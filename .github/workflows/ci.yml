@@ -41,4 +41,36 @@ jobs:
           uv run ruff format --check .
 
       - name: Test
-        run: uv run pytest
+        run: uv run pytest -m "not integration"
+
+  # The reference stack runs Linux containers, which GitHub's Windows runners
+  # cannot host, so integration tests run on ubuntu only.
+  integration:
+    name: integration / reference stack
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UV_PYTHON: "3.11"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Start the reference stack
+        run: make ref-up
+
+      - name: Integration tests
+        run: make test-integration
+
+      - name: Stack logs
+        if: failure()
+        run: docker compose -f reference/docker-compose.yml logs --tail 200
+
+      - name: Stop the reference stack
+        if: always()
+        run: make ref-down
