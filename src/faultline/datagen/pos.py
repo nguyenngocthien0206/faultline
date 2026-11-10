@@ -40,7 +40,9 @@ ORDER_COLUMNS = (
     "promo_code",
     "item_count",
 )
-ORDER_ITEM_COLUMNS = ("order_id", "line_no", "item_id", "qty", "unit_price_vnd")
+# created_at is the order's ordered_at: lines are written when the order is rung
+# up, and incremental extractors (dlt) need a timestamp to use as their cursor.
+ORDER_ITEM_COLUMNS = ("order_id", "line_no", "item_id", "qty", "unit_price_vnd", "created_at")
 PAYMENT_COLUMNS = ("payment_id", "order_id", "kind", "method", "amount_vnd", "paid_at")
 TRUTH_COLUMNS = (
     "order_date",
@@ -265,7 +267,9 @@ class StoreSimulator:
             item = pool.pop(i)
             pool_weights.pop(i)
             qty = rng.choices(QTYS, QTY_WEIGHTS)[0]
-            day.order_items.append((order_id, line_no, item.item_id, qty, item.price_vnd))
+            day.order_items.append(
+                (order_id, line_no, item.item_id, qty, item.price_vnd, _iso(ordered_at))
+            )
             subtotal += qty * item.price_vnd
             items_sold += qty
             by_category[item.category] += qty * item.price_vnd

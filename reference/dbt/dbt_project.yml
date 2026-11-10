@@ -1,0 +1,32 @@
+name: coffee_platform
+version: "1.0.0"
+config-version: 2
+profile: coffee_platform
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+target-path: target
+clean-targets: ["target", "logs"]
+
+vars:
+  # Placeholders so `dbt parse` works at image build time. Every real run passes
+  # both through --vars; generate_schema_name refuses to run with the placeholder.
+  workspace: fl_00000000
+  dt: "1970-01-01"
+
+models:
+  coffee_platform:
+    silver:
+      +materialized: view
+      +meta:
+        dagster:
+          group: silver
+    gold:
+      # Naive: recompute only the affected days, as two statements (DELETE, then
+      # INSERT). Readers can see the gap in between; that is the naive flaw the
+      # crash faults will exploit.
+      +materialized: incremental
+      +incremental_strategy: delete_insert
+      +meta:
+        dagster:
+          group: gold

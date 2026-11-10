@@ -183,6 +183,13 @@ def test_lines_are_extracted_on_the_creation_day_only(sim: Simulated) -> None:
         assert item["_dt"] == created_on[item["order_id"]]
 
 
+def test_line_created_at_is_the_order_time(sim: Simulated) -> None:
+    ordered_at = {o["order_id"]: o["ordered_at"] for o in _created(sim)}
+
+    for item in sim.items:
+        assert item["created_at"] == ordered_at[item["order_id"]]
+
+
 def test_some_orders_are_placed_at_dawn_in_local_time(sim: Simulated) -> None:
     # Before 07:00 local is still the previous day in UTC: the event-time trap.
     dawn = [o for o in _created(sim) if _ts(o["ordered_at"]).hour < 7]

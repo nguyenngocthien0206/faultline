@@ -131,7 +131,9 @@ services:
 
   dagster-code:
     <<: *dagster-image
-    build: ./dagster
+    build:
+      context: .
+      dockerfile: dagster/Dockerfile
     command:
       - dagster
       - code-server
