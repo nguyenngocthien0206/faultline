@@ -9,7 +9,7 @@ import os
 from collections.abc import Iterator
 
 import pytest
-from reference_stack import CLICKHOUSE_URL, SOURCE_DSN, Stack
+from reference_stack import Stack
 
 from faultline.connectors.dagster import DagsterError
 from faultline.connectors.workspace import new_workspace_name
@@ -25,9 +25,9 @@ def _unreachable(reason: str) -> None:
 def stack() -> Iterator[Stack]:
     stack = Stack.from_env()
     if not stack.clickhouse.ping():
-        _unreachable(f"ClickHouse at {CLICKHOUSE_URL}")
+        _unreachable(f"ClickHouse at {stack.clickhouse.url}")
     if not stack.source.ping():
-        _unreachable(f"Postgres at {SOURCE_DSN}")
+        _unreachable("source Postgres on 127.0.0.1:5433")
     try:
         stack.dagster.version()
         load_error = stack.dagster.location_error()

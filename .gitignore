@@ -84,3 +84,9 @@ Thumbs.db
 .faultline/
 *.duckdb
 *.duckdb.wal
+
+# Reference stack credentials (created from reference/.env.example by `make ref-up`)
+reference/.env
+
+# Local assistant instructions, kept out of the repository
+CLAUDE.md

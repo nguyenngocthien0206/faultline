@@ -330,7 +330,7 @@ A small but real data stack ships with faultline, so the idea can be demonstrate
 | `dagster-webserver` | same image | UI and the GraphQL API faultline drives |
 | `dagster-daemon` | same image | schedules, sensors, run retries |
 
-Every credential is a fixed test-only value and every port binds to `127.0.0.1`.
+Every port binds to `127.0.0.1`. Credentials are test-only values kept in one place, `reference/.env` (gitignored), which `make ref-up` creates from the committed `reference/.env.example`; compose, ClickHouse's named collection and the integration tests all read that file, and compose refuses to start when a variable is missing.
 
 **Workspaces.** Each experiment works in its own workspace, a name like `fl_ab12cd34` that is at once the Postgres schema of its source tables, its ClickHouse database and its S3 prefix. The name travels in the run config of every Dagster run. Isolation lets experiments run in parallel on one stack, and the name doubles as a guard: faultline's connectors refuse to drop anything that does not match `^fl_[0-9a-f]{8}$`, and the platform validates the same pattern on its side.
 
@@ -496,7 +496,7 @@ Results go to `.faultline/results/<run_id>/<experiment>__<target>.json`, with th
 
 ```
 faultline/
-  pyproject.toml  uv.lock  Makefile  README.md  LICENSE  CLAUDE.md
+  pyproject.toml  uv.lock  Makefile  README.md  LICENSE
   .github/workflows/ci.yml
   docs/
     design.md
@@ -510,8 +510,8 @@ faultline/
     report/        scorecard.py
     connectors/    dagster.py  clickhouse.py  postgres.py  workspace.py
   reference/       the platform under test, never imported by faultline
-    docker-compose.yml
-    clickhouse/    config.d/  users.d/
+    docker-compose.yml  .env.example   (credentials; the real .env is gitignored)
+    clickhouse/    entrypoint.sh  config.d/
     dagster/       Dockerfile  pyproject.toml  requirements.lock  dagster.yaml  workspace.yaml
                    coffee_platform/   Dagster definitions, dlt and ClickHouse assets
     dbt/           silver and gold models (added with the pipeline)

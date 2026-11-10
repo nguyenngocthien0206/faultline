@@ -25,16 +25,21 @@ test-integration: ## Run the tests against the reference stack (start it with re
 
 check: lint test ## Lint and Docker-free tests, what CI runs on every OS
 
-ref-up: ## Build and start the reference stack, wait until it is healthy
+# Credentials live in reference/.env (gitignored). Created from the example on
+# first use and never overwritten, so local edits survive.
+reference/.env:
+	cp reference/.env.example $@
+
+ref-up: reference/.env ## Build and start the reference stack, wait until it is healthy
 	$(COMPOSE) up -d --build --wait
 
-ref-down: ## Stop the reference stack and delete its volumes
+ref-down: reference/.env ## Stop the reference stack and delete its volumes
 	$(COMPOSE) down -v
 
-ref-ps: ## Show the reference stack services
+ref-ps: reference/.env ## Show the reference stack services
 	$(COMPOSE) ps -a
 
-ref-logs: ## Follow the reference stack logs
+ref-logs: reference/.env ## Follow the reference stack logs
 	$(COMPOSE) logs -f --tail 100
 
 clean: ## Remove caches, build output and faultline workspaces
