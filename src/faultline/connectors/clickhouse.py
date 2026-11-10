@@ -8,10 +8,12 @@ no compiled dependency, and it can stream results in any output format
 from __future__ import annotations
 
 import json
+import shutil
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any
+from pathlib import Path
+from typing import Any, BinaryIO
 
 from faultline.connectors.workspace import validate_workspace_name
 
@@ -34,7 +36,10 @@ class ClickHouseClient:
         self.password = password
         self.timeout = timeout
 
-    def _post(self, sql: str, settings: dict[str, str] | None = None) -> bytes:
+    def _post(
+        self, sql: str, settings: dict[str, str] | None = None, *, sink: BinaryIO | None = None
+    ) -> bytes:
+        """POST a statement. With `sink`, the response is streamed into it instead of returned."""
         params = urllib.parse.urlencode(settings or {})
         request = urllib.request.Request(
             f"{self.url}/?{params}" if params else f"{self.url}/",
@@ -44,7 +49,10 @@ class ClickHouseClient:
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return response.read()
+                if sink is None:
+                    return response.read()
+                shutil.copyfileobj(response, sink, length=1 << 20)
+                return b""
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode(errors="replace").strip()
             raise ClickHouseError(detail or f"HTTP {exc.code}") from exc
@@ -69,6 +77,22 @@ class ClickHouseClient:
             {"default_format": "JSONEachRow", "output_format_json_quote_64bit_integers": "0"},
         )
         return [json.loads(line) for line in raw.splitlines() if line.strip()]
+
+    def export_parquet(self, sql: str, dest: Path) -> Path:
+        """Stream the result of a SELECT into a Parquet file at `dest`.
+
+        Written to a temporary name first and renamed at the end, so a failed
+        export never leaves a truncated file that looks like a valid snapshot.
+        """
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        partial = dest.with_name(dest.name + ".partial")
+        try:
+            with partial.open("wb") as sink:
+                self._post(sql, {"default_format": "Parquet"}, sink=sink)
+            partial.replace(dest)
+        finally:
+            partial.unlink(missing_ok=True)
+        return dest
 
     def drop_workspace(self, name: str) -> None:
         """Drop the database of a faultline workspace. Refuses any other name."""

@@ -1,3 +1,4 @@
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -71,3 +72,25 @@ def test_drop_workspace_only_drops_faultline_databases(stub: StubServer) -> None
         ch.drop_workspace("default")
 
     assert [r.body for r in stub.requests] == [b"DROP DATABASE IF EXISTS fl_abcd1234"]
+
+
+def test_export_parquet_streams_the_body_into_the_file(stub: StubServer, tmp_path: Path) -> None:
+    payload = b"PAR1" + bytes(range(256)) * 4096 + b"PAR1"  # ~1 MB, larger than one chunk
+    stub.reply(200, payload)
+    dest = tmp_path / "snap" / "gold.parquet"
+
+    result = client(stub).export_parquet("SELECT * FROM gold", dest)
+
+    assert result == dest
+    assert dest.read_bytes() == payload
+    assert parse_qs(urlparse(stub.requests[0].path).query)["default_format"] == ["Parquet"]
+
+
+def test_failed_export_leaves_no_file_behind(stub: StubServer, tmp_path: Path) -> None:
+    stub.reply(500, "Code: 60. DB::Exception: Unknown table")
+    dest = tmp_path / "gold.parquet"
+
+    with pytest.raises(ClickHouseError, match="Unknown table"):
+        client(stub).export_parquet("SELECT * FROM gold", dest)
+
+    assert list(tmp_path.iterdir()) == []
