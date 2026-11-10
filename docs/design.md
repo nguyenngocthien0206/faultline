@@ -93,64 +93,62 @@ Signatures are indicative; exact types are settled when each interface is implem
 
 ### 4.1 Adapter
 
+Implemented in `faultline.adapters` (`base.py`, and `reference.py` for the reference stack):
+
 ```python
 class Capability(StrEnum):
-    LANDING_FILES = "landing.files"  # can place arbitrary files in landing
-    RUN_NEXT = "run.next"  # platform picks the next partition from its own cursor
-    RUN_PARTITION = "run.partition"  # run one explicit partition
-    RUN_BACKFILL = "run.backfill"  # run a date range
-    INTERRUPT_FAILPOINT = "interrupt.failpoint"
-    SIGNALS_ALERTS = "signals.alerts"  # exposes alerts beyond exit status
-
-
-class InterruptPoint(StrEnum):
-    BEFORE_WRITE = "before_write"
-    MID_WRITE = "mid_write"
-    AFTER_WRITE_BEFORE_STATE = "after_write_before_state"
-    AFTER_STATE = "after_state"
+    DELIVER_DAY = "input.deliver_day"  # make one day of input available to the platform
+    RUN_PARTITION = "run.partition"  # run the pipeline for one partition
+    SNAPSHOT = "output.snapshot"  # export a consumer-visible table to Parquet
 
 
 @dataclass(frozen=True)
-class Interrupt:
-    stage: str  # "ingest" | "transform" | "aggregate" | "state" ... adapter-defined
-    point: InterruptPoint
-
-
-@dataclass(frozen=True)
-class RunRequest:
-    mode: Literal["next", "partition", "backfill"]
-    partition: date | None = None
-    start: date | None = None
-    end: date | None = None
-    interrupt: Interrupt | None = None
-
-
-@dataclass(frozen=True)
-class RunResult:
-    status: Literal["SUCCEEDED", "FAILED", "INTERRUPTED"]
-    attempts: int
-    error: str | None
-    alerts: list[Alert]
+class TableContract:
+    name: str
+    key: tuple[str, ...]
+    measures: tuple[str, ...] = ()  # numeric columns whose totals are reported
+    ignore: tuple[str, ...] = ()  # volatile columns left out of comparisons
+    truth_dataset: str | None = None  # generated dataset whose keys must all appear
 
 
 @dataclass(frozen=True)
 class Capabilities:
     features: frozenset[Capability]
-    interrupt_points: frozenset[tuple[str, InterruptPoint]]
-    # table name -> key columns, measure columns, ignore columns
-    consumer_tables: dict[str, TableContract]
+    tables: tuple[TableContract, ...]
 
 
-class Adapter(ABC):
+class RunStatus(StrEnum):
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"  # the platform's own failure: a signal
+    INTERRUPTED = "INTERRUPTED"  # killed by faultline on purpose: not a signal
+
+
+@dataclass(frozen=True)
+class RunRequest:
+    partition: date
+
+
+@dataclass(frozen=True)
+class RunResult:
+    status: RunStatus
+    errors: tuple[str, ...] = ()  # root causes, not wrapper messages
+    run_id: str | None = None
+
+
+class Adapter(ABC):  # also a context manager: setup on enter, teardown on exit
     def capabilities(self) -> Capabilities: ...
-    def setup(self, workdir: Path) -> None: ...  # fresh, isolated environment
-    def place_input(self, item: InputFile) -> None: ...  # dataset, partition, filename, bytes
-    def trigger_run(self, request: RunRequest) -> RunResult: ...
-    def read_output(self, table: str, dest: Path) -> Path: ...  # Parquet snapshot
+    def setup(self) -> None: ...  # fresh, isolated sandbox
+    def deliver(self, day: date) -> None: ...  # the platform's normal input for one day
+    def run(self, request: RunRequest) -> RunResult: ...
+    def snapshot(self, table: str, dest: Path) -> Path: ...  # Parquet
     def teardown(self) -> None: ...
 ```
 
-Design note, deviation from the brief: the brief lists `interrupt` as an optional method. Here an interrupt is part of the `RunRequest` and is implemented as a **failpoint**: the platform exits hard (`os._exit`) at a named point. An asynchronous `interrupt()` call would race with the run (did the write finish before the kill arrived?) and would make results flaky. Failpoints are deterministic, behave the same on Windows and Linux, and are a well known technique (FoundationDB, TiKV and etcd all use them). Black-box adapters that cannot host failpoints can still implement an interrupt point by other means, such as a cancel API or "kill when this file appears"; that is post-MVP.
+**`deliver(day)` instead of `place_input(file)`.** The steady-state input is whatever "one more day" means for the platform: the reference stack replays the day's changes into its source Postgres, a file-based platform would drop the day's files into its landing zone. faultline does not need to know which. Faults that reach deeper (dropping an extra file into S3, rewriting a source row, killing a run) will use optional hooks declared as capabilities, added together with the faults that need them: `landing.files`, `source.mutate`, `interrupt.failpoint`, `run.backfill`.
+
+The reference adapter checks that the Dagster code location loaded before setting up anything, creates the workspace (Postgres schema and source tables), replays days with `faultline.sources.pos`, launches `pos_daily` through GraphQL, and snapshots tables with ClickHouse's `FORMAT Parquet` streamed to disk (written to a temporary name and renamed, so a failed export never looks like a valid snapshot). It only exports tables it declares.
+
+Design note, deviation from the brief: the brief lists `interrupt` as an optional method. Here an interrupt will be part of the `RunRequest` and implemented as a **failpoint**: the platform exits hard (`os._exit`) at a named point. An asynchronous `interrupt()` call would race with the run (did the write finish before the kill arrived?) and would make results flaky. Failpoints are deterministic, behave the same on Windows and Linux, and are a well known technique (FoundationDB, TiKV and etcd all use them). Black-box adapters that cannot host failpoints can still implement an interrupt point by other means, such as a cancel API or "kill when this file appears".
 
 A capability the adapter does not declare turns the dependent fault or property into `SKIPPED`, never into a failure.
 
@@ -223,22 +221,30 @@ The oracle is **hybrid**:
 1. **Differential baseline.** faultline runs the clean schedule on a fresh environment and snapshots the consumer tables after every logical step. The faulted run must match those snapshots at the relevant checkpoints. faultline never needs to know how revenue is computed, so this works for any platform.
 2. **Key invariants from the generator.** Because faultline generated the source data, it knows the set of keys that must exist per table (for example every `order_id`). It checks that each key appears exactly once and that none is missing. This also validates the baseline itself: a platform that is wrong even on a clean run would otherwise produce a wrong answer key.
 
+Implemented in `faultline.oracle`, all in an embedded DuckDB over Parquet snapshots, whatever warehouse produced them:
+
 ```python
-class Oracle:
-    def expected(self, step: int) -> Snapshot: ...  # baseline after logical step
-    def final(self) -> Snapshot: ...
-    def check_invariants(self, snapshot: Snapshot) -> list[Violation]: ...
+snapshot_all(adapter, dest_dir) -> dict[str, Path]  # every declared table to Parquet
+fingerprint(path, contract) -> Fingerprint  # rows, distinct keys, row hash, measure sums
+diff(expected, actual, contract) -> Diff  # bucket counts, sample keys, measure deltas, summary()
+unique_keys(path, contract) -> InvariantResult
+complete_keys(path, contract, generated_root) -> InvariantResult  # vs the generator's keys
 ```
 
-**Fingerprint** per table: row count, distinct key count, a multiset hash, and the sum of each measure column. The multiset hash is the sum of per-row hashes modulo 2^64. XOR is the tempting choice and the wrong one: two identical rows XOR to zero, so a fingerprint built on XOR is blind to duplicates, which are one of the main things faultline exists to catch.
+Measured on the reference stack: two clean baselines in two separate workspaces fingerprint identically for every consumer table, which is what makes the differential oracle trustworthy.
 
-**Diff** (when fingerprints differ) uses DuckDB `EXCEPT ALL` in both directions plus a group-by on keys, and reports four buckets:
+**Fingerprint** per table: row count, distinct key count, a multiset hash, and the sum of each measure column. The multiset hash is the sum of per-row hashes modulo 2^64. XOR is the tempting choice and the wrong one: two identical rows XOR to zero, so a fingerprint built on XOR is blind to duplicates, which are one of the main things faultline exists to catch. DuckDB's `hash()` can change between DuckDB versions, so fingerprints are only compared within one faultline run, never stored.
 
-| Bucket | Feeds property |
-|---|---|
-| missing keys | no data loss |
-| extra keys / duplicated keys | exactly-once |
-| same key, different values | no silent corruption |
+**Diff** (when fingerprints differ) groups both snapshots by key (row count and row-hash sum per key), joins them, and puts every key into at most one bucket:
+
+| Bucket | Meaning | Feeds property |
+|---|---|---|
+| missing | key in the expected snapshot only | no data loss |
+| extra | key in the actual snapshot only | exactly-once |
+| duplicated | more rows for the key in the actual snapshot | exactly-once |
+| changed | same or fewer rows, different content | no silent corruption |
+
+Totals alone are not enough. A unit test builds a snapshot with one key missing, one duplicated, one changed and one extra, and the revenue total comes out exactly equal to the expected one; only the keyed buckets reveal the damage. On the reference stack, rerunning one day of the naive pipeline yields: `silver_orders` identical, `silver_order_items` 133 duplicated keys, `gold_daily_store_sales` 4 changed keys with net revenue +19.3% and items sold +56.4% (duplicates on both sides of a join multiply instead of adding up).
 
 **Canonicalisation** before hashing or diffing: columns ordered by name, timestamps normalised to UTC, declared `ignore_columns` dropped (load timestamps, run ids), money stored as integer VND. Floats are avoided in the reference data because `0.1 + 0.2` summed in a different order is a different number, and the diff would report noise as corruption.
 
@@ -517,10 +523,10 @@ faultline/
     design.md
   src/faultline/
     cli.py  spec.py  safety.py  runner.py  trace.py  outcome.py
-    adapters/      base.py  reference.py  registry.py
+    adapters/      base.py  reference.py   (registry.py with the target spec)
     faults/        base.py  landing.py  execution.py
     properties/    base.py  idempotency.py  atomicity.py  ...
-    oracle/        fingerprint.py  snapshot.py  diff.py  truth.py
+    oracle/        fingerprint.py  diff.py  invariants.py  snapshot.py
     datagen/       spec.py  catalog.py  dimensions.py  pos.py  writer.py  truth.py  generate.py
     report/        scorecard.py
     connectors/    dagster.py  clickhouse.py  postgres.py  workspace.py
@@ -537,7 +543,7 @@ faultline/
                    tests that need the stack are marked `integration`
 ```
 
-Runtime dependencies: typer, faker, then pydantic, duckdb and pyyaml as their features land. The optional extra `faultline[reference]` adds psycopg for the source database connector. Development: pytest, ruff. Nothing else unless a concrete need proves it. The reference platform has its own fully pinned dependency set in `reference/dagster/requirements.lock`, installed only in its image.
+Runtime dependencies: typer, faker, duckdb (1.x, the oracle's engine), then pydantic and pyyaml as their features land. The optional extra `faultline[reference]` adds psycopg for the source database connector. Development: pytest, ruff. Nothing else unless a concrete need proves it. The reference platform has its own fully pinned dependency set in `reference/dagster/requirements.lock`, installed only in its image.
 
 ## 12. Expected results (MVP definition of done)
 
