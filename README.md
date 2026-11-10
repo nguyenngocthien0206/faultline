@@ -21,7 +21,9 @@ make test-integration   # run the tests that drive the real platform
 make ref-down           # stop it and delete its data
 ```
 
-While the reference platform is up, the Dagster UI is at <http://localhost:3000> and the S3 console at <http://localhost:9001/rustfs/console/> (`faultline` / `faultline-secret`). Every credential in `reference/docker-compose.yml` is a throwaway test value and every port is bound to localhost.
+While the reference platform is up, the Dagster UI is at <http://localhost:3000> and the S3 console at <http://localhost:9001/rustfs/console/> (log in with `S3_ACCESS_KEY` / `S3_SECRET_KEY` from `reference/.env`).
+
+Credentials live in `reference/.env`, which `make ref-up` creates from [`reference/.env.example`](reference/.env.example) the first time and never overwrites. They are throwaway test values and every port is bound to localhost; to change one, edit `reference/.env` and run `make ref-down` first, since the databases keep the credentials they were created with.
 
 ## License
 
