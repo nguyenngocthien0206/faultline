@@ -308,9 +308,9 @@ A small local platform ships with faultline so the idea can be demonstrated end 
 
 ```
 <workdir>/
-  landing/orders/dt=YYYY-MM-DD/*.jsonl     order files, one folder per business date
-  landing/orders/dt=YYYY-MM-DD/*.manifest.json   row count + sha256 (the delivery contract)
-  landing/reference/{stores,menu,members}.csv
+  landing/                                  same layout as the generator output (section 10)
+    backoffice/<dataset>/dt=YYYY-MM-DD/<dataset>.csv + <dataset>.manifest.json
+    pos/<dataset>/dt=YYYY-MM-DD/store=<id>/<dataset>.csv + <dataset>.manifest.json
   warehouse.duckdb                          schemas: bronze, silver, gold, ops
   state.json                                cursor (naive mode only)
 ```
@@ -319,9 +319,9 @@ A small local platform ships with faultline so the idea can be demonstrated end 
 
 Splitting orchestrator and worker mirrors real schedulers such as Airflow or ADF: the task process dies, the scheduler survives and retries.
 
-**Consumer-visible tables.** `silver.orders` (key `order_id`) and `gold.daily_store_sales` (key `order_date, store_id`; measures `orders`, `revenue_vnd`).
+**Consumer-visible tables** (planned, settled when the platform is built). Silver: `orders` (key `order_id`, latest state), `order_items` (key `order_id, line_no`), `payments` (key `payment_id`), plus SCD2 history for stores, menu items and members. Gold: `daily_store_sales` (key `order_date, store_id`; measures `orders`, `items_sold`, `gross_vnd`, `discount_vnd`, `net_vnd`), keyed by the day the order was placed.
 
-**Naive versus hardened.** Naive is not a strawman. Every one of its choices is common in real pipelines and passes a happy-path test.
+**Naive versus hardened.** Naive is not a strawman. Every one of its choices is common in real pipelines and passes a happy-path test. Order lifecycle updates (voids, refunds days later) are part of the steady state, so naive does handle updates that arrive in order: it merges by key and recomputes the business dates the changed rows belong to. It breaks only when faults hit it.
 
 | Concern | naive | hardened |
 |---|---|---|
@@ -333,6 +333,8 @@ Splitting orchestrator and worker mirrors real schedulers such as Airflow or ADF
 | Schema drift | auto-detects columns, unknown names silently become NULL | schema contract, mismatch raises an alert and fails the run |
 | Truncated file | loads whatever parses | compares row count with the manifest, quarantines and alerts |
 | Gold refresh | `DELETE` then batched `INSERT`, autocommit | build a staging table, swap in one transaction |
+| Order updates | last row loaded wins | row with the latest `updated_at` wins, so an out-of-order replay cannot undo a refund |
+| Dimension history | overwrite in place (SCD1) | SCD2 built from daily snapshots and member deltas, so a backfill uses the values valid on that day |
 
 Two lessons worth stating plainly:
 
@@ -362,10 +364,10 @@ description: A file for an already processed day lands two days late.
 targets: [reference-naive, reference-hardened]   # --target on the CLI overrides
 dataset:
   generator: coffee_vn
+  profile: tiny          # tiny | demo | large
   seed: 42
   start_date: 2026-11-01
-  days: 5
-  orders_per_day: 200
+  days: 5                # any profile value can be overridden
 steady_state:
   tables: [silver.orders, gold.daily_store_sales]
   invariants: [unique_keys, complete_keys]
@@ -388,16 +390,85 @@ The README will carry this warning prominently. The guard protects against mista
 
 ## 10. Dataset, CLI and scorecard
 
-**Dataset.** A simulated Vietnamese coffee chain generated with Faker `vi_VN` and a fixed seed: about 10 stores across Ho Chi Minh City, Hanoi and Da Nang, about 20 menu items, about 500 members, and by default 5 days of 200 orders per day. Orders carry `order_id`, `store_id`, `member_id` (nullable), `ordered_at`, `channel`, `item_count`, `amount_vnd`. Money is integer VND.
-Faker output can change between Faker versions. That does not affect verdicts, because the baseline is recomputed on every run from the same generated data. This is one more practical benefit of the differential oracle.
+### 10.1 The coffee chain domain
 
-**CLI.**
+faultline generates its own source data: a simulated Vietnamese coffee chain. The domain is deliberately rich, because each part of it opens a different way for a platform to fail. A toy table of orders would only ever exercise appends.
+
+**Source systems.** A real chain does not have one source; it has several systems, each with its own format, clock and delivery habits.
+
+| Source | Format | Clock | Delivers | Status |
+|---|---|---|---|---|
+| `backoffice` (ERP) | CSV | dates | one extract per dataset per day | built |
+| `pos` (till in each store) | CSV | local time, `+07:00` | one extract per dataset per store per day | built |
+| `delivery` (delivery app) | JSON | UTC | own order ids, status updates that lag | planned |
+| `loyalty` (member app) | JSON events | UTC | append-only events with `event_id` | planned |
+
+**Datasets built today.**
+
+| Dataset | Delivery | Key | What changes over time |
+|---|---|---|---|
+| `backoffice/stores` | full daily snapshot | `store_id` | stores open and close inside the window (`status` planned, open, closed) |
+| `backoffice/menu_items` | full daily snapshot | `item_id` | category price increases, a seasonal launch, a retired item (kept with `is_active=false`) |
+| `backoffice/promotions` | full daily snapshot | `promo_code` | weekly campaigns with validity windows, plus one evergreen offer |
+| `backoffice/members` | full on the first day, **delta** afterwards | `member_id` | new members, monthly tier upgrades |
+| `pos/orders` | daily change extract per store | `order_id` | status: `completed`, `voided` (same day), `refunded` (one to three days later) |
+| `pos/order_items` | with the order, on the day it is placed | `order_id, line_no` | immutable |
+| `pos/payments` | daily per store | `payment_id` | charges (about 10% split across two methods), negative refund rows |
+
+Both snapshot and delta deliveries are intentional: a platform has to build SCD2 history from snapshots (compare today with yesterday) and merge deltas, the two patterns teams meet most.
+
+**Event time versus ingestion time.** The `dt` partition of every landing file is the day the source *extracted* it, not the day the business event happened. The POS extract for `dt=D` contains every order created or changed on D, the equivalent of `WHERE updated_at` falls on D. So a refund issued on 3 November for an order placed on 1 November arrives in `dt=2026-11-03`, yet the revenue it removes belongs to 1 November. A platform that aggregates gold by landing partition gets every refund on the wrong day. Timestamps are local (`+07:00`); an order at 06:45 in Saigon is still the previous day in UTC, the other half of the same trap.
+
+**Invariants the generator guarantees** (and its tests check):
+
+- `subtotal_vnd = sum(qty * unit_price_vnd)` and `total_vnd = subtotal_vnd - discount_vnd`; percent discounts round down to whole thousands.
+- Payments of an order sum to `total_vnd` when it is `completed` and to 0 when it is `voided` or `refunded`.
+- `unit_price_vnd` is the menu price valid on the order day; promotions are active and their minimum spend is met; stores are open; members joined before the order day.
+- Orders fall between 06:30 and 22:00 local time, with morning, lunch and late afternoon peaks and busier weekends.
+
+**Truth.** Alongside `landing/`, never inside it, the generator writes `truth/control_totals.csv`: per business date and store, the final counts per status, items sold, gross, discount and net revenue after every refund inside the window. The platform never sees it. Together with the key sets read from landing files, it is what the oracle can check outputs against.
+
+### 10.2 Volume profiles and determinism
+
+| Profile | Stores | Days | Orders per store per day | Members | Measured |
+|---|---|---|---|---|---|
+| `tiny` | 4 | 4 | 40 | 2,000 | about 420 orders, under a second; used by tests |
+| `demo` | 50 | 30 | 300 | 20,000 | 456k orders, 784k lines, 147 MB, about 13 s on 16 cores |
+| `large` | 200 | 365 | 350 | 200,000 | about 25M orders and 8 GB (extrapolated) |
+
+Any profile value can be overridden. Rules that keep the output byte-identical:
+
+- **One random stream per store-day**, seeded with `(seed, store, date)`. Stores are simulated in parallel worker processes, each store sequentially by day (a refund decided on D is delivered on D+k). The output is the same for 1 or 16 workers; a test enforces it.
+- **Change events sit on a calendar anchored at `start_date`**, never derived from `days`: price increases every 30 days rotating through categories, store openings and closings at fixed offsets, monthly tier reviews, member sign-ups spread over a one-year horizon. Generating 50 days instead of 5 therefore leaves the first 5 days untouched, so cached baselines and short experiment windows stay valid.
+- **Faker only produces names, phone numbers and street names.** Prices, menus, cities and volumes are hard-coded. A Faker upgrade may rename customers but never moves revenue, and verdicts do not depend on it anyway because the baseline is recomputed on every run.
+- **Bytes are canonical**: UTF-8 without BOM, `\n` line endings, fixed column order, header-only files for empty extracts (an extract that found nothing must look different from a file that never arrived).
+
+Workers receive only the spec and rebuild the dimensions from the seed. On Windows the process pool starts workers one after another, and shipping the dimensions to each one made start-up dominate the run (21 s down to 13 s on `demo`).
+
+### 10.3 Domain slices still to build
+
+Each slice is its own piece of work, planned after the first end-to-end demo runs.
+
+| Slice | Adds | Failure modes it opens |
+|---|---|---|
+| Delivery app | orders from a delivery platform: JSON, UTC, external ids, commission, lagging status updates | merging sources, timezone skew, foreign keys across systems |
+| Loyalty ledger | earn, redeem and reversal events with `event_id`; tiers computed from points | exactly-once on an append-only ledger (a retry that double-counts gives points away) |
+| Shift closing | each store reports its own totals per shift | an independent reconciliation source for gold |
+| Staff and shifts | employees, rosters, clock events, `cashier_id` on orders | POS schema evolution |
+| Inventory and purchasing | ingredients, recipes, purchase orders, stock counts, waste | snapshot plus movement, running balances |
+| Parent and child skew | order lines or payments arriving before or without their order | orphan rows, completeness across related files |
+
+### 10.4 CLI
 
 ```
+faultline generate --out DIR [--profile tiny|demo|large] [--seed N] [--start-date YYYY-MM-DD]
+                   [--days N] [--stores N] [--orders-per-store-day N] [--members N] [--workers N]
 faultline run <experiment.yaml> [--target NAME ...]
 faultline run --all
 faultline report [--format md|json]
 ```
+
+`generate` refuses a non-empty output directory rather than deleting anything, and prints plain ASCII so the summary works on any console.
 
 Results go to `.faultline/results/<run_id>/<experiment>__<target>.json`, with the snapshots needed to explain a diff.
 
@@ -417,15 +488,13 @@ faultline/
     faults/        base.py  landing.py  execution.py
     properties/    base.py  idempotency.py  atomicity.py  ...
     oracle/        fingerprint.py  snapshot.py  diff.py  truth.py
-    datagen/       coffee_vn.py
+    datagen/       spec.py  catalog.py  dimensions.py  pos.py  writer.py  truth.py  generate.py
     report/        scorecard.py
     reference_platform/
                    __main__.py  orchestrator.py  stages.py  naive.py  hardened.py  failpoints.py
   experiments/     *.yaml
   targets/         *.yaml
-  tests/
-    unit/
-    integration/
+  tests/           one folder per package area (datagen/, ...); slow tests marked `integration`
 ```
 
 Runtime dependencies: typer, pydantic, duckdb, pyyaml, faker. Development: pytest, ruff. Nothing else unless a concrete need proves it.
@@ -456,6 +525,7 @@ Runtime dependencies: typer, pydantic, duckdb, pyyaml, faker. Development: pytes
 7. **Combining faults.** With several faults in one experiment, the expected state at intermediate checkpoints becomes hard to define. MVP: one fault per experiment is the norm. Final-state properties stay valid when faults are combined.
 8. **An interface overfitted to one implementation.** Designing the adapter around a single platform risks baking in its quirks. Mitigation: keep the interface minimal now and revise it when the dlt adapter arrives.
 9. **A misconfigured guard.** A target can claim `environment: test` and point at production. Mitigations: per-adapter checks on what they touch, and a clear README warning.
+10. **A rich domain multiplies platform work.** Every dataset the generator adds is something the reference platform must ingest in both modes. Mitigations: domain slices land one at a time and only after the end-to-end demo works; experiments can run on the `tiny` profile or a short window of `demo`.
 
 ## 14. After the MVP
 
