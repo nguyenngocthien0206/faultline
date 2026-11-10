@@ -83,8 +83,9 @@ Why: separating "what happened" from "is it acceptable" keeps properties pure an
 `read_output` exports a table to a Parquet file. All fingerprinting and diffing is done by faultline in DuckDB over those files.
 Why: adapters stay thin (any warehouse can export Parquet), faultline needs no pandas or pyarrow dependency, and diffs scale beyond what fits comfortably in Python lists.
 
-**Every platform run is a subprocess.**
-Why: a crash must be a real crash. If the platform ran in faultline's process, a "crash" would be an exception that `finally` blocks and context managers clean up politely, which is exactly the situation that never happens when a node dies.
+**Every platform run is a real run on a real stack, outside faultline's process.**
+The reference platform runs in Docker and is driven only through public interfaces (a source database, an S3 bucket, Dagster's GraphQL API, ClickHouse's HTTP API).
+Why: a crash must be a real crash. If the platform ran in faultline's process, a "crash" would be an exception that `finally` blocks and context managers clean up politely, which is exactly the situation that never happens when a node dies. Driving it through public interfaces also proves that faultline can plug into a team's platform the same way.
 
 ## 4. Key interfaces
 
@@ -300,48 +301,63 @@ Every property gets its own unit tests on hand-built traces, plus at least one i
 
 ## 8. Reference platform
 
-A small local platform ships with faultline so the idea can be demonstrated end to end on a laptop and in CI.
-
-**Location and isolation.** It lives in `src/faultline/reference_platform/`. A test parses its source with `ast` and fails if it imports anything from `faultline` outside its own package. The platform is a genuine black box: it cannot peek at faultline's oracle or faults, so the demo cannot cheat.
-
-**Workspace layout.**
+A small but real data stack ships with faultline, so the idea can be demonstrated end to end on a laptop and in CI with the tools teams actually run: Postgres as the business database, dlt for ingestion, an S3 bucket as the landing zone, ClickHouse as the warehouse, dbt for transformations and Dagster to orchestrate it all. It is a showcase, not a requirement: a team plugs faultline into its own stack by writing an adapter (section 4.1).
 
 ```
-<workdir>/
-  landing/                                  same layout as the generator output (section 10)
-    backoffice/<dataset>/dt=YYYY-MM-DD/<dataset>.csv + <dataset>.manifest.json
-    pos/<dataset>/dt=YYYY-MM-DD/store=<id>/<dataset>.csv + <dataset>.manifest.json
-  warehouse.duckdb                          schemas: bronze, silver, gold, ops
-  state.json                                cursor (naive mode only)
+ faultline (host)                         reference stack (docker compose, reference/)
+ ----------------                         ---------------------------------------------
+ replay change set of day D  --SQL-->     source-db      Postgres, one schema per workspace
+                                              | dlt sql_database, incremental on updated_at
+                                              v
+                                          rustfs         S3: landing/<ws>/pos/<table>/dt=D/*.parquet
+                                              | ClickHouse s3() through the landing_s3 named collection
+                                              v
+                                          clickhouse     <ws>.bronze_*  --dbt-->  silver  -->  gold
+ launchRun(partition = D)  --GraphQL-->   dagster        webserver + code server (runs) + daemon
+ read outputs              --HTTP-->      clickhouse
 ```
 
-**Processes.** `python -m faultline.reference_platform run --mode naive|hardened ...` starts an orchestrator process that owns the retry policy. Each attempt spawns a worker process that runs the stages in order: ingest (landing to bronze), transform (bronze to silver), aggregate (silver to gold). Failpoints come from the environment variable `FAULTLINE_FAILPOINT=stage:point`, fire once (a marker file in the workspace records that they fired), and exit with code 86, which is reserved so the adapter can tell an injected crash from a real failure. Alerts are written to `ops.alerts`.
+**Services.**
 
-Splitting orchestrator and worker mirrors real schedulers such as Airflow or ADF: the task process dies, the scheduler survives and retries.
+| Service | Image | Role |
+|---|---|---|
+| `source-db` | `postgres:16` | the simulated business (POS) database faultline replays into and later corrupts |
+| `rustfs` | `rustfs/rustfs:1.0.4` | S3-compatible landing zone (MinIO no longer publishes community images) |
+| `rustfs-init` | `amazon/aws-cli` | one-shot: creates the `landing` bucket |
+| `clickhouse` | `clickhouse/clickhouse-server:26.8.16.41` | warehouse; reads landing files with `s3(landing_s3, filename = ...)` so SQL never carries credentials |
+| `dagster-db` | `postgres:16` | Dagster's own storage, deliberately separate from the business database |
+| `dagster-code` | built from `reference/dagster/` | gRPC code server; runs execute here (`DefaultRunLauncher`, no Docker socket) |
+| `dagster-webserver` | same image | UI and the GraphQL API faultline drives |
+| `dagster-daemon` | same image | schedules, sensors, run retries |
 
-**Consumer-visible tables** (planned, settled when the platform is built). Silver: `orders` (key `order_id`, latest state), `order_items` (key `order_id, line_no`), `payments` (key `payment_id`), plus SCD2 history for stores, menu items and members. Gold: `daily_store_sales` (key `order_date, store_id`; measures `orders`, `items_sold`, `gross_vnd`, `discount_vnd`, `net_vnd`), keyed by the day the order was placed.
+Every credential is a fixed test-only value and every port binds to `127.0.0.1`.
 
-**Naive versus hardened.** Naive is not a strawman. Every one of its choices is common in real pipelines and passes a happy-path test. Order lifecycle updates (voids, refunds days later) are part of the steady state, so naive does handle updates that arrive in order: it merges by key and recomputes the business dates the changed rows belong to. It breaks only when faults hit it.
+**Workspaces.** Each experiment works in its own workspace, a name like `fl_ab12cd34` that is at once the Postgres schema of its source tables, its ClickHouse database and its S3 prefix. The name travels in the run config of every Dagster run. Isolation lets experiments run in parallel on one stack, and the name doubles as a guard: faultline's connectors refuse to drop anything that does not match `^fl_[0-9a-f]{8}$`, and the platform validates the same pattern on its side.
+
+**Black box.** The platform code (`reference/dagster/coffee_platform`) never imports faultline, and faultline never imports it; they live in different processes, images and dependency sets. faultline touches the platform only through the source database, the bucket, Dagster's GraphQL API and ClickHouse's HTTP API, exactly what an adapter for a team's stack would use. The demo therefore cannot cheat.
+
+**Consumer-visible tables** (planned, settled when the pipeline is built). Silver: `orders` (key `order_id`, latest state), `order_items` (key `order_id, line_no`), `payments` (key `payment_id`). Gold: `daily_store_sales` (key `order_date, store_id`; measures `orders`, `items_sold`, `gross_vnd`, `discount_vnd`, `net_vnd`), keyed by the day the order was placed, and `daily_payments`.
+
+**Naive versus hardened.** Naive is not a strawman. Every one of its choices is common in real pipelines and passes a happy-path test. Order lifecycle updates (voids, refunds days later) are part of the steady state, so naive does produce the right numbers when every change arrives once and in order. It breaks only when faults hit it.
 
 | Concern | naive | hardened |
 |---|---|---|
-| Writes | blind `INSERT` append | partition overwrite inside one transaction, upsert by `order_id` |
-| Cursor | saved before the data write | saved in the same DuckDB transaction as the data |
-| State file | rewritten in place with `open("w")` | written to a temp file, then `os.replace` (atomic rename) |
-| Dedup | none | file manifest keyed by sha256, plus dedup by key |
-| Late data | reads only `dt=<run date>` | scans for unprocessed files within a lookback window and recomputes affected partitions |
-| Schema drift | auto-detects columns, unknown names silently become NULL | schema contract, mismatch raises an alert and fails the run |
-| Truncated file | loads whatever parses | compares row count with the manifest, quarantines and alerts |
-| Gold refresh | `DELETE` then batched `INSERT`, autocommit | build a staging table, swap in one transaction |
-| Order updates | last row loaded wins | row with the latest `updated_at` wins, so an out-of-order replay cannot undo a refund |
-| Dimension history | overwrite in place (SCD1) | SCD2 built from daily snapshots and member deltas, so a backfill uses the values valid on that day |
+| Bronze load | appends every file under `dt=D` with `INSERT ... SELECT FROM s3()` | loads into a staging table and swaps the partition in with `REPLACE PARTITION`; a ledger skips files already loaded |
+| Rerun and retry | appends the same rows again | idempotent: the partition is replaced by identical content |
+| Order updates | gold nets change events (completed adds, refunded subtracts), trusting each event to arrive exactly once | silver keeps the latest row per `order_id` (`ReplacingMergeTree(updated_at)` read with `FINAL`, or `argMax`); gold aggregates latest states |
+| Late rows at the source | dlt's default incremental cursor: a row whose `updated_at` is older than the cursor is never extracted | incremental with a lag window, then dedup by key downstream |
+| Late files in landing | reads only `dt=<run date>` | finds unprocessed files in a lookback window and recomputes the business dates they touch |
+| Schema drift | schema inferred from Parquet; a renamed column silently becomes NULL | explicit contract (dbt contracts and tests); mismatch alerts and fails the run |
+| Partial file | loads whatever rows are there | reconciles row counts against dlt's load metadata, quarantines and alerts |
+| Gold refresh | `delete+insert` incremental: two statements, a reader can see the gap | `insert_overwrite` by partition, one atomic swap |
 
-Two lessons worth stating plainly:
+Lessons worth stating plainly:
 
-- DuckDB itself is ACID. A single SQL statement never leaves half its rows behind. The naive atomicity failures come from **multi-step jobs where each step autocommits**, which is how real pipelines usually break: the database kept its promise, the job did not.
-- If state and data can be committed in one transaction, do it. When they cannot (state in Airflow, data in Snowflake), make every write idempotent so that replaying a step is harmless. Hardened shows the first; faultline's retry and rerun faults test the second.
+- **ClickHouse has no multi-statement transactions.** Atomicity comes from swapping whole partitions or tables (`REPLACE PARTITION`, `EXCHANGE TABLES`), and safety from making every step idempotent so that a replay is harmless. That is the situation of most real warehouses and lakes, which is why the hardened patterns here transfer.
+- **Deduplication can be eventual.** `ReplacingMergeTree` removes duplicates when ClickHouse merges parts in the background, at a time nobody controls. A reader that forgets `FINAL` sees duplicates sometimes and not others; the platform must define one stable way for consumers to read.
+- **Cursor and data live in different systems.** dlt stores its cursor with the load in the landing bucket, while bronze lives in ClickHouse. A crash after landing but before bronze leaves the cursor ahead of the warehouse: the next extract finds nothing new, and unless bronze picks up unprocessed landing files the day is silently missing. This is the classic window faultline's execution faults aim at.
 
-**Cursor-driven runs.** The normal schedule uses `RunNext`: the platform reads its own cursor and processes the next partition, as dlt and ADF watermarks do. This is what makes the classic window visible: if naive saves the cursor and then crashes before writing, the orchestrator's retry asks "what is next?" and moves on to the following day. The skipped day is gone and every later run is green.
+**Interrupts.** Planned with the execution faults: the run carries a tag such as `faultline/failpoint=bronze:mid_write`, the asset checks it and exits hard (`os._exit`) inside the run worker, and Dagster records the run as failed. The tag is how faultline tells its own injected crash from a genuine platform failure.
 
 ## 9. Experiment spec, targets and the safety guard
 
@@ -426,6 +442,8 @@ Both snapshot and delta deliveries are intentional: a platform has to build SCD2
 - `unit_price_vnd` is the menu price valid on the order day; promotions are active and their minimum spend is met; stores are open; members joined before the order day.
 - Orders fall between 06:30 and 22:00 local time, with morning, lunch and late afternoon peaks and busier weekends.
 
+**How the files are used.** The generator's files are *change sets*: the POS extract of `dt=D` is exactly what changed in the business on day D. On the reference stack faultline replays each day's change set into the source Postgres before running that day, so dlt's incremental extraction sees time pass the way it would in production. The same files, with their manifests, are what faultline drops straight into a landing zone when it impersonates the ingestion tool (point 2).
+
 **Truth.** Alongside `landing/`, never inside it, the generator writes `truth/control_totals.csv`: per business date and store, the final counts per status, items sold, gross, discount and net revenue after every refund inside the window. The platform never sees it. Together with the key sets read from landing files, it is what the oracle can check outputs against.
 
 ### 10.2 Volume profiles and determinism
@@ -490,14 +508,20 @@ faultline/
     oracle/        fingerprint.py  snapshot.py  diff.py  truth.py
     datagen/       spec.py  catalog.py  dimensions.py  pos.py  writer.py  truth.py  generate.py
     report/        scorecard.py
-    reference_platform/
-                   __main__.py  orchestrator.py  stages.py  naive.py  hardened.py  failpoints.py
+    connectors/    dagster.py  clickhouse.py  postgres.py  workspace.py
+  reference/       the platform under test, never imported by faultline
+    docker-compose.yml
+    clickhouse/    config.d/  users.d/
+    dagster/       Dockerfile  pyproject.toml  requirements.lock  dagster.yaml  workspace.yaml
+                   coffee_platform/   Dagster definitions, dlt and ClickHouse assets
+    dbt/           silver and gold models (added with the pipeline)
   experiments/     *.yaml
   targets/         *.yaml
-  tests/           one folder per package area (datagen/, ...); slow tests marked `integration`
+  tests/           one folder per package area (datagen/, connectors/, reference/, ...);
+                   tests that need the stack are marked `integration`
 ```
 
-Runtime dependencies: typer, pydantic, duckdb, pyyaml, faker. Development: pytest, ruff. Nothing else unless a concrete need proves it.
+Runtime dependencies: typer, faker, then pydantic, duckdb and pyyaml as their features land. The optional extra `faultline[reference]` adds psycopg for the source database connector. Development: pytest, ruff. Nothing else unless a concrete need proves it. The reference platform has its own fully pinned dependency set in `reference/dagster/requirements.lock`, installed only in its image.
 
 ## 12. Expected results (MVP definition of done)
 
@@ -509,28 +533,34 @@ Runtime dependencies: typer, pydantic, duckdb, pyyaml, faker. Development: pytes
 | late-file | SILENT_CORRUPTION | PASS |
 | schema-drift (column rename) | SILENT_CORRUPTION | DETECTED |
 | truncated-file (line boundary) | SILENT_CORRUPTION | DETECTED |
-| crash-mid-write (gold) | SILENT_CORRUPTION (cursor moved first, retry skips the day) | PASS |
-| crash-mid-write (state file) | BROKEN (state.json corrupted, every later run fails) | PASS |
+| late-row-at-source (`updated_at` older than the dlt cursor) | SILENT_CORRUPTION (row never extracted) | PASS |
+| crash between landing and bronze | SILENT_CORRUPTION (cursor ahead of the warehouse, the day never loads) | PASS |
+| crash-mid-write (gold) | SILENT_CORRUPTION (readers see the gap of a two-statement refresh) | PASS |
 | retry-after-partial-commit | SILENT_CORRUPTION (duplicates) | PASS |
 | idempotency and backfill probes | SILENT_CORRUPTION | PASS |
 
+At least one experiment must show `BROKEN` (noisy and unrecoverable); which one is settled when the execution faults are built on the new stack.
+
 ## 13. Design risks
 
-1. **A self-fulfilling demo.** We write both the bugs and the tests, so faultline could end up catching only bugs designed for it. Mitigations: faults are defined against generic contracts (files, runs, keys), never against naive internals; hardened uses established patterns rather than tricks tuned to pass; the first post-MVP adapter (dlt) is the real check.
+1. **A self-fulfilling demo.** We write both the bugs and the tests, so faultline could end up catching only bugs designed for it. Mitigations: faults are defined against generic contracts (files, runs, keys), never against naive internals; hardened uses established patterns rather than tricks tuned to pass; the reference stack is built from real tools (dlt, Dagster, dbt, ClickHouse), and the first adapter for a team's own platform is the real check.
 2. **Non-deterministic baselines.** Volatile columns, floats and row order can make two clean runs differ. Mitigations: canonicalisation, `ignore_columns`, integer money, and a self-check that runs the baseline twice in tests and expects identical fingerprints.
 3. **Failpoints need platform cooperation.** Real tools do not expose them. Mitigation: interrupt points are generic, and each adapter chooses how to realise them (failpoint, cancel API, or kill on an observed event).
 4. **Blurry outcome boundaries.** `DETECTED` versus `BROKEN` versus `SILENT_CORRUPTION` invites argument. Mitigations: the fixed decision table in section 6, injected crashes never count as signals, and every verdict carries evidence.
-5. **Run time.** A subprocess per run costs roughly a second, more on Windows. Mitigations: baseline caching, a small default dataset, and parallel experiments in separate workspaces. Target: `make demo` in about two minutes, measured as soon as the first experiment runs end to end.
-6. **Windows versus Linux.** Windows locks open DuckDB files and has different signal semantics. Mitigations: `os._exit` failpoints, connections closed explicitly, one temp directory per experiment, CI on both ubuntu and windows.
+5. **Run time.** A Dagster run on the reference stack takes about 11 s even for a smoke job (measured), so an experiment with dozens of runs takes minutes. Mitigations: baseline caching, the `tiny` profile or short windows for the demo, several workspaces running in parallel on one stack. `make demo` target to be re-set once the first experiment runs end to end.
+6. **Windows versus Linux.** Integration tests need Linux containers, which GitHub's Windows runners cannot host, so they run on ubuntu only while unit tests still run on Windows. Locally, Git Bash rewrites absolute paths passed to `docker exec` (`/usr/bin/x` becomes `C:/Program Files/Git/usr/bin/x`); set `MSYS_NO_PATHCONV=1` for such commands.
 7. **Combining faults.** With several faults in one experiment, the expected state at intermediate checkpoints becomes hard to define. MVP: one fault per experiment is the norm. Final-state properties stay valid when faults are combined.
 8. **An interface overfitted to one implementation.** Designing the adapter around a single platform risks baking in its quirks. Mitigation: keep the interface minimal now and revise it when the dlt adapter arrives.
 9. **A misconfigured guard.** A target can claim `environment: test` and point at production. Mitigations: per-adapter checks on what they touch, and a clear README warning.
 10. **A rich domain multiplies platform work.** Every dataset the generator adds is something the reference platform must ingest in both modes. Mitigations: domain slices land one at a time and only after the end-to-end demo works; experiments can run on the `tiny` profile or a short window of `demo`.
+11. **A heavier, moving dependency stack.** Seven containers and about 200 pinned Python packages can break on upgrades: SQLAlchemy 2.1 broke Dagster's Postgres storage ("the connection is closed" on every launch) and had to be pinned below 2.1. Mitigations: everything pinned (images by exact tag, Python by lock file), one-command rebuild, CI runs the stack on every pull request.
+12. **A young S3 implementation.** MinIO stopped publishing community images, and RustFS (1.0.x) replaced it. It serves path-style addressing only, so every S3 client must be configured for path style. If it misbehaves, SeaweedFS is the fallback; both speak S3, so only the compose file changes.
+13. **Healthy is not loaded.** A Dagster code server reports healthy even when its definitions fail to import, and jobs then simply "do not exist". The integration fixtures check the code location's load status first and fail with the real import error.
 
 ## 14. After the MVP
 
-- Source-side faults (point 1) with fake sources: a test Postgres, a mock paginated API.
-- Adapters for dlt, Airbyte, ADF, dbt and Dagster.
+- More source-side fakes beyond Postgres (point 1 itself is now in scope through the reference stack): a mock paginated API with duplicate pages and mid-pagination errors.
+- A generic "files plus command" adapter, then adapters for Airbyte, ADF and Databricks jobs.
 - Freshness SLA and alerting checks.
 - Iceberg support.
 - A soak mode with randomised kill timing on top of the deterministic failpoints.
