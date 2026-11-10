@@ -1,0 +1,12 @@
+<!--
+  Merged into the `faultline` user that the image creates from CLICKHOUSE_USER.
+  Users defined in XML cannot receive SQL GRANTs, and reading through the
+  `landing_s3` named collection needs the NAMED COLLECTION privilege.
+-->
+<clickhouse>
+    <users>
+        <faultline>
+            <named_collection_control>1</named_collection_control>
+        </faultline>
+    </users>
+</clickhouse>

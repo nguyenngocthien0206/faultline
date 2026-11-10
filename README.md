@@ -10,12 +10,18 @@ faultline injects faults into ingestion and pipelines (duplicate files, late dat
 
 ## Development
 
-Requires [uv](https://docs.astral.sh/uv/) and GNU Make.
+Requires [uv](https://docs.astral.sh/uv/) and GNU Make. The reference platform (Postgres, dlt, an S3 landing bucket, ClickHouse, dbt and Dagster) also needs Docker, for example Docker Desktop.
 
 ```sh
-make install   # create .venv and install dependencies
-make check     # lint, format check and tests
+make install            # create .venv and install dependencies
+make check              # lint, format check and the tests that need no Docker
+
+make ref-up             # build and start the reference platform (first build takes a few minutes)
+make test-integration   # run the tests that drive the real platform
+make ref-down           # stop it and delete its data
 ```
+
+While the reference platform is up, the Dagster UI is at <http://localhost:3000> and the S3 console at <http://localhost:9001/rustfs/console/> (`faultline` / `faultline-secret`). Every credential in `reference/docker-compose.yml` is a throwaway test value and every port is bound to localhost.
 
 ## License
 

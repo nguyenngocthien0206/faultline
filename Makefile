@@ -1,8 +1,10 @@
 .DEFAULT_GOAL := help
-.PHONY: help install lint fmt test test-unit check clean
+.PHONY: help install lint fmt test test-integration check clean ref-up ref-down ref-ps ref-logs
+
+COMPOSE := docker compose -f reference/docker-compose.yml
 
 help: ## Show available targets
-	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-12s %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-17s %s\n", $$1, $$2}'
 
 install: ## Create .venv and install all dependencies from uv.lock
 	uv sync --locked
@@ -15,13 +17,25 @@ fmt: ## Auto-fix lint issues and format the code
 	uv run ruff check --fix .
 	uv run ruff format .
 
-test: ## Run the full test suite
-	uv run pytest
-
-test-unit: ## Run tests without the slower integration ones
+test: ## Run the tests that need no Docker
 	uv run pytest -m "not integration"
 
-check: lint test ## Everything CI runs
+test-integration: ## Run the tests against the reference stack (start it with ref-up)
+	FAULTLINE_REQUIRE_STACK=1 uv run pytest -m integration
+
+check: lint test ## Lint and Docker-free tests, what CI runs on every OS
+
+ref-up: ## Build and start the reference stack, wait until it is healthy
+	$(COMPOSE) up -d --build --wait
+
+ref-down: ## Stop the reference stack and delete its volumes
+	$(COMPOSE) down -v
+
+ref-ps: ## Show the reference stack services
+	$(COMPOSE) ps -a
+
+ref-logs: ## Follow the reference stack logs
+	$(COMPOSE) logs -f --tail 100
 
 clean: ## Remove caches, build output and faultline workspaces
 	rm -rf .pytest_cache .ruff_cache dist build .faultline
