@@ -1,6 +1,6 @@
 # faultline design
 
-Status: draft for review (step 1, before M0). Nothing here is implemented yet.
+Status: draft for review. Nothing here is implemented yet.
 
 ## 1. Purpose and scope
 
@@ -88,7 +88,7 @@ Why: a crash must be a real crash. If the platform ran in faultline's process, a
 
 ## 4. Key interfaces
 
-Signatures are indicative; exact types land in M2 to M4.
+Signatures are indicative; exact types are settled when each interface is implemented.
 
 ### 4.1 Adapter
 
@@ -171,7 +171,7 @@ class FaultInjector(ABC):
     def affected_partitions(self, ctx: FaultContext) -> set[date]: ...
 ```
 
-MVP faults (M3):
+MVP faults:
 
 | Fault | Point | What it does | Heal |
 |---|---|---|---|
@@ -409,7 +409,6 @@ faultline/
   .github/workflows/ci.yml
   docs/
     design.md
-    adr/
   src/faultline/
     cli.py  spec.py  safety.py  runner.py  trace.py  outcome.py
     adapters/      base.py  reference.py  registry.py
@@ -427,7 +426,7 @@ faultline/
     integration/
 ```
 
-Runtime dependencies: typer, pydantic, duckdb, pyyaml, faker. Development: pytest, ruff. Nothing else unless a milestone proves it is needed.
+Runtime dependencies: typer, pydantic, duckdb, pyyaml, faker. Development: pytest, ruff. Nothing else unless a concrete need proves it.
 
 ## 12. Expected results (MVP definition of done)
 
@@ -450,24 +449,13 @@ Runtime dependencies: typer, pydantic, duckdb, pyyaml, faker. Development: pytes
 2. **Non-deterministic baselines.** Volatile columns, floats and row order can make two clean runs differ. Mitigations: canonicalisation, `ignore_columns`, integer money, and a self-check that runs the baseline twice in tests and expects identical fingerprints.
 3. **Failpoints need platform cooperation.** Real tools do not expose them. Mitigation: interrupt points are generic, and each adapter chooses how to realise them (failpoint, cancel API, or kill on an observed event).
 4. **Blurry outcome boundaries.** `DETECTED` versus `BROKEN` versus `SILENT_CORRUPTION` invites argument. Mitigations: the fixed decision table in section 6, injected crashes never count as signals, and every verdict carries evidence.
-5. **Run time.** A subprocess per run costs roughly a second, more on Windows. Mitigations: baseline caching, a small default dataset, and parallel experiments in separate workspaces. Target: `make demo` in about two minutes, measured in M2.
+5. **Run time.** A subprocess per run costs roughly a second, more on Windows. Mitigations: baseline caching, a small default dataset, and parallel experiments in separate workspaces. Target: `make demo` in about two minutes, measured as soon as the first experiment runs end to end.
 6. **Windows versus Linux.** Windows locks open DuckDB files and has different signal semantics. Mitigations: `os._exit` failpoints, connections closed explicitly, one temp directory per experiment, CI on both ubuntu and windows.
 7. **Combining faults.** With several faults in one experiment, the expected state at intermediate checkpoints becomes hard to define. MVP: one fault per experiment is the norm. Final-state properties stay valid when faults are combined.
 8. **An interface overfitted to one implementation.** Designing the adapter around a single platform risks baking in its quirks. Mitigation: keep the interface minimal now and revise it when the dlt adapter arrives.
 9. **A misconfigured guard.** A target can claim `environment: test` and point at production. Mitigations: per-adapter checks on what they touch, and a clear README warning.
 
-## 14. Planned ADRs
-
-To be written in step 2, once this design is approved:
-
-- 0001 Hybrid oracle: differential baseline plus key invariants
-- 0002 Schedule of actions, faults as schedule transformers
-- 0003 Deterministic failpoints instead of random kills
-- 0004 Parquet snapshot handoff from adapters
-- 0005 Outcome classification: what counts as a signal, and the ERROR outcome
-- 0006 Reference platform inside the package, isolated by an import test
-
-## 15. After the MVP
+## 14. After the MVP
 
 - Source-side faults (point 1) with fake sources: a test Postgres, a mock paginated API.
 - Adapters for dlt, Airbyte, ADF, dbt and Dagster.
