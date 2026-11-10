@@ -1,0 +1,25 @@
+# Dagster instance shared by the code server, webserver and daemon.
+storage:
+  postgres:
+    postgres_db:
+      hostname: dagster-db
+      port: 5432
+      db_name:
+        env: DAGSTER_PG_DB
+      username:
+        env: DAGSTER_PG_USER
+      password:
+        env: DAGSTER_PG_PASSWORD
+
+# Runs start as soon as they are launched (no queue) and execute inside the
+# code server container, so no Docker socket is needed.
+run_coordinator:
+  module: dagster.core.run_coordinator
+  class: DefaultRunCoordinator
+
+run_launcher:
+  module: dagster.core.launcher
+  class: DefaultRunLauncher
+
+telemetry:
+  enabled: false

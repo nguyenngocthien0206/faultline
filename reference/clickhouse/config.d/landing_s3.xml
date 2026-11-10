@@ -1,0 +1,17 @@
+<!--
+  Named collection for the landing bucket, so SQL never carries credentials:
+    SELECT * FROM s3(landing_s3, filename = 'fl_ab12cd34/pos/orders/dt=2026-11-01/*.parquet')
+  Test-only credentials, matching docker-compose.yml.
+-->
+<clickhouse>
+    <named_collections>
+        <landing_s3>
+            <url>http://rustfs:9000/landing/</url>
+            <access_key_id>faultline</access_key_id>
+            <secret_access_key>faultline-secret</secret_access_key>
+        </landing_s3>
+    </named_collections>
+    <logger>
+        <level>warning</level>
+    </logger>
+</clickhouse>

@@ -1,0 +1,24 @@
+[project]
+name = "coffee-platform"
+version = "0.1.0"
+description = "Reference data platform for faultline: dlt + ClickHouse + dbt, orchestrated by Dagster."
+requires-python = ">=3.11,<3.12"
+# Direct dependencies only. The image installs the fully pinned requirements.lock,
+# regenerated with:
+#   uv pip compile pyproject.toml --python-version 3.11 --python-platform linux -o requirements.lock
+dependencies = [
+    "dagster==1.13.29",
+    "dagster-webserver==1.13.29",
+    "dagster-postgres==0.29.29",
+    "dagster-dlt==0.29.29",
+    "dagster-dbt==0.29.29",
+    "dlt[sql_database,filesystem,s3,parquet]==1.32.0",
+    "psycopg2-binary==2.9.13",  # dlt sql_database (SQLAlchemy default driver)
+    "psycopg[binary]==3.3.8",  # dagster-postgres storage
+    "dbt-core==1.12.6",
+    "dbt-clickhouse==1.10.3",
+    "clickhouse-connect==1.12.0",
+    # dagster-postgres 0.29 loses its storage connection on SQLAlchemy 2.1
+    # ("the connection is closed" on every launchRun). Keep 2.0 until fixed.
+    "sqlalchemy>=2.0,<2.1",
+]

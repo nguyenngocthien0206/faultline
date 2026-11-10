@@ -1,0 +1,183 @@
+# faultline reference platform: a small but real data stack for faultline to break.
+#
+#   source-db (Postgres) --dlt--> rustfs (S3 landing) --> clickhouse --dbt--> silver, gold
+#                     all orchestrated by Dagster (code server, webserver, daemon)
+#
+# TEST ONLY. Every credential below is a fixed throwaway value and every port is
+# bound to 127.0.0.1. Never reuse this file for anything holding real data.
+#
+#   make ref-up     build and start, wait until healthy
+#   make ref-down   stop and delete all volumes
+
+name: faultline-reference
+
+x-dagster-env: &dagster-env
+  DAGSTER_PG_DB: dagster
+  DAGSTER_PG_USER: dagster
+  DAGSTER_PG_PASSWORD: dagster
+  CLICKHOUSE_HOST: clickhouse
+  CLICKHOUSE_PORT: "8123"
+  CLICKHOUSE_USER: faultline
+  CLICKHOUSE_PASSWORD: faultline
+  # dlt reads its configuration from environment variables.
+  SOURCES__SQL_DATABASE__CREDENTIALS: postgresql://faultline:faultline@source-db:5432/coffee
+  DESTINATION__FILESYSTEM__CREDENTIALS__AWS_ACCESS_KEY_ID: faultline
+  DESTINATION__FILESYSTEM__CREDENTIALS__AWS_SECRET_ACCESS_KEY: faultline-secret
+  DESTINATION__FILESYSTEM__CREDENTIALS__ENDPOINT_URL: http://rustfs:9000
+  DESTINATION__FILESYSTEM__CREDENTIALS__REGION_NAME: us-east-1
+  DESTINATION__FILESYSTEM__CREDENTIALS__S3_URL_STYLE: path  # RustFS serves path-style only
+  RUNTIME__DLTHUB_TELEMETRY: "false"
+
+x-dagster-image: &dagster-image
+  image: faultline-reference-dagster:dev
+  environment: *dagster-env
+
+services:
+  source-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: faultline
+      POSTGRES_PASSWORD: faultline
+      POSTGRES_DB: coffee
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - source-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U faultline -d coffee"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  rustfs:
+    image: rustfs/rustfs:1.0.4
+    environment:
+      RUSTFS_ACCESS_KEY: faultline
+      RUSTFS_SECRET_KEY: faultline-secret
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_VOLUMES: /data
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - rustfs-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/health > /dev/null"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # One-shot: create the landing bucket, then exit.
+  rustfs-init:
+    image: amazon/aws-cli:2.39.6
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: faultline
+      AWS_SECRET_ACCESS_KEY: faultline-secret
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket landing 2>/dev/null
+        || aws --endpoint-url http://rustfs:9000 s3 mb s3://landing
+    restart: "no"
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.8.16.41
+    environment:
+      CLICKHOUSE_USER: faultline
+      CLICKHOUSE_PASSWORD: faultline
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+      TZ: UTC
+    ports:
+      - "127.0.0.1:8123:8123"
+    volumes:
+      - ./clickhouse/config.d/landing_s3.xml:/etc/clickhouse-server/config.d/landing_s3.xml:ro
+      - ./clickhouse/users.d/named_collections.xml:/etc/clickhouse-server/users.d/named_collections.xml:ro
+      - clickhouse-data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping | grep -q Ok"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  dagster-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: dagster
+      POSTGRES_PASSWORD: dagster
+      POSTGRES_DB: dagster
+    volumes:
+      - dagster-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dagster -d dagster"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  dagster-code:
+    <<: *dagster-image
+    build: ./dagster
+    command:
+      - dagster
+      - code-server
+      - start
+      - --host=0.0.0.0
+      - --port=4000
+      - --module-name=coffee_platform.definitions
+      - --location-name=coffee_platform
+    depends_on:
+      dagster-db:
+        condition: service_healthy
+      source-db:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      rustfs-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "dagster", "api", "grpc-health-check", "--port", "4000"]
+      interval: 3s
+      timeout: 10s
+      retries: 40
+
+  dagster-webserver:
+    <<: *dagster-image
+    command:
+      - dagster-webserver
+      - --host=0.0.0.0
+      - --port=3000
+      - --workspace=/opt/dagster/home/workspace.yaml
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      dagster-code:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:3000/server_info', timeout=3)"
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+  dagster-daemon:
+    <<: *dagster-image
+    command: ["dagster-daemon", "run", "--workspace=/opt/dagster/home/workspace.yaml"]
+    depends_on:
+      dagster-code:
+        condition: service_healthy
+
+volumes:
+  source-db-data:
+  rustfs-data:
+  clickhouse-data:
+  dagster-db-data:
