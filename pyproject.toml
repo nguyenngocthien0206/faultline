@@ -26,8 +26,14 @@ Repository = "https://github.com/nguyenngocthien0206/faultline"
 [project.scripts]
 faultline = "faultline.cli:app"
 
+[project.optional-dependencies]
+reference = [
+    "psycopg[binary]>=3.3.8",
+]
+
 [dependency-groups]
 dev = [
+    "psycopg[binary]>=3.3.8",
     "pytest>=9.2.0",
     "ruff>=0.17.4",
 ]
