@@ -1,0 +1,19 @@
+version: 2
+
+sources:
+  - name: bronze
+    description: Raw POS change rows appended from the landing bucket by Dagster assets.
+    schema: "{{ var('workspace') }}"
+    tables:
+      - name: bronze_orders
+        meta:
+          dagster:
+            asset_key: ["bronze_orders"]
+      - name: bronze_order_items
+        meta:
+          dagster:
+            asset_key: ["bronze_order_items"]
+      - name: bronze_payments
+        meta:
+          dagster:
+            asset_key: ["bronze_payments"]

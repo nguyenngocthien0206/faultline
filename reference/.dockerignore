@@ -1,0 +1,6 @@
+# The image build context is reference/. Keep credentials and local dbt output out of it.
+.env
+.env.*
+dbt/target/
+dbt/logs/
+**/__pycache__/

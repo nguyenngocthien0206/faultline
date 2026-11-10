@@ -1,5 +1,5 @@
 # One image for the three Dagster services (code server, webserver, daemon),
-# like Dagster's own Docker deployment example.
+# like Dagster's own Docker deployment example. Build context: reference/.
 FROM python:3.11-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -14,11 +14,17 @@ COPY --from=ghcr.io/astral-sh/uv:0.11.14 /uv /usr/local/bin/uv
 # Dependencies first, in their own layer, so code changes rebuild in seconds.
 # The cache mount keeps downloaded wheels across builds: when the lock changes,
 # only the changed packages are fetched again.
-COPY requirements.lock /tmp/requirements.lock
+COPY dagster/requirements.lock /tmp/requirements.lock
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system -r /tmp/requirements.lock
 
-COPY dagster.yaml workspace.yaml ${DAGSTER_HOME}/
-COPY coffee_platform /opt/dagster/app/coffee_platform
+COPY dagster/dagster.yaml dagster/workspace.yaml ${DAGSTER_HOME}/
+
+# dbt project, parsed at build time so dagster-dbt finds target/manifest.json.
+# Parsing never connects to the warehouse.
+COPY dbt /opt/dagster/app/dbt
+RUN dbt parse --project-dir /opt/dagster/app/dbt --profiles-dir /opt/dagster/app/dbt --quiet
+
+COPY dagster/coffee_platform /opt/dagster/app/coffee_platform
 
 WORKDIR /opt/dagster/app
