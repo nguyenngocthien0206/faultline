@@ -9,6 +9,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from faultline.adapters.reference import ReferenceStackConfig
 from faultline.connectors.clickhouse import ClickHouseClient
 from faultline.connectors.dagster import DagsterClient
 from faultline.connectors.postgres import SourceDatabase
@@ -38,6 +39,19 @@ def stack_settings() -> dict[str, str]:
     settings = parse_env_file(env_file)
     settings.update({k: v for k, v in os.environ.items() if k in settings})
     return settings
+
+
+def reference_config() -> ReferenceStackConfig:
+    """Adapter configuration for the local stack, from the same settings as Stack."""
+    s = stack_settings()
+    return ReferenceStackConfig(
+        source_dsn=(
+            f"postgresql://{s['SOURCE_DB_USER']}:{s['SOURCE_DB_PASSWORD']}"
+            f"@127.0.0.1:5433/{s['SOURCE_DB_NAME']}"
+        ),
+        clickhouse_user=s["CLICKHOUSE_USER"],
+        clickhouse_password=s["CLICKHOUSE_PASSWORD"],
+    )
 
 
 @dataclass
