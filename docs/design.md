@@ -336,7 +336,22 @@ Every port binds to `127.0.0.1`. Credentials are test-only values kept in one pl
 
 **Black box.** The platform code (`reference/dagster/coffee_platform`) never imports faultline, and faultline never imports it; they live in different processes, images and dependency sets. faultline touches the platform only through the source database, the bucket, Dagster's GraphQL API and ClickHouse's HTTP API, exactly what an adapter for a team's stack would use. The demo therefore cannot cheat.
 
-**Consumer-visible tables** (planned, settled when the pipeline is built). Silver: `orders` (key `order_id`, latest state), `order_items` (key `order_id, line_no`), `payments` (key `payment_id`). Gold: `daily_store_sales` (key `order_date, store_id`; measures `orders`, `items_sold`, `gross_vnd`, `discount_vnd`, `net_vnd`), keyed by the day the order was placed, and `daily_payments`.
+**The POS pipeline.** One Dagster job, `pos_daily`, partitioned by day; each run executes in a single process (`in_process_executor`, which saves about 15 s of re-imports per step):
+
+1. `pos_landing` (dlt `sql_database`): extracts `orders`, `order_items` and `payments` incrementally on `updated_at`, `created_at` and `paid_at`, and writes Parquet to `landing/<ws>/pos/<table>/dt=<partition>/`.
+2. `bronze_<table>` (ClickHouse): appends the partition's landing files with `INSERT ... SELECT FROM s3()`, adding `_source_file` and `_dt`. Tables take the schema of the first file seen.
+3. dbt models (dagster-dbt, one asset per model), all in the workspace database:
+
+| Table | Key | Materialization | Content |
+|---|---|---|---|
+| `silver_order_events` | none (change log) | view | every order row the source emitted, typed, with `extracted_on` |
+| `silver_orders` | `order_id` | view | latest state per order (`argMax` by `updated_at`) |
+| `silver_order_items` | `order_id, line_no` | view | order lines |
+| `silver_payments` | `payment_id` | view | charges and negative refund rows |
+| `gold_daily_store_sales` | `order_date, store_id` | incremental `delete_insert` | `orders`, `items_sold`, `gross_vnd`, `discount_vnd`, `net_vnd` per business day (Vietnam time) |
+| `gold_daily_payments` | `paid_date, store_id, method` | incremental `delete_insert` | `charges`, `charged_vnd`, `refunded_vnd`, `net_vnd` |
+
+Gold recomputes only the business days touched by the run's extract: the day itself plus the original days of refunds that came in. On the happy path the naive gold matches the generator's truth to the dong (checked by `tests/reference/test_naive_pipeline.py`).
 
 **Naive versus hardened.** Naive is not a strawman. Every one of its choices is common in real pipelines and passes a happy-path test. Order lifecycle updates (voids, refunds days later) are part of the steady state, so naive does produce the right numbers when every change arrives once and in order. It breaks only when faults hit it.
 
@@ -428,7 +443,7 @@ faultline generates its own source data: a simulated Vietnamese coffee chain. Th
 | `backoffice/promotions` | full daily snapshot | `promo_code` | weekly campaigns with validity windows, plus one evergreen offer |
 | `backoffice/members` | full on the first day, **delta** afterwards | `member_id` | new members, monthly tier upgrades |
 | `pos/orders` | daily change extract per store | `order_id` | status: `completed`, `voided` (same day), `refunded` (one to three days later) |
-| `pos/order_items` | with the order, on the day it is placed | `order_id, line_no` | immutable |
+| `pos/order_items` | with the order, on the day it is placed | `order_id, line_no` | immutable; `created_at` equals the order's `ordered_at` and is the extraction cursor |
 | `pos/payments` | daily per store | `payment_id` | charges (about 10% split across two methods), negative refund rows |
 
 Both snapshot and delta deliveries are intentional: a platform has to build SCD2 history from snapshots (compare today with yesterday) and merge deltas, the two patterns teams meet most.
@@ -509,12 +524,13 @@ faultline/
     datagen/       spec.py  catalog.py  dimensions.py  pos.py  writer.py  truth.py  generate.py
     report/        scorecard.py
     connectors/    dagster.py  clickhouse.py  postgres.py  workspace.py
+    sources/       pos.py   (fake POS source: tables and day-by-day replay)
   reference/       the platform under test, never imported by faultline
     docker-compose.yml  .env.example   (credentials; the real .env is gitignored)
     clickhouse/    entrypoint.sh  config.d/
     dagster/       Dockerfile  pyproject.toml  requirements.lock  dagster.yaml  workspace.yaml
                    coffee_platform/   Dagster definitions, dlt and ClickHouse assets
-    dbt/           silver and gold models (added with the pipeline)
+    dbt/           dbt project: silver and gold models, ClickHouse profile
   experiments/     *.yaml
   targets/         *.yaml
   tests/           one folder per package area (datagen/, connectors/, reference/, ...);
@@ -547,7 +563,7 @@ At least one experiment must show `BROKEN` (noisy and unrecoverable); which one 
 2. **Non-deterministic baselines.** Volatile columns, floats and row order can make two clean runs differ. Mitigations: canonicalisation, `ignore_columns`, integer money, and a self-check that runs the baseline twice in tests and expects identical fingerprints.
 3. **Failpoints need platform cooperation.** Real tools do not expose them. Mitigation: interrupt points are generic, and each adapter chooses how to realise them (failpoint, cancel API, or kill on an observed event).
 4. **Blurry outcome boundaries.** `DETECTED` versus `BROKEN` versus `SILENT_CORRUPTION` invites argument. Mitigations: the fixed decision table in section 6, injected crashes never count as signals, and every verdict carries evidence.
-5. **Run time.** A Dagster run on the reference stack takes about 11 s even for a smoke job (measured), so an experiment with dozens of runs takes minutes. Mitigations: baseline caching, the `tiny` profile or short windows for the demo, several workspaces running in parallel on one stack. `make demo` target to be re-set once the first experiment runs end to end.
+5. **Run time.** One `pos_daily` run takes about 27 s on Docker Desktop (measured; about 40 s from launch, since the run worker spends some 13 s importing code first). Most of it is fixed cost: importing dbt and its ClickHouse adapter alone takes about 10 s, while the six models execute in under 2 s. An experiment with dozens of runs therefore takes minutes. Mitigations: baseline caching, the `tiny` profile or short windows for the demo, several workspaces running in parallel on one stack. Not yet done: avoiding dbt's full re-parse on every run (changing `--vars` invalidates partial parsing, about 3 to 4 s). `make demo` target to be re-set once the first experiment runs end to end.
 6. **Windows versus Linux.** Integration tests need Linux containers, which GitHub's Windows runners cannot host, so they run on ubuntu only while unit tests still run on Windows. Locally, Git Bash rewrites absolute paths passed to `docker exec` (`/usr/bin/x` becomes `C:/Program Files/Git/usr/bin/x`); set `MSYS_NO_PATHCONV=1` for such commands.
 7. **Combining faults.** With several faults in one experiment, the expected state at intermediate checkpoints becomes hard to define. MVP: one fault per experiment is the norm. Final-state properties stay valid when faults are combined.
 8. **An interface overfitted to one implementation.** Designing the adapter around a single platform risks baking in its quirks. Mitigation: keep the interface minimal now and revise it when the dlt adapter arrives.
