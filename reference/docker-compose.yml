@@ -3,8 +3,9 @@
 #   source-db (Postgres) --dlt--> rustfs (S3 landing) --> clickhouse --dbt--> silver, gold
 #                     all orchestrated by Dagster (code server, webserver, daemon)
 #
-# TEST ONLY. Every credential below is a fixed throwaway value and every port is
-# bound to 127.0.0.1. Never reuse this file for anything holding real data.
+# TEST ONLY. Credentials come from reference/.env (gitignored), which `make ref-up`
+# creates from .env.example on first use. Every port is bound to 127.0.0.1.
+# `${VAR:?}` makes compose stop with a clear error when a variable is missing.
 #
 #   make ref-up     build and start, wait until healthy
 #   make ref-down   stop and delete all volumes
@@ -12,17 +13,17 @@
 name: faultline-reference
 
 x-dagster-env: &dagster-env
-  DAGSTER_PG_DB: dagster
-  DAGSTER_PG_USER: dagster
-  DAGSTER_PG_PASSWORD: dagster
+  DAGSTER_PG_DB: ${DAGSTER_DB_NAME:?set in reference/.env}
+  DAGSTER_PG_USER: ${DAGSTER_DB_USER:?set in reference/.env}
+  DAGSTER_PG_PASSWORD: ${DAGSTER_DB_PASSWORD:?set in reference/.env}
   CLICKHOUSE_HOST: clickhouse
   CLICKHOUSE_PORT: "8123"
-  CLICKHOUSE_USER: faultline
-  CLICKHOUSE_PASSWORD: faultline
+  CLICKHOUSE_USER: ${CLICKHOUSE_USER:?set in reference/.env}
+  CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set in reference/.env}
   # dlt reads its configuration from environment variables.
-  SOURCES__SQL_DATABASE__CREDENTIALS: postgresql://faultline:faultline@source-db:5432/coffee
-  DESTINATION__FILESYSTEM__CREDENTIALS__AWS_ACCESS_KEY_ID: faultline
-  DESTINATION__FILESYSTEM__CREDENTIALS__AWS_SECRET_ACCESS_KEY: faultline-secret
+  SOURCES__SQL_DATABASE__CREDENTIALS: postgresql://${SOURCE_DB_USER:?set in reference/.env}:${SOURCE_DB_PASSWORD:?set in reference/.env}@source-db:5432/${SOURCE_DB_NAME:?set in reference/.env}
+  DESTINATION__FILESYSTEM__CREDENTIALS__AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:?set in reference/.env}
+  DESTINATION__FILESYSTEM__CREDENTIALS__AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:?set in reference/.env}
   DESTINATION__FILESYSTEM__CREDENTIALS__ENDPOINT_URL: http://rustfs:9000
   DESTINATION__FILESYSTEM__CREDENTIALS__REGION_NAME: us-east-1
   DESTINATION__FILESYSTEM__CREDENTIALS__S3_URL_STYLE: path  # RustFS serves path-style only
@@ -36,15 +37,16 @@ services:
   source-db:
     image: postgres:16
     environment:
-      POSTGRES_USER: faultline
-      POSTGRES_PASSWORD: faultline
-      POSTGRES_DB: coffee
+      POSTGRES_USER: ${SOURCE_DB_USER:?set in reference/.env}
+      POSTGRES_PASSWORD: ${SOURCE_DB_PASSWORD:?set in reference/.env}
+      POSTGRES_DB: ${SOURCE_DB_NAME:?set in reference/.env}
     ports:
       - "127.0.0.1:5433:5432"
     volumes:
       - source-db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U faultline -d coffee"]
+      # $$ defers expansion to the container, which has these variables set.
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 2s
       timeout: 3s
       retries: 30
@@ -52,8 +54,8 @@ services:
   rustfs:
     image: rustfs/rustfs:1.0.4
     environment:
-      RUSTFS_ACCESS_KEY: faultline
-      RUSTFS_SECRET_KEY: faultline-secret
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:?set in reference/.env}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:?set in reference/.env}
       RUSTFS_CONSOLE_ENABLE: "true"
       RUSTFS_VOLUMES: /data
     ports:
@@ -74,8 +76,8 @@ services:
       rustfs:
         condition: service_healthy
     environment:
-      AWS_ACCESS_KEY_ID: faultline
-      AWS_SECRET_ACCESS_KEY: faultline-secret
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:?set in reference/.env}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:?set in reference/.env}
       AWS_DEFAULT_REGION: us-east-1
     entrypoint: ["sh", "-c"]
     command:
@@ -86,16 +88,22 @@ services:
 
   clickhouse:
     image: clickhouse/clickhouse-server:26.8.16.41
+    # Wrapper: grants the configured user named collection access, then runs
+    # the image's own entrypoint (see clickhouse/entrypoint.sh).
+    entrypoint: ["sh", "/faultline/entrypoint.sh"]
     environment:
-      CLICKHOUSE_USER: faultline
-      CLICKHOUSE_PASSWORD: faultline
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:?set in reference/.env}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set in reference/.env}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+      # Read by the landing_s3 named collection (config.d/landing_s3.xml).
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set in reference/.env}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?set in reference/.env}
       TZ: UTC
     ports:
       - "127.0.0.1:8123:8123"
     volumes:
+      - ./clickhouse/entrypoint.sh:/faultline/entrypoint.sh:ro
       - ./clickhouse/config.d/landing_s3.xml:/etc/clickhouse-server/config.d/landing_s3.xml:ro
-      - ./clickhouse/users.d/named_collections.xml:/etc/clickhouse-server/users.d/named_collections.xml:ro
       - clickhouse-data:/var/lib/clickhouse
     ulimits:
       nofile:
@@ -110,13 +118,13 @@ services:
   dagster-db:
     image: postgres:16
     environment:
-      POSTGRES_USER: dagster
-      POSTGRES_PASSWORD: dagster
-      POSTGRES_DB: dagster
+      POSTGRES_USER: ${DAGSTER_DB_USER:?set in reference/.env}
+      POSTGRES_PASSWORD: ${DAGSTER_DB_PASSWORD:?set in reference/.env}
+      POSTGRES_DB: ${DAGSTER_DB_NAME:?set in reference/.env}
     volumes:
       - dagster-db-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U dagster -d dagster"]
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 2s
       timeout: 3s
       retries: 30
