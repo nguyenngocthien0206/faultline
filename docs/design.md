@@ -94,12 +94,12 @@ Signatures are indicative; exact types are settled when each interface is implem
 
 ```python
 class Capability(StrEnum):
-    LANDING_FILES = "landing.files"          # can place arbitrary files in landing
-    RUN_NEXT = "run.next"                    # platform picks the next partition from its own cursor
-    RUN_PARTITION = "run.partition"          # run one explicit partition
-    RUN_BACKFILL = "run.backfill"            # run a date range
+    LANDING_FILES = "landing.files"  # can place arbitrary files in landing
+    RUN_NEXT = "run.next"  # platform picks the next partition from its own cursor
+    RUN_PARTITION = "run.partition"  # run one explicit partition
+    RUN_BACKFILL = "run.backfill"  # run a date range
     INTERRUPT_FAILPOINT = "interrupt.failpoint"
-    SIGNALS_ALERTS = "signals.alerts"        # exposes alerts beyond exit status
+    SIGNALS_ALERTS = "signals.alerts"  # exposes alerts beyond exit status
 
 
 class InterruptPoint(StrEnum):
@@ -111,7 +111,7 @@ class InterruptPoint(StrEnum):
 
 @dataclass(frozen=True)
 class Interrupt:
-    stage: str               # "ingest" | "transform" | "aggregate" | "state" ... adapter-defined
+    stage: str  # "ingest" | "transform" | "aggregate" | "state" ... adapter-defined
     point: InterruptPoint
 
 
@@ -136,15 +136,16 @@ class RunResult:
 class Capabilities:
     features: frozenset[Capability]
     interrupt_points: frozenset[tuple[str, InterruptPoint]]
-    consumer_tables: dict[str, TableContract]   # table name -> key columns, measure columns, ignore columns
+    # table name -> key columns, measure columns, ignore columns
+    consumer_tables: dict[str, TableContract]
 
 
 class Adapter(ABC):
     def capabilities(self) -> Capabilities: ...
-    def setup(self, workdir: Path) -> None: ...                      # fresh, isolated environment
-    def place_input(self, item: InputFile) -> None: ...              # dataset, partition, filename, bytes
+    def setup(self, workdir: Path) -> None: ...  # fresh, isolated environment
+    def place_input(self, item: InputFile) -> None: ...  # dataset, partition, filename, bytes
     def trigger_run(self, request: RunRequest) -> RunResult: ...
-    def read_output(self, table: str, dest: Path) -> Path: ...       # Parquet snapshot
+    def read_output(self, table: str, dest: Path) -> Path: ...  # Parquet snapshot
     def teardown(self) -> None: ...
 ```
 
@@ -167,7 +168,8 @@ class FaultInjector(ABC):
     requires: ClassVar[frozenset[Capability]]
 
     def apply(self, schedule: Schedule, ctx: FaultContext) -> Schedule: ...
-    def heal(self, ctx: FaultContext) -> list[Action]: ...        # undo the cause, e.g. redeliver the correct file
+    # undo the cause, e.g. redeliver the correct file
+    def heal(self, ctx: FaultContext) -> list[Action]: ...
     def affected_partitions(self, ctx: FaultContext) -> set[date]: ...
 ```
 
@@ -197,15 +199,15 @@ class Verdict(StrEnum):
 class PropertyResult:
     verdict: Verdict
     checkpoint: str | None
-    evidence: str           # one human readable line, plus structured diff counts
-    reason: str | None      # for SKIPPED
+    evidence: str  # one human readable line, plus structured diff counts
+    reason: str | None  # for SKIPPED
 
 
 class Property(ABC):
     name: ClassVar[str]
     requires: ClassVar[frozenset[Capability]]
 
-    def probe(self, ctx: ProbeContext) -> list[Action]:   # default: no probe
+    def probe(self, ctx: ProbeContext) -> list[Action]:  # default: no probe
         return []
 
     def check(self, trace: Trace, oracle: Oracle) -> list[PropertyResult]: ...
@@ -222,7 +224,7 @@ The oracle is **hybrid**:
 
 ```python
 class Oracle:
-    def expected(self, step: int) -> Snapshot: ...                     # baseline after logical step
+    def expected(self, step: int) -> Snapshot: ...  # baseline after logical step
     def final(self) -> Snapshot: ...
     def check_invariants(self, snapshot: Snapshot) -> list[Violation]: ...
 ```

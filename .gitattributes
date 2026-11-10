@@ -1,0 +1,6 @@
+# Store and check out text files with LF everywhere, so Windows and Linux
+# contributors produce identical files and Makefile recipes keep working.
+* text=auto eol=lf
+
+*.parquet binary
+*.duckdb binary
