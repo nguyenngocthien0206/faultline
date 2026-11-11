@@ -6,7 +6,7 @@ faultline injects faults into ingestion and pipelines (duplicate files, late dat
 
 > **Warning:** faultline deliberately corrupts and deletes data. Point it only at disposable test or CI environments. A target must declare `environment: test` and `allow_destructive: true`, or faultline refuses to run.
 
-**Status:** early development. One experiment runs end to end against the bundled reference platform. See [docs/design.md](docs/design.md) for the design.
+**Status:** early development. One experiment runs end to end against both editions of the bundled reference platform. See [docs/design.md](docs/design.md) for the design.
 
 ## Try it
 
@@ -14,8 +14,9 @@ With Docker running:
 
 ```sh
 make install
-make ref-up                                   # Postgres, dlt, S3, ClickHouse, dbt, Dagster
-uv run faultline run pos-offline-sync         # about 8 minutes on a laptop
+make ref-up                                              # Postgres, dlt, S3, ClickHouse, dbt, Dagster
+uv run faultline run pos-offline-sync                    # naive edition, about 8 minutes on a laptop
+uv run faultline run pos-offline-sync --target hardened  # hardened edition
 ```
 
 `pos-offline-sync` takes a store's till offline for two days. When it reconnects, its orders reach the source database with their real, older timestamps, behind the incremental cursor of the ingestion tool. On the reference platform's naive pipeline the result looks like this:
@@ -33,6 +34,8 @@ Evidence at F:
 
 Every run was green, so no alert fired and nobody would have been paged, yet two days of one store's sales are gone. Rerunning the days, the usual fix, does not bring them back and double counts the other stores instead (net revenue +35.5% at checkpoint R). That is the gap faultline measures. At checkpoint F, the usual data quality checks (unique keys, no nulls, valid values) all pass: nothing in the tables is malformed, rows are simply absent. The platform failed, not the data. Snapshots of every checkpoint stay in `.faultline/runs/` for inspection.
 
+The hardened edition runs the same tools with established patterns: a lag window in the extractor, idempotent bronze loads, one row per key in silver, and gold built from final states. Same fault, same runs, verdict `PASS` at both checkpoints. Its lag window is a promise with a limit, and faultline can measure that too: with `--lag-days 1`, shorter than the two-day outage, hardened loses exactly the oldest day (22 orders) and the verdict is `SILENT_CORRUPTION` again. Choosing that window is a business decision (how late may a till sync and still count?) that now comes with a number attached.
+
 ## Development
 
 Requires [uv](https://docs.astral.sh/uv/) and GNU Make. The reference platform (Postgres, dlt, an S3 landing bucket, ClickHouse, dbt and Dagster) also needs Docker, for example Docker Desktop.
@@ -42,11 +45,11 @@ make install            # create .venv and install dependencies
 make check              # lint, format check and the tests that need no Docker
 
 make ref-up             # build and start the reference platform (first build takes a few minutes)
-make test-integration   # run the tests that drive the real platform (about 12 min)
+make test-integration   # run the tests that drive the real platform (about 21 min; EDITION=naive|hardened for one half)
 make ref-down           # stop it and delete its data
 ```
 
-Pull requests on GitHub run only lint and the Docker-free tests; the integration suite runs on every push to `main`. Run `make test-integration` locally before opening a pull request that touches `src/` or `reference/`.
+Pull requests on GitHub run only lint and the Docker-free tests; the integration suite runs on every push to `main`, as two parallel jobs, one per edition. Run `make test-integration` locally before opening a pull request that touches `src/` or `reference/`.
 
 While the reference platform is up, the Dagster UI is at <http://localhost:3000> and the S3 console at <http://localhost:9001/rustfs/console/> (log in with `S3_ACCESS_KEY` / `S3_SECRET_KEY` from `reference/.env`).
 
