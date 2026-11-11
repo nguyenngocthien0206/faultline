@@ -11,6 +11,9 @@
 
 Sandboxes are always torn down. Snapshots stay in the work directory, so a
 verdict can be inspected after the fact.
+
+Steps 1 and 2 are `run_baseline`. Its result can be passed to several
+experiments on the same dataset and target, so the clean run is paid for once.
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ from datetime import date
 from functools import reduce
 from pathlib import Path
 
-from faultline.adapters.base import Adapter, RunRequest, RunResult
+from faultline.adapters.base import Adapter, RunRequest, RunResult, TableContract
 from faultline.datagen import DatasetSpec, generate
 from faultline.faults.base import Fault
 from faultline.oracle.invariants import complete_keys, unique_keys
@@ -122,19 +125,57 @@ def steady_state_problems(adapter: Adapter, snapshots: dict[str, Path], truth: P
     return problems
 
 
+@dataclass(frozen=True)
+class Baseline:
+    """A clean run's outcome, reusable by every experiment on the same dataset and target."""
+
+    spec: DatasetSpec
+    truth_root: Path
+    snapshots: dict[str, Path]
+    contracts: tuple[TableContract, ...]
+    runs: RunLog
+    problems: tuple[str, ...] = ()
+
+    @property
+    def established(self) -> bool:
+        """The steady state holds: every run green and every key invariant satisfied."""
+        return not self.problems
+
+
+def run_baseline(
+    spec: DatasetSpec, adapter_factory: AdapterFactory, work_dir: Path, *, log: Log = lambda _: None
+) -> Baseline:
+    """Generate the dataset and run it cleanly in a fresh sandbox (steps 1 and 2)."""
+    work_dir = Path(work_dir)
+    truth = work_dir / "generated"
+    log(f"generating {spec.profile} dataset")
+    generate(spec, truth)
+    log("baseline: clean run")
+    with adapter_factory(truth) as clean:
+        runs = execute(clean, clean_schedule(spec), log, "baseline")
+        snapshots = snapshot_all(clean, work_dir / "baseline")
+        contracts = clean.capabilities().tables
+        invariants = steady_state_problems(clean, snapshots, truth)
+    failed = [f"baseline run {d} failed: {r.errors}" for d, r in runs if not r.succeeded]
+    problems = (*failed, *invariants)
+    return Baseline(spec, truth, snapshots, contracts, runs, tuple(problems))
+
+
 def run_experiment(
     experiment: Experiment,
     adapter_factory: AdapterFactory,
     work_dir: Path,
     *,
     target: str = "platform",
+    baseline: Baseline | None = None,
     log: Log = lambda _: None,
 ) -> ExperimentResult:
+    """Run one experiment. Pass `baseline` to reuse a clean run of the same dataset."""
     work_dir = Path(work_dir)
     faults = tuple(copy.deepcopy(f) for f in experiment.faults)  # keep the experiment reusable
     base = {"experiment": experiment.name, "target": target, "work_dir": work_dir}
     try:
-        return _run(experiment, faults, adapter_factory, work_dir, base, log)
+        return _run(experiment, faults, adapter_factory, work_dir, base, baseline, log)
     except Exception as exc:  # a harness failure is never a verdict about the platform
         log(traceback.format_exc())
         problem = f"{type(exc).__name__}: {exc}"
@@ -147,29 +188,30 @@ def _run(
     adapter_factory: AdapterFactory,
     work_dir: Path,
     base: dict,
+    baseline: Baseline | None,
     log: Log,
 ) -> ExperimentResult:
-    truth = work_dir / "generated"
-    log(f"generating {experiment.spec.profile} dataset")
-    generate(experiment.spec, truth)
-    descriptions: list[str] = []
-
-    log("baseline: clean run")
-    with adapter_factory(truth) as clean:
-        baseline_runs = execute(clean, clean_schedule(experiment.spec), log, "baseline")
-        baseline = snapshot_all(clean, work_dir / "baseline")
-        contracts = clean.capabilities().tables
-        problems = steady_state_problems(clean, baseline, truth)
-    runs = {"baseline": baseline_runs}
-    failed = [f"baseline run {d} failed: {r.errors}" for d, r in baseline_runs if not r.succeeded]
-    if failed or problems:
+    if baseline is None:
+        baseline = run_baseline(experiment.spec, adapter_factory, work_dir, log=log)
+        phase = "baseline"
+    elif baseline.spec != experiment.spec:
+        raise ValueError(
+            f"baseline was run on {baseline.spec}, the experiment needs {experiment.spec}"
+        )
+    else:
+        log("baseline: reused")
+        phase = "baseline (reused)"
+    runs = {phase: baseline.runs}
+    if not baseline.established:
         log("steady state not established")
         return ExperimentResult(
             **base,
             outcome=Outcome.ERROR,
             runs=runs,
-            problems=("steady state not established", *failed, *problems),
+            problems=("steady state not established", *baseline.problems),
         )
+    truth, contracts = baseline.truth_root, baseline.contracts
+    descriptions: list[str] = []
 
     faulted_input = work_dir / "faulted_input"
     shutil.copytree(truth, faulted_input)
@@ -190,7 +232,7 @@ def _run(
         runs["recovery"] = execute(sandbox, recovery, log, "recovery")
         at_r = Checkpoint("R", snapshot_all(sandbox, work_dir / "checkpoint_R"), runs["recovery"])
 
-    ctx = PropertyContext(contracts=contracts, baseline=baseline, truth_root=truth)
+    ctx = PropertyContext(contracts=contracts, baseline=baseline.snapshots, truth_root=truth)
     signal_f, signal_r = has_signal(at_f.runs), has_signal(at_r.runs)
     verdicts = []
     for prop in experiment.properties:

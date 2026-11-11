@@ -1,8 +1,10 @@
 """The adapter and the oracle together, on the real stack.
 
-Two clean baselines in two separate workspaces must fingerprint identically,
-or the differential oracle would report false alarms in every experiment.
-Then rerunning one day shows that the diff points exactly at the damage.
+A second clean baseline, in its own workspace, must fingerprint exactly like
+the shared one, or the differential oracle would report false alarms in every
+experiment. Then rerunning one day on that second sandbox shows that the diff
+points exactly at the damage, while the job stays green and silver stays clean.
+(The shared baseline's key invariants are asserted by its fixture.)
 """
 
 from collections.abc import Iterator
@@ -10,97 +12,57 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from reference_stack import Stack, reference_config
+from reference_stack import reference_config
 
 from faultline.adapters.base import RunRequest
 from faultline.adapters.reference import ReferenceAdapter
-from faultline.datagen import DatasetSpec, generate
 from faultline.oracle.diff import diff
 from faultline.oracle.fingerprint import fingerprint
-from faultline.oracle.invariants import complete_keys, unique_keys
 from faultline.oracle.snapshot import snapshot_all
+from faultline.runner import Baseline, execute
+from faultline.schedule import clean_schedule
 
 pytestmark = pytest.mark.integration
 
-TINY = DatasetSpec.from_profile("tiny")
-
 
 @dataclass
-class Baseline:
+class LiveBaseline:
     adapter: ReferenceAdapter
     snapshots: dict[str, Path]
 
 
-def run_baseline(adapter: ReferenceAdapter, dest: Path) -> Baseline:
-    for day in TINY.dates():
-        adapter.deliver(day)
-        result = adapter.run(RunRequest(partition=day))
-        assert result.succeeded, result.errors
-    return Baseline(adapter, snapshot_all(adapter, dest))
-
-
 @pytest.fixture(scope="module")
-def generated(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    root = tmp_path_factory.mktemp("tiny")
-    generate(TINY, root, workers=1)
-    return root
-
-
-@pytest.fixture(scope="module")
-def baselines(
-    stack: Stack, generated: Path, tmp_path_factory: pytest.TempPathFactory
-) -> Iterator[tuple[Baseline, Baseline]]:
-    first = ReferenceAdapter(reference_config(), generated)
-    second = ReferenceAdapter(reference_config(), generated)
-    try:
-        first.setup()
-        second.setup()
-        yield (
-            run_baseline(first, tmp_path_factory.mktemp("baseline_a")),
-            run_baseline(second, tmp_path_factory.mktemp("baseline_b")),
-        )
-    finally:
-        first.teardown()
-        second.teardown()
+def second(
+    clean_baseline: Baseline, tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[LiveBaseline]:
+    """Another clean run of the same input, kept alive for the rerun test."""
+    adapter = ReferenceAdapter(reference_config(), clean_baseline.truth_root)
+    with adapter:
+        runs = execute(adapter, clean_schedule(clean_baseline.spec), lambda _: None, "second")
+        assert all(r.succeeded for _, r in runs), runs
+        yield LiveBaseline(adapter, snapshot_all(adapter, tmp_path_factory.mktemp("second")))
 
 
 def test_two_clean_baselines_fingerprint_identically(
-    baselines: tuple[Baseline, Baseline],
+    clean_baseline: Baseline, second: LiveBaseline
 ) -> None:
-    a, b = baselines
-    contracts = a.adapter.capabilities().tables
-
-    assert a.adapter.workspace != b.adapter.workspace
-    for contract in contracts:
-        fa = fingerprint(a.snapshots[contract.name], contract)
-        fb = fingerprint(b.snapshots[contract.name], contract)
+    for contract in clean_baseline.contracts:
+        fa = fingerprint(clean_baseline.snapshots[contract.name], contract)
+        fb = fingerprint(second.snapshots[contract.name], contract)
         assert fa == fb, contract.name
         assert fa.rows > 0, contract.name
 
 
-def test_the_baseline_satisfies_the_key_invariants(
-    baselines: tuple[Baseline, Baseline], generated: Path
+def test_a_rerun_is_green_silver_stays_clean_and_the_diff_finds_the_damage(
+    clean_baseline: Baseline, second: LiveBaseline, tmp_path: Path
 ) -> None:
-    a, _ = baselines
-
-    for contract in a.adapter.capabilities().tables:
-        assert unique_keys(a.snapshots[contract.name], contract).holds, contract.name
-        if contract.truth_dataset:
-            result = complete_keys(a.snapshots[contract.name], contract, generated)
-            assert result.holds, result.summary()
-
-
-def test_a_rerun_shows_up_exactly_where_the_damage_is(
-    baselines: tuple[Baseline, Baseline], tmp_path: Path
-) -> None:
-    # Runs last: it changes baseline A's workspace.
-    a, _ = baselines
-    result = a.adapter.run(RunRequest(partition=TINY.end_date))
+    # Changes the second sandbox, so it runs after the fingerprint comparison.
+    result = second.adapter.run(RunRequest(partition=clean_baseline.spec.end_date))
     assert result.succeeded, result.errors
-    after = snapshot_all(a.adapter, tmp_path)
-    caps = a.adapter.capabilities()
+    after = snapshot_all(second.adapter, tmp_path)
+    tables = second.adapter.capabilities().tables
 
-    diffs = {t.name: diff(a.snapshots[t.name], after[t.name], t) for t in caps.tables}
+    diffs = {t.name: diff(second.snapshots[t.name], after[t.name], t) for t in tables}
     for d in diffs.values():
         print(d.summary())
 

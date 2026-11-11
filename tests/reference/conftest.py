@@ -9,10 +9,15 @@ import os
 from collections.abc import Iterator
 
 import pytest
-from reference_stack import Stack
+from reference_stack import Stack, reference_config
 
+from faultline.adapters.reference import ReferenceAdapter
 from faultline.connectors.dagster import DagsterError
 from faultline.connectors.workspace import new_workspace_name
+from faultline.datagen import DatasetSpec
+from faultline.runner import Baseline, run_baseline
+
+TINY = DatasetSpec.from_profile("tiny")
 
 
 def _unreachable(reason: str) -> None:
@@ -49,3 +54,21 @@ def workspace(stack: Stack) -> Iterator[str]:
     yield name
     stack.source.drop_workspace(name)
     stack.clickhouse.drop_workspace(name)
+
+
+@pytest.fixture(scope="session")
+def clean_baseline(stack: Stack, tmp_path_factory: pytest.TempPathFactory) -> Baseline:
+    """One clean run of the tiny dataset on the naive pipeline, shared by every test.
+
+    A baseline is four Dagster runs; several tests need one, and running it once
+    per session instead of once per test keeps the suite several minutes shorter.
+    Its snapshots live on disk; the sandbox itself is already torn down.
+    """
+    config = reference_config()
+    baseline = run_baseline(
+        TINY,
+        lambda root: ReferenceAdapter(config, root),
+        tmp_path_factory.mktemp("clean_baseline"),
+    )
+    assert baseline.established, baseline.problems
+    return baseline

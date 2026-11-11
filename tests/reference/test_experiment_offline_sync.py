@@ -8,24 +8,29 @@ not help, and the verdict must be SILENT_CORRUPTION.
 from pathlib import Path
 
 import pytest
-from reference_stack import Stack, reference_config
+from reference_stack import reference_config
 
 from faultline.adapters.base import RunStatus
 from faultline.adapters.reference import ReferenceAdapter
-from faultline.datagen import DatasetSpec
 from faultline.experiments import pos_offline_sync
 from faultline.outcome import Outcome
-from faultline.runner import run_experiment
+from faultline.runner import Baseline, run_experiment
 
 pytestmark = pytest.mark.integration
 
 
-def test_naive_loses_the_offline_store_without_a_word(stack: Stack, tmp_path: Path) -> None:
-    experiment = pos_offline_sync(DatasetSpec.from_profile("tiny"))
+def test_naive_loses_the_offline_store_without_a_word(
+    clean_baseline: Baseline, tmp_path: Path
+) -> None:
+    experiment = pos_offline_sync(clean_baseline.spec)
     config = reference_config()
 
     result = run_experiment(
-        experiment, lambda root: ReferenceAdapter(config, root), tmp_path, target="reference"
+        experiment,
+        lambda root: ReferenceAdapter(config, root),
+        tmp_path,
+        target="reference",
+        baseline=clean_baseline,
     )
     print(result.render())
 

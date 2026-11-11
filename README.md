@@ -42,9 +42,11 @@ make install            # create .venv and install dependencies
 make check              # lint, format check and the tests that need no Docker
 
 make ref-up             # build and start the reference platform (first build takes a few minutes)
-make test-integration   # run the tests that drive the real platform
+make test-integration   # run the tests that drive the real platform (about 12 min)
 make ref-down           # stop it and delete its data
 ```
+
+Pull requests on GitHub run only lint and the Docker-free tests; the integration suite runs on every push to `main`. Run `make test-integration` locally before opening a pull request that touches `src/` or `reference/`.
 
 While the reference platform is up, the Dagster UI is at <http://localhost:3000> and the S3 console at <http://localhost:9001/rustfs/console/> (log in with `S3_ACCESS_KEY` / `S3_SECRET_KEY` from `reference/.env`).
 

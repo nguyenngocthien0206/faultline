@@ -43,10 +43,16 @@ jobs:
       - name: Test
         run: uv run pytest -m "not integration"
 
-  # The reference stack runs Linux containers, which GitHub's Windows runners
-  # cannot host, so integration tests run on ubuntu only.
+  # Integration tests drive the real reference stack (Dagster runs, minutes
+  # each experiment). They run locally with `make test-integration` before a PR
+  # is opened, so pull requests only get the fast jobs above; this job runs on
+  # every push to main as the safety net, catching anything that slipped
+  # through and drift in images or dependencies.
+  # The stack runs Linux containers, which GitHub's Windows runners cannot
+  # host, so this job runs on ubuntu only.
   integration:
     name: integration / reference stack
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
