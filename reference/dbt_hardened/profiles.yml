@@ -1,0 +1,16 @@
+# Connection comes from the container environment (reference/.env). The
+# defaults only exist so `dbt parse` can run at image build time; parse never
+# connects.
+coffee_platform:
+  target: reference
+  outputs:
+    reference:
+      type: clickhouse
+      driver: http
+      host: "{{ env_var('CLICKHOUSE_HOST', 'clickhouse') }}"
+      port: "{{ env_var('CLICKHOUSE_PORT', '8123') | int }}"
+      user: "{{ env_var('CLICKHOUSE_USER', 'parse_only') }}"
+      password: "{{ env_var('CLICKHOUSE_PASSWORD', '') }}"
+      schema: default  # replaced per run by generate_schema_name (the workspace)
+      secure: false
+      threads: 1

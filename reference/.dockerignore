@@ -3,4 +3,6 @@
 .env.*
 dbt/target/
 dbt/logs/
+dbt_hardened/target/
+dbt_hardened/logs/
 **/__pycache__/

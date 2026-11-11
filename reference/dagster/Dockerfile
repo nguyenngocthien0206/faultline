@@ -20,10 +20,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 COPY dagster/dagster.yaml dagster/workspace.yaml ${DAGSTER_HOME}/
 
-# dbt project, parsed at build time so dagster-dbt finds target/manifest.json.
-# Parsing never connects to the warehouse.
+# dbt projects (naive, hardened), parsed at build time so dagster-dbt finds
+# target/manifest.json. Parsing never connects to the warehouse. The hardened
+# project reads the shared macros from ../dbt, so both are copied first.
 COPY dbt /opt/dagster/app/dbt
-RUN dbt parse --project-dir /opt/dagster/app/dbt --profiles-dir /opt/dagster/app/dbt --quiet
+COPY dbt_hardened /opt/dagster/app/dbt_hardened
+RUN dbt parse --project-dir /opt/dagster/app/dbt --profiles-dir /opt/dagster/app/dbt --quiet \
+ && dbt parse --project-dir /opt/dagster/app/dbt_hardened \
+      --profiles-dir /opt/dagster/app/dbt_hardened --quiet
 
 COPY dagster/coffee_platform /opt/dagster/app/coffee_platform
 

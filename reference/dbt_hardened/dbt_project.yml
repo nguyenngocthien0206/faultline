@@ -1,0 +1,39 @@
+name: coffee_platform_hardened
+version: "1.0.0"
+config-version: 2
+profile: coffee_platform
+
+model-paths: ["models"]
+# The workspace guard (generate_schema_name) is shared with the naive project,
+# so both editions refuse a non-workspace schema in exactly the same way.
+macro-paths: ["../dbt/macros"]
+target-path: target
+clean-targets: ["target", "logs"]
+
+vars:
+  # Placeholders so `dbt parse` works at image build time, as in the naive project.
+  workspace: fl_00000000
+  dt: "1970-01-01"
+
+models:
+  coffee_platform_hardened:
+    staging:
+      # Typed bronze rows, every copy kept, with the partition that extracted
+      # them. Internal: gold uses them to find the days a run touched.
+      +materialized: view
+      +meta:
+        dagster:
+          group: hardened_staging
+    silver:
+      +materialized: view
+      +meta:
+        dagster:
+          group: hardened_silver
+    gold:
+      # Rewrite the touched business days and swap them in with one ALTER
+      # statement (REPLACE PARTITION per day). Each model sets its partition key.
+      +materialized: incremental
+      +incremental_strategy: insert_overwrite
+      +meta:
+        dagster:
+          group: hardened_gold
