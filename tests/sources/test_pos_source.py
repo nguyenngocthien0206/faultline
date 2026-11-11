@@ -54,9 +54,11 @@ def test_orders_upsert_but_lines_and_payments_only_insert() -> None:
 
     assert upsert_sql("fl_abcd1234", orders, ["order_id", "status", "updated_at"]) == (
         'INSERT INTO "fl_abcd1234".orders (order_id, status, updated_at) '
-        "SELECT order_id, status, updated_at FROM staging_orders "
+        "SELECT DISTINCT ON (order_id) order_id, status, updated_at FROM staging_orders "
+        "ORDER BY order_id, updated_at DESC "
         "ON CONFLICT (order_id) DO UPDATE SET status = EXCLUDED.status, "
-        "updated_at = EXCLUDED.updated_at"
+        "updated_at = EXCLUDED.updated_at "
+        'WHERE "fl_abcd1234".orders.updated_at <= EXCLUDED.updated_at'
     )
     assert "ON CONFLICT" not in upsert_sql("fl_abcd1234", items, ["order_id", "line_no"])
     assert "ON CONFLICT" not in upsert_sql("fl_abcd1234", payments, ["payment_id"])
