@@ -1,0 +1,21 @@
+version: 2
+
+# Same ClickHouse tables as the naive edition (one workspace runs one edition),
+# but different Dagster assets: the hardened ones carry the `hardened` prefix.
+sources:
+  - name: bronze
+    description: Raw POS change rows, one partition per extract day, replaced whole on every load.
+    schema: "{{ var('workspace') }}"
+    tables:
+      - name: bronze_orders
+        meta:
+          dagster:
+            asset_key: ["hardened", "bronze_orders"]
+      - name: bronze_order_items
+        meta:
+          dagster:
+            asset_key: ["hardened", "bronze_order_items"]
+      - name: bronze_payments
+        meta:
+          dagster:
+            asset_key: ["hardened", "bronze_payments"]

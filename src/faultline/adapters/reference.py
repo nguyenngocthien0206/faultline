@@ -3,6 +3,10 @@
 Everything goes through public interfaces: the source database for input,
 Dagster's GraphQL API for runs, ClickHouse's HTTP API for snapshots. An adapter
 for a team's own Dagster or ClickHouse platform would look much the same.
+
+The stack hosts two editions of the same pipeline, each a Dagster job: naive
+(common shortcuts) and hardened (established patterns). They write the same
+tables, so one contract and one set of experiments serve both.
 """
 
 from __future__ import annotations
@@ -11,6 +15,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
+from enum import StrEnum
 from pathlib import Path
 
 from faultline.adapters.base import (
@@ -28,6 +33,26 @@ from faultline.connectors.dagster import DagsterClient
 from faultline.connectors.postgres import SourceDatabase
 from faultline.connectors.workspace import new_workspace_name, validate_workspace_name
 from faultline.sources.pos import apply_day, create_tables
+
+
+class Edition(StrEnum):
+    NAIVE = "naive"
+    HARDENED = "hardened"
+
+
+JOBS: dict[Edition, str] = {Edition.NAIVE: "pos_daily", Edition.HARDENED: "pos_daily_hardened"}
+HARDENED_EXTRACT_OP = "hardened_pos_landing"  # takes the lag window as op config
+
+
+def target_name(edition: Edition | str, lag_days: int | None = None) -> str:
+    """How a result names the platform it ran on, e.g. reference-hardened(lag=1d).
+
+    faultline does not know the platform's default lag, so the name shows the
+    lag only when faultline set one.
+    """
+    name = f"reference-{Edition(edition)}"
+    return name if lag_days is None else f"{name}(lag={lag_days}d)"
+
 
 CONSUMER_TABLES: tuple[TableContract, ...] = (
     TableContract(
@@ -69,7 +94,6 @@ class ReferenceStackConfig:
     clickhouse_url: str = "http://127.0.0.1:8123"
     dagster_url: str = "http://127.0.0.1:3000/graphql"
     location: str = "coffee_platform"
-    job: str = "pos_daily"
     run_timeout_seconds: float = 900.0
 
 
@@ -114,8 +138,16 @@ class ReferenceAdapter(Adapter):
         config: ReferenceStackConfig,
         generated_root: Path,
         *,
+        edition: Edition | str = Edition.NAIVE,
+        lag_days: int | None = None,
         workspace: str | None = None,
     ) -> None:
+        self.edition = Edition(edition)
+        if lag_days is not None and self.edition is not Edition.HARDENED:
+            raise ValueError("only the hardened edition has a lag window")
+        if lag_days is not None and lag_days < 0:
+            raise ValueError(f"lag_days must be 0 or more, got {lag_days}")
+        self.lag_days = lag_days
         self.config = config
         self.generated_root = Path(generated_root)
         self.workspace = validate_workspace_name(workspace or new_workspace_name())
@@ -125,6 +157,23 @@ class ReferenceAdapter(Adapter):
         )
         self.dagster = DagsterClient(config.dagster_url, location=config.location)
         self._created = False
+
+    @property
+    def job(self) -> str:
+        return JOBS[self.edition]
+
+    @property
+    def target(self) -> str:
+        return target_name(self.edition, self.lag_days)
+
+    def run_config(self) -> dict[str, object]:
+        """Dagster run config: the sandbox to work in and, if set, the lag window."""
+        config: dict[str, object] = {
+            "resources": {"workspace": {"config": {"name": self.workspace}}}
+        }
+        if self.lag_days is not None:
+            config["ops"] = {HARDENED_EXTRACT_OP: {"config": {"lag_days": self.lag_days}}}
+        return config
 
     def capabilities(self) -> Capabilities:
         features = frozenset(
@@ -144,11 +193,10 @@ class ReferenceAdapter(Adapter):
         apply_day(self.source, self.workspace, self.generated_root, day)
 
     def run(self, request: RunRequest) -> RunResult:
-        run_config = {"resources": {"workspace": {"config": {"name": self.workspace}}}}
         run_id = self.dagster.launch_run(
-            self.config.job,
+            self.job,
             partition=request.partition.isoformat(),
-            run_config=run_config,
+            run_config=self.run_config(),
             tags={"faultline/workspace": self.workspace},
         )
         outcome = self.dagster.wait_for_run(run_id, timeout=self.config.run_timeout_seconds)

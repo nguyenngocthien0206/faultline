@@ -14,6 +14,9 @@ verdict can be inspected after the fact.
 
 Steps 1 and 2 are `run_baseline`. Its result can be passed to several
 experiments on the same dataset and target, so the clean run is paid for once.
+A baseline from another dataset or another target is refused: comparing a
+hardened platform against naive's clean run would score the difference
+between the two platforms, not the fault.
 """
 
 from __future__ import annotations
@@ -135,6 +138,7 @@ class Baseline:
     contracts: tuple[TableContract, ...]
     runs: RunLog
     problems: tuple[str, ...] = ()
+    target: str = "platform"
 
     @property
     def established(self) -> bool:
@@ -143,7 +147,12 @@ class Baseline:
 
 
 def run_baseline(
-    spec: DatasetSpec, adapter_factory: AdapterFactory, work_dir: Path, *, log: Log = lambda _: None
+    spec: DatasetSpec,
+    adapter_factory: AdapterFactory,
+    work_dir: Path,
+    *,
+    target: str = "platform",
+    log: Log = lambda _: None,
 ) -> Baseline:
     """Generate the dataset and run it cleanly in a fresh sandbox (steps 1 and 2)."""
     work_dir = Path(work_dir)
@@ -158,7 +167,7 @@ def run_baseline(
         invariants = steady_state_problems(clean, snapshots, truth)
     failed = [f"baseline run {d} failed: {r.errors}" for d, r in runs if not r.succeeded]
     problems = (*failed, *invariants)
-    return Baseline(spec, truth, snapshots, contracts, runs, tuple(problems))
+    return Baseline(spec, truth, snapshots, contracts, runs, tuple(problems), target)
 
 
 def run_experiment(
@@ -192,11 +201,17 @@ def _run(
     log: Log,
 ) -> ExperimentResult:
     if baseline is None:
-        baseline = run_baseline(experiment.spec, adapter_factory, work_dir, log=log)
+        target = base["target"]
+        baseline = run_baseline(experiment.spec, adapter_factory, work_dir, target=target, log=log)
         phase = "baseline"
     elif baseline.spec != experiment.spec:
         raise ValueError(
             f"baseline was run on {baseline.spec}, the experiment needs {experiment.spec}"
+        )
+    elif baseline.target != base["target"]:
+        raise ValueError(
+            f"baseline was run on target {baseline.target!r}, "
+            f"the experiment runs on {base['target']!r}"
         )
     else:
         log("baseline: reused")

@@ -3,6 +3,10 @@
 Without the stack these tests are skipped, so `make test` works anywhere.
 CI sets FAULTLINE_REQUIRE_STACK=1, which turns "stack unreachable" into a
 failure: a broken stack must never pass silently.
+
+Tests that exercise the hardened edition carry the `hardened` marker; CI runs
+them in a job of their own (`make test-integration EDITION=hardened`), next to
+everything else (EDITION=naive).
 """
 
 import os
@@ -11,7 +15,7 @@ from collections.abc import Iterator
 import pytest
 from reference_stack import Stack, reference_config
 
-from faultline.adapters.reference import ReferenceAdapter
+from faultline.adapters.reference import Edition, ReferenceAdapter, target_name
 from faultline.connectors.dagster import DagsterError
 from faultline.connectors.workspace import new_workspace_name
 from faultline.datagen import DatasetSpec
@@ -56,19 +60,36 @@ def workspace(stack: Stack) -> Iterator[str]:
     stack.clickhouse.drop_workspace(name)
 
 
+def _clean_baseline(edition: Edition, tmp_path_factory: pytest.TempPathFactory) -> Baseline:
+    config = reference_config()
+    baseline = run_baseline(
+        TINY,
+        lambda root: ReferenceAdapter(config, root, edition=edition),
+        tmp_path_factory.mktemp(f"{edition}_baseline"),
+        target=target_name(edition),
+    )
+    assert baseline.established, baseline.problems
+    return baseline
+
+
 @pytest.fixture(scope="session")
-def clean_baseline(stack: Stack, tmp_path_factory: pytest.TempPathFactory) -> Baseline:
+def naive_baseline(stack: Stack, tmp_path_factory: pytest.TempPathFactory) -> Baseline:
     """One clean run of the tiny dataset on the naive pipeline, shared by every test.
 
     A baseline is four Dagster runs; several tests need one, and running it once
     per session instead of once per test keeps the suite several minutes shorter.
     Its snapshots live on disk; the sandbox itself is already torn down.
     """
-    config = reference_config()
-    baseline = run_baseline(
-        TINY,
-        lambda root: ReferenceAdapter(config, root),
-        tmp_path_factory.mktemp("clean_baseline"),
-    )
-    assert baseline.established, baseline.problems
-    return baseline
+    return _clean_baseline(Edition.NAIVE, tmp_path_factory)
+
+
+@pytest.fixture(scope="session")
+def hardened_baseline(stack: Stack, tmp_path_factory: pytest.TempPathFactory) -> Baseline:
+    """The same, on the hardened pipeline (with the platform's default lag window)."""
+    return _clean_baseline(Edition.HARDENED, tmp_path_factory)
+
+
+@pytest.fixture(params=["naive", pytest.param("hardened", marks=pytest.mark.hardened)])
+def baseline(request: pytest.FixtureRequest) -> Baseline:
+    """Each edition's shared clean baseline in turn: for checks both editions must pass."""
+    return request.getfixturevalue(f"{request.param}_baseline")

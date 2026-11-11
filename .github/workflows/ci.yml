@@ -48,13 +48,19 @@ jobs:
   # is opened, so pull requests only get the fast jobs above; this job runs on
   # every push to main as the safety net, catching anything that slipped
   # through and drift in images or dependencies.
+  # The suite is split by platform edition into two parallel jobs, each with
+  # its own stack: the wall clock is the slower half, not the sum.
   # The stack runs Linux containers, which GitHub's Windows runners cannot
   # host, so this job runs on ubuntu only.
   integration:
-    name: integration / reference stack
+    name: integration / ${{ matrix.edition }}
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        edition: [naive, hardened]
     env:
       UV_PYTHON: "3.11"
     steps:
@@ -67,11 +73,38 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
+      # Compose interpolates every ${VAR:?} when the file is read, including by
+      # bake below, so the stack's variables must be set first. The values are
+      # the test credentials from the committed .env.example.
+      - name: Prepare the stack environment
+        run: |
+          make reference/.env
+          grep -E '^[A-Z_]+=' reference/.env >> "$GITHUB_ENV"
+
+      # Build the platform image with a layer cache in GitHub's cache service,
+      # shared by both jobs: unchanged layers (the ~200 pinned packages above
+      # all) are restored instead of rebuilt.
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the platform image (cached)
+        uses: docker/bake-action@v6
+        with:
+          # Bake resolves the compose build context against its working
+          # directory, not the compose file's, so it runs from reference/.
+          source: .
+          workdir: reference
+          files: docker-compose.yml
+          targets: dagster-code
+          load: true
+          set: |
+            *.cache-from=type=gha,scope=reference-platform
+            *.cache-to=type=gha,scope=reference-platform,mode=max
+
       - name: Start the reference stack
-        run: make ref-up
+        run: make ref-up REF_UP_FLAGS=
 
       - name: Integration tests
-        run: make test-integration
+        run: make test-integration EDITION=${{ matrix.edition }}
 
       - name: Stack logs
         if: failure()

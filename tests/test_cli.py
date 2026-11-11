@@ -69,3 +69,42 @@ def test_run_explains_a_missing_stack(tmp_path: Path) -> None:
 
     assert result.exit_code == 2
     assert "make ref-up" in result.output
+
+
+def test_run_refuses_a_lag_window_on_naive(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        ["run", "pos-offline-sync", "--lag-days", "3", "--stack-env", str(tmp_path / ".env")],
+    )
+
+    assert result.exit_code == 2
+    assert "--target hardened only" in result.output
+
+
+def test_run_rejects_an_unknown_target(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        ["run", "pos-offline-sync", "--target", "bulletproof", "--stack-env", str(tmp_path)],
+    )
+
+    assert result.exit_code != 0
+
+
+def test_run_accepts_a_lag_window_on_hardened(tmp_path: Path) -> None:
+    # Gets as far as looking for the stack, so the options themselves were accepted.
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "pos-offline-sync",
+            "--target",
+            "hardened",
+            "--lag-days",
+            "1",
+            "--stack-env",
+            str(tmp_path / ".env"),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "make ref-up" in result.output

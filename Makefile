@@ -20,8 +20,16 @@ fmt: ## Auto-fix lint issues and format the code
 test: ## Run the tests that need no Docker
 	uv run pytest -m "not integration"
 
+# EDITION=naive or EDITION=hardened runs one share of the suite, as the two CI
+# jobs do: hardened takes the tests marked `hardened`, naive takes the rest
+# (including the edition-free stack checks). Unset: the whole suite.
+INTEGRATION_MARKS := integration
+INTEGRATION_MARKS_naive := integration and not hardened
+INTEGRATION_MARKS_hardened := integration and hardened
+
 test-integration: ## Run the tests against the reference stack (start it with ref-up)
-	FAULTLINE_REQUIRE_STACK=1 uv run pytest -m integration
+	$(if $(filter-out naive hardened,$(EDITION)),$(error EDITION must be naive or hardened, not '$(EDITION)'))
+	FAULTLINE_REQUIRE_STACK=1 uv run pytest -m "$(if $(EDITION),$(INTEGRATION_MARKS_$(EDITION)),$(INTEGRATION_MARKS))"
 
 check: lint test ## Lint and Docker-free tests, what CI runs on every OS
 
@@ -30,8 +38,12 @@ check: lint test ## Lint and Docker-free tests, what CI runs on every OS
 reference/.env:
 	cp reference/.env.example $@
 
+# CI builds the platform image beforehand with a layer cache and starts the
+# stack with REF_UP_FLAGS= so compose does not build it a second time.
+REF_UP_FLAGS ?= --build
+
 ref-up: reference/.env ## Build and start the reference stack, wait until it is healthy
-	$(COMPOSE) up -d --build --wait
+	$(COMPOSE) up -d $(REF_UP_FLAGS) --wait
 
 ref-down: reference/.env ## Stop the reference stack and delete its volumes
 	$(COMPOSE) down -v

@@ -358,7 +358,7 @@ Every port binds to `127.0.0.1`. Credentials are test-only values kept in one pl
 
 **Black box.** The platform code (`reference/dagster/coffee_platform`) never imports faultline, and faultline never imports it; they live in different processes, images and dependency sets. faultline touches the platform only through the source database, the bucket, Dagster's GraphQL API and ClickHouse's HTTP API, exactly what an adapter for a team's stack would use. The demo therefore cannot cheat.
 
-**The POS pipeline.** One Dagster job, `pos_daily`, partitioned by day; each run executes in a single process (`in_process_executor`, which saves about 15 s of re-imports per step):
+**The POS pipeline.** Two editions of the same pipeline live side by side in one code location: `pos_daily` (naive, described here) and `pos_daily_hardened` (below). They write the same tables, so one table contract and one set of experiments serve both, and an adapter picks the edition by the job it launches. The naive job is partitioned by day; each run executes in a single process (`in_process_executor`, which saves about 15 s of re-imports per step):
 
 1. `pos_landing` (dlt `sql_database`): extracts `orders`, `order_items` and `payments` incrementally on `updated_at`, `created_at` and `paid_at`, and writes Parquet to `landing/<ws>/pos/<table>/dt=<partition>/`.
 2. `bronze_<table>` (ClickHouse): appends the partition's landing files with `INSERT ... SELECT FROM s3()`, adding `_source_file` and `_dt`. Tables take the schema of the first file seen.
@@ -377,16 +377,25 @@ Gold recomputes only the business days touched by the run's extract: the day its
 
 **Naive versus hardened.** Naive is not a strawman. Every one of its choices is common in real pipelines and passes a happy-path test. Order lifecycle updates (voids, refunds days later) are part of the steady state, so naive does produce the right numbers when every change arrives once and in order. It breaks only when faults hit it.
 
-| Concern | naive | hardened |
-|---|---|---|
-| Bronze load | appends every file under `dt=D` with `INSERT ... SELECT FROM s3()` | loads into a staging table and swaps the partition in with `REPLACE PARTITION`; a ledger skips files already loaded |
-| Rerun and retry | appends the same rows again | idempotent: the partition is replaced by identical content |
-| Order updates | gold nets change events (completed adds, refunded subtracts), trusting each event to arrive exactly once | silver keeps the latest row per `order_id` (`ReplacingMergeTree(updated_at)` read with `FINAL`, or `argMax`); gold aggregates latest states |
-| Late rows at the source | dlt's default incremental cursor: a row whose `updated_at` is older than the cursor is never extracted | incremental with a lag window, then dedup by key downstream |
-| Late files in landing | reads only `dt=<run date>` | finds unprocessed files in a lookback window and recomputes the business dates they touch |
-| Schema drift | schema inferred from Parquet; a renamed column silently becomes NULL | explicit contract (dbt contracts and tests); mismatch alerts and fails the run |
-| Partial file | loads whatever rows are there | reconciles row counts against dlt's load metadata, quarantines and alerts |
-| Gold refresh | `delete+insert` incremental: two statements, a reader can see the gap | `insert_overwrite` by partition, one atomic swap |
+| Concern | naive | hardened | built |
+|---|---|---|---|
+| Late rows at the source | dlt's default incremental cursor: a row whose `updated_at` is older than the cursor is never extracted | dlt `incremental(..., lag=...)`: every run reads again the last `lag_days` (op config, default 3) | yes |
+| Bronze load | appends every file under `dt=D` with `INSERT ... SELECT FROM s3()` | rebuilds day `D` in a staging table from all its landing files, then swaps it in with `REPLACE PARTITION` | yes |
+| Rerun and retry | appends the same rows again | idempotent: the partition is replaced, and silver collapses copies by key | yes |
+| Order updates | gold nets change events (completed adds, refunded subtracts), trusting each event to arrive exactly once | silver keeps the latest row per key (`argMax`); gold aggregates final states (an order counts if its latest status is `completed`) | yes |
+| Gold refresh | `delete+insert` incremental: two statements, a reader can see the gap | `insert_overwrite` partitioned by business day: one `ALTER TABLE ... REPLACE PARTITION` statement for all touched days | yes |
+| Duplicate files in landing | loaded again | a ledger skips files already loaded | with duplicate-file |
+| Late files in landing | reads only `dt=<run date>` | finds unprocessed files in a lookback window and recomputes the business dates they touch | with late-file |
+| Schema drift | schema inferred from Parquet; a renamed column silently becomes NULL | explicit contract (dbt contracts and tests); mismatch alerts and fails the run | with schema-drift |
+| Partial file | loads whatever rows are there | reconciles row counts against dlt's load metadata, quarantines and alerts | with truncated-file |
+
+Each hardening ships together with the fault that tests it. A safeguard no experiment exercises proves nothing, and is exactly the kind of code that drifts into being tuned to pass (risk 1 in section 13).
+
+**The hardened pipeline** (`coffee_platform/pos_hardened.py`, dbt project `reference/dbt_hardened/`). Same tools and table names; Dagster asset keys carry the prefix `hardened`. The dbt project reuses the naive project's workspace guard macro. Internal `stg_*` views keep every copy of every row with `extracted_on`; gold uses them to find the business days a run touched (orders and order lines that came in, wherever their day lies). The consumer silver tables carry business columns only: when the platform happened to read a row is lineage, not a fact about the sale, and it legitimately differs between a clean run and one where the row arrived late.
+
+The three main safeguards only work together. The lag window creates duplicates on purpose, since every run reads the last few days again; idempotent bronze and keyed silver are what make those copies harmless. A lag window on top of naive's append-only bronze and event-netting gold would turn a loss into double counting.
+
+**Lateness is a promise with a limit.** The lag window is how late a row may reach the source and still be counted. It is a business decision as much as a technical one: a wider window tolerates longer outages but re-reads more data on every run (with `lag_days = 3`, each run extracts about four days of changes instead of one). A row later than the window is lost on hardened too, silently, exactly as on naive. faultline makes that limit measurable: `faultline run pos-offline-sync --target hardened --lag-days 1` shrinks the window below the two-day outage, and the verdict should turn into `SILENT_CORRUPTION`. The runner's unit tests show the same on a toy platform.
 
 Lessons worth stating plainly:
 
@@ -578,7 +587,7 @@ Runtime dependencies: typer, faker, duckdb (1.x, the oracle's engine), then pyda
 | crash-mid-write (gold) | SILENT_CORRUPTION (readers see the gap of a two-statement refresh) | PASS |
 | retry-after-partial-commit | SILENT_CORRUPTION (duplicates) | PASS |
 | idempotency and backfill probes | SILENT_CORRUPTION | PASS |
-| pos-offline-sync (a till syncs two days late, old timestamps) | SILENT_CORRUPTION (measured, see below) | PASS (dlt `lag` window) |
+| pos-offline-sync (a till syncs two days late, old timestamps) | SILENT_CORRUPTION (measured, see below) | PASS (measured, dlt `lag` window of 3 days) |
 
 At least one experiment must show `BROKEN` (noisy and unrecoverable); which one is settled when the execution faults are built on the new stack.
 
@@ -587,13 +596,17 @@ At least one experiment must show `BROKEN` (noisy and unrecoverable); which one 
 - At F: all 62 orders of store HCM-001 from the two offline days missing from `silver_orders` (with 105 order lines and 69 payments); net revenue in gold -15.1%. dlt's cursor had passed their timestamps, so they were never extracted.
 - At R, after the operator reran the three affected days: the 62 orders still missing, and every other store now double counted because naive bronze reloaded the same landing files. Net revenue +35.5% against the baseline, items sold +136.7%. The standard fix did not recover the data; it made the numbers wrong in the other direction.
 
+**The same experiment on hardened** (`--target hardened`, default lag window of 3 days): 11 of 11 runs green, verdict `PASS`. Every consumer table equals its clean baseline at F, as soon as the till synced, and again at R: the three reruns changed nothing.
+
+**And with the lag window shrunk below the outage** (`--target hardened --lag-days 1`): `SILENT_CORRUPTION`, precisely bounded. On the sync day the window reached back one day, so the 40 orders of day 3 were counted and only the 22 of day 2 were lost (net revenue -4.6% instead of naive's -15.1%). At R the figures stayed at -4.6%: the reruns could not bring day 2 back, but idempotent bronze kept them from double counting the rest. The safeguards worked; the promise was simply shorter than the outage.
+
 ## 13. Design risks
 
 1. **A self-fulfilling demo.** We write both the bugs and the tests, so faultline could end up catching only bugs designed for it. Mitigations: faults are defined against generic contracts (files, runs, keys), never against naive internals; hardened uses established patterns rather than tricks tuned to pass; the reference stack is built from real tools (dlt, Dagster, dbt, ClickHouse), and the first adapter for a team's own platform is the real check.
 2. **Non-deterministic baselines.** Volatile columns, floats and row order can make two clean runs differ. Mitigations: canonicalisation, `ignore_columns`, integer money, and a self-check that runs the baseline twice in tests and expects identical fingerprints.
 3. **Failpoints need platform cooperation.** Real tools do not expose them. Mitigation: interrupt points are generic, and each adapter chooses how to realise them (failpoint, cancel API, or kill on an observed event).
 4. **Blurry outcome boundaries.** `DETECTED` versus `BROKEN` versus `SILENT_CORRUPTION` invites argument. Mitigations: the fixed decision table in section 6, injected crashes never count as signals, and every verdict carries evidence.
-5. **Run time.** One `pos_daily` run takes about 27 s on Docker Desktop (measured; about 40 s from launch, since the run worker spends some 13 s importing code first). Most of it is fixed cost: importing dbt and its ClickHouse adapter alone takes about 10 s, while the six models execute in under 2 s. An experiment with dozens of runs therefore takes minutes. Mitigations: baseline caching, the `tiny` profile or short windows for the demo, several workspaces running in parallel on one stack. Not yet done: avoiding dbt's full re-parse on every run (changing `--vars` invalidates partial parsing, about 3 to 4 s). `make demo` target to be re-set once the first experiment runs end to end. The integration suite shares one clean baseline across tests (18 Dagster runs instead of 27; about 12 minutes on Docker Desktop instead of 17.5), and CI runs it only on pushes to main: pull requests get lint and unit tests (under a minute), and integration is run locally with `make test-integration` before a PR is opened. Not done yet: caching the platform image build in CI (about a minute per run) and running sandboxes in parallel.
+5. **Run time.** One `pos_daily` run takes about 27 s on Docker Desktop (measured; about 40 s from launch, since the run worker spends some 13 s importing code first). Most of it is fixed cost: importing dbt and its ClickHouse adapter alone takes about 10 s, while the six models execute in under 2 s. An experiment with dozens of runs therefore takes minutes. Mitigations: baseline caching, the `tiny` profile or short windows for the demo, several workspaces running in parallel on one stack. Not yet done: avoiding dbt's full re-parse on every run (changing `--vars` invalidates partial parsing, about 3 to 4 s). `make demo` target to be re-set once the first experiment runs end to end. The integration suite shares one clean baseline per edition across tests (naive's share: 18 Dagster runs instead of 27). With both editions it is 29 runs, about 21.5 minutes on Docker Desktop run back to back (measured; hardened runs take as long as naive ones, about 30 s, the lag window costs nothing visible at `tiny` scale). CI runs it only on pushes to main, split by edition into two parallel jobs that each start their own stack (`make test-integration EDITION=naive|hardened`), with the platform image built through `docker buildx bake` and its layers cached in GitHub's cache. Pull requests get lint and unit tests (under a minute), and integration is run locally with `make test-integration` before a PR is opened. Not done yet: running sandboxes in parallel on one stack, which would also shorten `faultline run` itself.
 6. **Windows versus Linux.** Integration tests need Linux containers, which GitHub's Windows runners cannot host, so they run on ubuntu only (on pushes to main) while unit tests still run on Windows for every pull request. Locally, Git Bash rewrites absolute paths passed to `docker exec` (`/usr/bin/x` becomes `C:/Program Files/Git/usr/bin/x`); set `MSYS_NO_PATHCONV=1` for such commands.
 7. **Combining faults.** With several faults in one experiment, the expected state at intermediate checkpoints becomes hard to define. MVP: one fault per experiment is the norm. Final-state properties stay valid when faults are combined.
 8. **An interface overfitted to one implementation.** Designing the adapter around a single platform risks baking in its quirks. Mitigation: keep the interface minimal now and revise it when the dlt adapter arrives.
