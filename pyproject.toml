@@ -66,4 +66,5 @@ testpaths = ["tests"]
 addopts = ["-ra", "--strict-markers", "--strict-config"]
 markers = [
     "integration: runs the reference platform in subprocesses (slower)",
+    "hardened: exercises the hardened edition of the reference platform",
 ]
