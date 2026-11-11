@@ -6,7 +6,32 @@ faultline injects faults into ingestion and pipelines (duplicate files, late dat
 
 > **Warning:** faultline deliberately corrupts and deletes data. Point it only at disposable test or CI environments. A target must declare `environment: test` and `allow_destructive: true`, or faultline refuses to run.
 
-**Status:** early development, nothing usable yet. See [docs/design.md](docs/design.md) for the design.
+**Status:** early development. One experiment runs end to end against the bundled reference platform. See [docs/design.md](docs/design.md) for the design.
+
+## Try it
+
+With Docker running:
+
+```sh
+make install
+make ref-up                                   # Postgres, dlt, S3, ClickHouse, dbt, Dagster
+uv run faultline run pos-offline-sync         # about 8 minutes on a laptop
+```
+
+`pos-offline-sync` takes a store's till offline for two days. When it reconnects, its orders reach the source database with their real, older timestamps, behind the incremental cursor of the ingestion tool. On the reference platform's naive pipeline the result looks like this:
+
+```
+Runs:       baseline 4/4 green, fault phase 4/4 green, recovery 3/3 green
+  property                F         R         outcome
+  no_data_loss            violated  violated  SILENT_CORRUPTION
+  no_silent_corruption    violated  violated  SILENT_CORRUPTION
+Verdict:    SILENT_CORRUPTION
+Evidence at F:
+  - silver_orders: complete_keys violated by 62 keys, e.g. HCM-001-20261102-00001, ...
+  - gold_daily_store_sales: 2 missing keys, ..., net_vnd 37,937,000 -> 32,214,000 (-15.1%)
+```
+
+Every run was green, so no alert fired and nobody would have been paged, yet two days of one store's sales are gone. Rerunning the days, the usual fix, does not bring them back and double counts the other stores instead (net revenue +35.5% at checkpoint R). That is the gap faultline measures. At checkpoint F, the usual data quality checks (unique keys, no nulls, valid values) all pass: nothing in the tables is malformed, rows are simply absent. The platform failed, not the data. Snapshots of every checkpoint stay in `.faultline/runs/` for inspection.
 
 ## Development
 
