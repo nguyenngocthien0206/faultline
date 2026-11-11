@@ -48,6 +48,7 @@ from faultline.datagen.truth import write_control_totals
 from faultline.datagen.writer import FileStat, write_json, write_landing_file
 
 GENERATION_FILE = "generation.json"
+PARALLEL_FROM_ORDERS = 50_000  # below this, worker processes cost more than they save
 
 
 class OutputNotEmptyError(Exception):
@@ -79,7 +80,12 @@ def generate(spec: DatasetSpec, out_dir: Path, *, workers: int | None = None) ->
     stats = _write_backoffice(spec, dims, out_dir)
 
     context = _PosContext.from_dimensions(spec, dims)
-    n_workers = max(1, min(workers or os.cpu_count() or 1, len(dims.stores)))
+    if workers is None:
+        # Starting a process pool costs seconds (spawn re-imports everything),
+        # more than generating a small dataset takes. Parallelism pays off only
+        # for large volumes; the output is byte-identical either way.
+        workers = 1 if estimate_orders(spec) < PARALLEL_FROM_ORDERS else os.cpu_count() or 1
+    n_workers = max(1, min(workers, len(dims.stores)))
     results = _run_stores(context, out_dir, n_workers)
 
     truth_rows = []
