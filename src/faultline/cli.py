@@ -27,6 +27,13 @@ class ProfileName(StrEnum):
     large = "large"
 
 
+class TargetName(StrEnum):
+    """Editions of the reference platform (temporary, until targets come from YAML)."""
+
+    naive = "naive"
+    hardened = "hardened"
+
+
 def _print_version(value: bool) -> None:
     if value:
         typer.echo(f"faultline {__version__}")
@@ -117,6 +124,16 @@ def run(
     profile: Annotated[ProfileName, typer.Option(help="Dataset volume profile.")] = (
         ProfileName.tiny
     ),
+    target: Annotated[
+        TargetName, typer.Option(help="Edition of the reference platform to test.")
+    ] = TargetName.naive,
+    lag_days: Annotated[
+        int | None,
+        typer.Option(
+            min=0,
+            help="Hardened only: the lag window, in days (default: the platform's own).",
+        ),
+    ] = None,
     stack_env: Annotated[
         Path, typer.Option(help="Env file of the reference stack (created by `make ref-up`).")
     ] = Path("reference/.env"),
@@ -125,7 +142,7 @@ def run(
     ] = Path(".faultline/runs"),
 ) -> None:
     """Run a built-in experiment against the local reference stack and print the verdict."""
-    from faultline.adapters.reference import ReferenceAdapter, config_from_env_file
+    from faultline.adapters.reference import ReferenceAdapter, config_from_env_file, target_name
     from faultline.datagen import DatasetSpec
     from faultline.experiments import BUILTIN
     from faultline.outcome import Outcome
@@ -135,18 +152,21 @@ def run(
         available = ", ".join(sorted(BUILTIN))
         typer.echo(f"Error: unknown experiment {name!r}; available: {available}", err=True)
         raise typer.Exit(code=2)
+    if lag_days is not None and target is not TargetName.hardened:
+        typer.echo("Error: --lag-days applies to --target hardened only", err=True)
+        raise typer.Exit(code=2)
     if not stack_env.exists():
         typer.echo(f"Error: {stack_env} not found; start the stack with `make ref-up`", err=True)
         raise typer.Exit(code=2)
 
     experiment = BUILTIN[name](DatasetSpec.from_profile(profile.value))
     config = config_from_env_file(stack_env)
-    run_dir = work_dir / f"{datetime.now():%Y%m%d-%H%M%S}-{name}"
+    run_dir = work_dir / f"{datetime.now():%Y%m%d-%H%M%S}-{name}-{target}"
     result = run_experiment(
         experiment,
-        lambda root: ReferenceAdapter(config, root),
+        lambda root: ReferenceAdapter(config, root, edition=target.value, lag_days=lag_days),
         run_dir,
-        target="reference",
+        target=target_name(target.value, lag_days),
         log=typer.echo,
     )
     typer.echo("")
