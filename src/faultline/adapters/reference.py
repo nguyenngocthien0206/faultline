@@ -7,6 +7,8 @@ for a team's own Dagster or ClickHouse platform would look much the same.
 
 from __future__ import annotations
 
+import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -69,6 +71,41 @@ class ReferenceStackConfig:
     location: str = "coffee_platform"
     job: str = "pos_daily"
     run_timeout_seconds: float = 900.0
+
+
+def parse_env_file(path: Path) -> dict[str, str]:
+    """Minimal KEY=VALUE reader: comments, blank lines and surrounding quotes."""
+    values: dict[str, str] = {}
+    for raw in Path(path).read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[key.strip()] = value
+    return values
+
+
+def config_from_env_file(
+    path: Path, *, environ: Mapping[str, str] | None = None
+) -> ReferenceStackConfig:
+    """Connection settings for a local reference stack, from the env file compose reads.
+
+    Process environment variables with the same names win over the file.
+    """
+    settings = parse_env_file(path)
+    env = os.environ if environ is None else environ
+    settings.update({k: v for k, v in env.items() if k in settings})
+    return ReferenceStackConfig(
+        source_dsn=(
+            f"postgresql://{settings['SOURCE_DB_USER']}:{settings['SOURCE_DB_PASSWORD']}"
+            f"@127.0.0.1:5433/{settings['SOURCE_DB_NAME']}"
+        ),
+        clickhouse_user=settings["CLICKHOUSE_USER"],
+        clickhouse_password=settings["CLICKHOUSE_PASSWORD"],
+    )
 
 
 class ReferenceAdapter(Adapter):

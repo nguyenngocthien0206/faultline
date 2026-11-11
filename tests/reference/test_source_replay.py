@@ -1,12 +1,15 @@
 """Replaying generated days into the source Postgres (needs the reference stack)."""
 
 from collections import Counter
+from datetime import date
 from pathlib import Path
 
 import pytest
 from reference_stack import Stack
 
 from faultline.datagen import DatasetSpec, generate
+from faultline.datagen.pos import ORDER_COLUMNS
+from faultline.datagen.writer import write_landing_file
 from faultline.sources.pos import apply_day, create_tables
 
 pytestmark = pytest.mark.integration
@@ -80,3 +83,69 @@ def test_a_failed_day_leaves_nothing_behind(stack: Stack, workspace: str, genera
         apply_day(stack.source, workspace, generated, TINY.start_date)
 
     assert snapshot() == before
+
+
+def _order_row(status: str, updated_at: str) -> tuple[object, ...]:
+    return (
+        "HCM-001-20261102-00001",
+        "HCM-001",
+        None,
+        "takeaway",
+        status,
+        "2026-11-02T08:00:00+07:00",
+        updated_at,
+        29000,
+        0,
+        29000,
+        None,
+        1,
+    )
+
+
+def _deliver(root: Path, dt: str, folder: str, rows: list[tuple[object, ...]]) -> None:
+    write_landing_file(
+        root,
+        source="pos",
+        dataset="orders",
+        partition={"dt": dt, "store": folder},
+        columns=ORDER_COLUMNS,
+        rows=rows,
+    )
+
+
+def test_a_batch_holding_an_order_and_its_refund_keeps_the_latest(
+    stack: Stack, workspace: str, tmp_path: Path
+) -> None:
+    # An offline till syncs the order and its refund in the same batch.
+    _deliver(
+        tmp_path,
+        "2026-11-04",
+        "HCM-001-offline",
+        [
+            _order_row("completed", "2026-11-02T08:01:00+07:00"),
+            _order_row("refunded", "2026-11-03T10:00:00+07:00"),
+        ],
+    )
+    create_tables(stack.source, workspace)
+
+    apply_day(stack.source, workspace, tmp_path, date(2026, 11, 4))
+
+    assert stack.source.fetch_all(f'SELECT status FROM "{workspace}".orders') == [("refunded",)]
+
+
+def test_an_older_row_never_overwrites_a_newer_one(
+    stack: Stack, workspace: str, tmp_path: Path
+) -> None:
+    _deliver(
+        tmp_path, "2026-11-03", "HCM-001", [_order_row("refunded", "2026-11-03T10:00:00+07:00")]
+    )
+    _deliver(
+        tmp_path, "2026-11-04", "HCM-001", [_order_row("completed", "2026-11-02T08:01:00+07:00")]
+    )
+    create_tables(stack.source, workspace)
+
+    apply_day(stack.source, workspace, tmp_path, date(2026, 11, 3))
+    counts = apply_day(stack.source, workspace, tmp_path, date(2026, 11, 4))
+
+    assert counts["orders"] == 0  # the stale version was skipped, not applied
+    assert stack.source.fetch_all(f'SELECT status FROM "{workspace}".orders') == [("refunded",)]

@@ -5,11 +5,10 @@ Credentials come from the same file docker compose reads, reference/.env
 a password happens in exactly one place. Environment variables win over both.
 """
 
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from faultline.adapters.reference import ReferenceStackConfig
+from faultline.adapters.reference import ReferenceStackConfig, config_from_env_file
 from faultline.connectors.clickhouse import ClickHouseClient
 from faultline.connectors.dagster import DagsterClient
 from faultline.connectors.postgres import SourceDatabase
@@ -17,41 +16,14 @@ from faultline.connectors.postgres import SourceDatabase
 REFERENCE_DIR = Path(__file__).resolve().parents[2] / "reference"
 
 
-def parse_env_file(path: Path) -> dict[str, str]:
-    """Minimal KEY=VALUE reader: comments, blank lines and surrounding quotes."""
-    values: dict[str, str] = {}
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        values[key.strip()] = value
-    return values
-
-
-def stack_settings() -> dict[str, str]:
-    env_file = REFERENCE_DIR / ".env"
-    if not env_file.exists():
-        env_file = REFERENCE_DIR / ".env.example"
-    settings = parse_env_file(env_file)
-    settings.update({k: v for k, v in os.environ.items() if k in settings})
-    return settings
+def env_file() -> Path:
+    path = REFERENCE_DIR / ".env"
+    return path if path.exists() else REFERENCE_DIR / ".env.example"
 
 
 def reference_config() -> ReferenceStackConfig:
-    """Adapter configuration for the local stack, from the same settings as Stack."""
-    s = stack_settings()
-    return ReferenceStackConfig(
-        source_dsn=(
-            f"postgresql://{s['SOURCE_DB_USER']}:{s['SOURCE_DB_PASSWORD']}"
-            f"@127.0.0.1:5433/{s['SOURCE_DB_NAME']}"
-        ),
-        clickhouse_user=s["CLICKHOUSE_USER"],
-        clickhouse_password=s["CLICKHOUSE_PASSWORD"],
-    )
+    """Adapter configuration for the local stack."""
+    return config_from_env_file(env_file())
 
 
 @dataclass
@@ -62,19 +34,13 @@ class Stack:
 
     @classmethod
     def from_env(cls) -> "Stack":
-        s = stack_settings()
-        source_dsn = (
-            f"postgresql://{s['SOURCE_DB_USER']}:{s['SOURCE_DB_PASSWORD']}"
-            f"@127.0.0.1:5433/{s['SOURCE_DB_NAME']}"
-        )
+        config = reference_config()
         return cls(
-            source=SourceDatabase(source_dsn),
+            source=SourceDatabase(config.source_dsn),
             clickhouse=ClickHouseClient(
-                "http://127.0.0.1:8123",
-                user=s["CLICKHOUSE_USER"],
-                password=s["CLICKHOUSE_PASSWORD"],
+                config.clickhouse_url,
+                user=config.clickhouse_user,
+                password=config.clickhouse_password,
             ),
-            dagster=DagsterClient(
-                "http://127.0.0.1:3000/graphql", location="coffee_platform", timeout=10
-            ),
+            dagster=DagsterClient(config.dagster_url, location=config.location, timeout=10),
         )

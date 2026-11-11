@@ -109,3 +109,47 @@ def generate(
     for name, count in report.row_counts.items():
         typer.echo(f"  {name:<{width}}  {count:>12,}")
     typer.echo(f"Wrote {report.files:,} files to {out} in {report.elapsed_seconds:.1f}s")
+
+
+@app.command()
+def run(
+    name: Annotated[str, typer.Argument(help="Built-in experiment, e.g. pos-offline-sync.")],
+    profile: Annotated[ProfileName, typer.Option(help="Dataset volume profile.")] = (
+        ProfileName.tiny
+    ),
+    stack_env: Annotated[
+        Path, typer.Option(help="Env file of the reference stack (created by `make ref-up`).")
+    ] = Path("reference/.env"),
+    work_dir: Annotated[
+        Path, typer.Option(help="Parent folder for this run's data and snapshots.")
+    ] = Path(".faultline/runs"),
+) -> None:
+    """Run a built-in experiment against the local reference stack and print the verdict."""
+    from faultline.adapters.reference import ReferenceAdapter, config_from_env_file
+    from faultline.datagen import DatasetSpec
+    from faultline.experiments import BUILTIN
+    from faultline.outcome import Outcome
+    from faultline.runner import run_experiment
+
+    if name not in BUILTIN:
+        available = ", ".join(sorted(BUILTIN))
+        typer.echo(f"Error: unknown experiment {name!r}; available: {available}", err=True)
+        raise typer.Exit(code=2)
+    if not stack_env.exists():
+        typer.echo(f"Error: {stack_env} not found; start the stack with `make ref-up`", err=True)
+        raise typer.Exit(code=2)
+
+    experiment = BUILTIN[name](DatasetSpec.from_profile(profile.value))
+    config = config_from_env_file(stack_env)
+    run_dir = work_dir / f"{datetime.now():%Y%m%d-%H%M%S}-{name}"
+    result = run_experiment(
+        experiment,
+        lambda root: ReferenceAdapter(config, root),
+        run_dir,
+        target="reference",
+        log=typer.echo,
+    )
+    typer.echo("")
+    typer.echo(result.render())
+    if result.outcome is Outcome.ERROR:
+        raise typer.Exit(code=1)

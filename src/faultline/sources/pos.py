@@ -94,13 +94,26 @@ def day_files(generated_root: Path, table: str, dt: date) -> list[Path]:
 
 
 def upsert_sql(workspace: str, table: SourceTable, columns: list[str]) -> str:
-    """INSERT from the staging table; for upsert tables a key conflict updates the row."""
+    """INSERT from the staging table; for upsert tables a key conflict updates the row.
+
+    A batch can hold several versions of one row: a till that was offline syncs
+    an order and its refund together. Only the latest version per key is kept
+    (Postgres refuses to touch one row twice in a statement), and an incoming
+    row never overwrites a newer one, so the source cannot move back in time.
+    """
     cols = ", ".join(columns)
-    sql = f'INSERT INTO "{workspace}".{table.name} ({cols}) SELECT {cols} FROM staging_{table.name}'
-    if table.upsert:
-        updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in columns if c not in table.key)
-        sql += f" ON CONFLICT ({', '.join(table.key)}) DO UPDATE SET {updates}"
-    return sql
+    target = f'"{workspace}".{table.name}'
+    if not table.upsert:
+        return f"INSERT INTO {target} ({cols}) SELECT {cols} FROM staging_{table.name}"
+    keys = ", ".join(table.key)
+    updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in columns if c not in table.key)
+    return (
+        f"INSERT INTO {target} ({cols}) "
+        f"SELECT DISTINCT ON ({keys}) {cols} FROM staging_{table.name} "
+        f"ORDER BY {keys}, {table.cursor} DESC "
+        f"ON CONFLICT ({keys}) DO UPDATE SET {updates} "
+        f"WHERE {target}.{table.cursor} <= EXCLUDED.{table.cursor}"
+    )
 
 
 def apply_day(db: SourceDatabase, workspace: str, generated_root: Path, dt: date) -> dict[str, int]:

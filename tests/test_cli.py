@@ -54,3 +54,18 @@ def test_generate_rejects_an_invalid_date(tmp_path: Path) -> None:
     )
 
     assert result.exit_code != 0
+
+
+def test_run_rejects_an_unknown_experiment(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["run", "no-such-thing", "--stack-env", str(tmp_path / ".env")])
+
+    assert result.exit_code == 2
+    assert "unknown experiment 'no-such-thing'" in result.output
+    assert "pos-offline-sync" in result.output
+
+
+def test_run_explains_a_missing_stack(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["run", "pos-offline-sync", "--stack-env", str(tmp_path / ".env")])
+
+    assert result.exit_code == 2
+    assert "make ref-up" in result.output

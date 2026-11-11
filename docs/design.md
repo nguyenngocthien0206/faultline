@@ -152,7 +152,9 @@ Design note, deviation from the brief: the brief lists `interrupt` as an optiona
 
 A capability the adapter does not declare turns the dependent fault or property into `SKIPPED`, never into a failure.
 
-### 4.2 FaultInjector
+### 4.2 Fault
+
+Implemented in `faultline.faults` (`base.py`, `source.py`):
 
 ```python
 class InjectionPoint(StrEnum):
@@ -161,16 +163,21 @@ class InjectionPoint(StrEnum):
     EXECUTION = "execution"
 
 
-class FaultInjector(ABC):
+class Fault(ABC):
     name: ClassVar[str]
     injection_point: ClassVar[InjectionPoint]
-    requires: ClassVar[frozenset[Capability]]
+    requires: ClassVar[frozenset[Capability]] = frozenset()
 
-    def apply(self, schedule: Schedule, ctx: FaultContext) -> Schedule: ...
-    # undo the cause, e.g. redeliver the correct file
-    def heal(self, ctx: FaultContext) -> list[Action]: ...
-    def affected_partitions(self, ctx: FaultContext) -> set[date]: ...
+    def prepare_input(self, input_root: Path) -> None: ...  # rewrite the faulted copy of the input
+    def apply(self, schedule: Schedule) -> Schedule: ...  # default: unchanged
+    def heal(self) -> list[Action]: ...  # default: none
+    def affected_partitions(self) -> set[date]: ...  # what an operator would rerun
+    def describe(self) -> str: ...  # one line for reports
 ```
+
+A fault acts only on what faultline controls: its private copy of the generated input, the schedule of `Deliver(day)` and `Run(partition)` actions (`faultline.schedule`), and, later, optional adapter capabilities. It never reaches into the platform, so any adapter that offers what the fault `requires` can be tested with it.
+
+**Built so far: `PosOfflineSync(offline_from, sync_on, store=None)`** (source, point 1). A store's till is offline for some days; everything it recorded reaches the source database on `sync_on`, with its real, older timestamps. faultline moves that store's `pos/{orders,order_items,payments}` extracts for the offline days into the sync day's input; the adapter replays them like any other day. With no store given, the first store (by id) open on every day involved is chosen, deterministically. Replay into the source keeps the latest version per key and never moves a row back in time, as a real till sync would.
 
 MVP faults:
 
@@ -187,32 +194,38 @@ A line-boundary truncation is the default on purpose. A file cut mid-line usuall
 
 ### 4.3 Property
 
+Implemented in `faultline.properties`:
+
 ```python
-class Verdict(StrEnum):
-    HOLDS = "holds"
-    VIOLATED = "violated"
-    SKIPPED = "skipped"
+@dataclass(frozen=True)
+class Checkpoint:
+    name: str  # "F" (end of the fault phase) or "R" (after recovery)
+    snapshots: dict[str, Path]
+    runs: tuple[tuple[date, RunResult], ...]
+
+
+@dataclass(frozen=True)
+class PropertyContext:
+    contracts: tuple[TableContract, ...]
+    baseline: dict[str, Path]  # the clean run: the differential answer key
+    truth_root: Path  # generated data before any fault
 
 
 @dataclass(frozen=True)
 class PropertyResult:
-    verdict: Verdict
-    checkpoint: str | None
-    evidence: str  # one human readable line, plus structured diff counts
-    reason: str | None  # for SKIPPED
+    name: str
+    checkpoint: str
+    holds: bool
+    evidence: tuple[str, ...]
 
 
 class Property(ABC):
     name: ClassVar[str]
-    requires: ClassVar[frozenset[Capability]]
 
-    def probe(self, ctx: ProbeContext) -> list[Action]:  # default: no probe
-        return []
-
-    def check(self, trace: Trace, oracle: Oracle) -> list[PropertyResult]: ...
+    def check(self, ctx: PropertyContext, checkpoint: Checkpoint) -> PropertyResult: ...
 ```
 
-`check` returns one result per checkpoint it inspects, and the classifier (section 6) turns those into a single outcome.
+A property only reads snapshots; it never drives the platform. The runner checks every property at F and at R and the classifier (section 6) turns the pair into one outcome. Probes (a property adding its own rerun or backfill) come with the properties that need them.
 
 ### 4.4 Oracle
 
@@ -250,24 +263,26 @@ Totals alone are not enough. A unit test builds a snapshot with one key missing,
 
 ## 5. Experiment lifecycle
 
+Implemented in `faultline.runner.run_experiment(experiment, adapter_factory, work_dir)`:
+
 ```
-0. guard        refuse unless the target is declared a destructive test environment
-1. generate     dataset from seed -> clean schedule
-2. baseline     workspace A: execute clean schedule, snapshot after every run, check key invariants
-                  invariants fail -> ERROR "steady state not established", stop
-3. fault phase  workspace B (fresh): execute faults.apply(clean schedule)        -> checkpoint F
-4. recovery     execute fault.heal(), then rerun affected partitions until the
-                outputs match the baseline or max_runs is reached                -> checkpoint R
-5. probes       execute property probes (rerun, backfill), each with its own checkpoint
-6. score        properties.check(trace, oracle) -> classifier -> results JSON (+ snapshots for diff)
+1. generate     dataset from its seed -> the truth (work_dir/generated)
+2. baseline     sandbox A: clean schedule, snapshot, key invariants
+                  a failed run or a broken invariant -> ERROR "steady state not established", stop
+3. fault phase  sandbox B (fresh): faults rewrite a copy of the input and the schedule  -> checkpoint F
+4. recovery     heal actions, then rerun the affected partitions (recovery_rounds times) -> checkpoint R
+5. score        every property at F and R -> classifier -> one verdict per property and for the experiment
 ```
+
+Planned additions: the safety guard before step 1 (with the target spec), property probes after step 4, convergence counting (rerun until the outputs match, up to `max_runs`), baseline caching per (dataset, target), and results written as JSON for the scorecard.
 
 Notes:
 
 - Never inject faults into a system that is not healthy. That is the first rule of chaos engineering, and step 2 enforces it.
-- The baseline is cached per (dataset spec, target), so a suite of experiments over the same dataset pays for it once.
-- Recovery reruns the affected partitions because that is the standard operator move after an incident. The number of runs needed is reported as the convergence metric.
-- Each experiment gets its own workspace directories, so experiments can run in parallel and never contaminate each other.
+- Recovery reruns the affected partitions because that is the standard operator move after an incident.
+- Each phase gets its own sandbox (workspace), so experiments can run in parallel and never contaminate each other. Sandboxes are always torn down; snapshots stay in `work_dir` for inspection.
+- Any exception in the harness ends the experiment as `ERROR` with the message, never as a verdict about the platform.
+- The whole machinery is tested without Docker on a toy platform written in Python (`tests/runner/fake_platform.py`) with a dlt-like cursor: the same `PosOfflineSync` fault yields `SILENT_CORRUPTION`, `PASS`, `DETECTED` or `BROKEN` depending only on how the toy platform treats rows behind its cursor.
 
 ## 6. Outcome classification
 
@@ -289,6 +304,7 @@ Per property, given results at checkpoints F and R:
 - A violation at F without a signal is `SILENT_CORRUPTION` even if R later heals. Consumers read wrong numbers in between and nobody raised a hand.
 - `ERROR` is an addition to the brief. Without it, a bug in faultline or an unhealthy baseline would be reported as a verdict about the platform.
 - The experiment outcome is the worst property outcome, ordered `SILENT_CORRUPTION > BROKEN > DETECTED > PASS`. `SKIPPED` and `ERROR` are shown separately and never mask a real verdict.
+- Implemented in `faultline.outcome.classify`. A violation at R counts as `BROKEN` when a signal was raised in either phase: the platform did raise its hand, it just did not heal.
 - Atomicity uses its own checkpoint, right after an interrupted run: the consumer snapshot there must equal either the actual snapshot before that run or the baseline after that step. Anything in between is a partial result.
 
 ## 7. Properties
@@ -522,11 +538,13 @@ faultline/
   docs/
     design.md
   src/faultline/
-    cli.py  spec.py  safety.py  runner.py  trace.py  outcome.py
+    cli.py  spec.py  safety.py   (spec.py and safety.py come with the YAML specs)
     adapters/      base.py  reference.py   (registry.py with the target spec)
-    faults/        base.py  landing.py  execution.py
-    properties/    base.py  idempotency.py  atomicity.py  ...
     oracle/        fingerprint.py  diff.py  invariants.py  snapshot.py
+    schedule.py    Deliver / Run actions, clean_schedule
+    faults/        base.py  source.py   (landing.py, execution.py to come)
+    properties/    base.py  core.py     (no_data_loss, no_silent_corruption)
+    outcome.py  runner.py  experiments.py
     datagen/       spec.py  catalog.py  dimensions.py  pos.py  writer.py  truth.py  generate.py
     report/        scorecard.py
     connectors/    dagster.py  clickhouse.py  postgres.py  workspace.py
@@ -560,8 +578,14 @@ Runtime dependencies: typer, faker, duckdb (1.x, the oracle's engine), then pyda
 | crash-mid-write (gold) | SILENT_CORRUPTION (readers see the gap of a two-statement refresh) | PASS |
 | retry-after-partial-commit | SILENT_CORRUPTION (duplicates) | PASS |
 | idempotency and backfill probes | SILENT_CORRUPTION | PASS |
+| pos-offline-sync (a till syncs two days late, old timestamps) | SILENT_CORRUPTION (measured, see below) | PASS (dlt `lag` window) |
 
 At least one experiment must show `BROKEN` (noisy and unrecoverable); which one is settled when the execution faults are built on the new stack.
+
+**First measured result** (`faultline run pos-offline-sync`, profile `tiny`, naive, about 8 minutes on Docker Desktop): every one of the 11 runs green, verdict `SILENT_CORRUPTION`.
+
+- At F: all 62 orders of store HCM-001 from the two offline days missing from `silver_orders` (with 105 order lines and 69 payments); net revenue in gold -15.1%. dlt's cursor had passed their timestamps, so they were never extracted.
+- At R, after the operator reran the three affected days: the 62 orders still missing, and every other store now double counted because naive bronze reloaded the same landing files. Net revenue +35.5% against the baseline, items sold +136.7%. The standard fix did not recover the data; it made the numbers wrong in the other direction.
 
 ## 13. Design risks
 
