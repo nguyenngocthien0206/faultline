@@ -2,7 +2,9 @@
 
 from pathlib import Path
 
-from reference_stack import REFERENCE_DIR, parse_env_file
+from reference_stack import REFERENCE_DIR
+
+from faultline.adapters.reference import config_from_env_file, parse_env_file
 
 REQUIRED = {
     "SOURCE_DB_USER",
@@ -50,3 +52,15 @@ def test_compose_references_only_variables_from_the_example() -> None:
     for value in ("faultline-secret", "dagster:dagster"):
         assert value not in compose, f"hard-coded credential {value!r} left in compose"
     assert example["S3_SECRET_KEY"] not in compose
+
+
+def test_config_comes_from_the_env_file_and_the_environment_wins(tmp_path: Path) -> None:
+    env = tmp_path / ".env"
+    env.write_text((REFERENCE_DIR / ".env.example").read_text(encoding="utf-8"), encoding="utf-8")
+
+    plain = config_from_env_file(env, environ={})
+    overridden = config_from_env_file(env, environ={"CLICKHOUSE_PASSWORD": "rotated"})
+
+    assert plain.source_dsn == "postgresql://faultline:faultline@127.0.0.1:5433/coffee"
+    assert plain.clickhouse_user == "faultline"
+    assert overridden.clickhouse_password == "rotated"
