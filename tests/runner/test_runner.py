@@ -5,7 +5,7 @@ platform handles rows that arrive behind its cursor. That is the point of
 faultline: the fault is fixed, the platform's behaviour decides the outcome.
 """
 
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -48,6 +48,19 @@ def test_one_fault_every_verdict(mode: str, expected: Outcome, tmp_path: Path) -
 
     assert result.outcome is expected, result.render()
     assert {p.outcome for p in result.properties} <= {expected, Outcome.PASS}
+
+
+def test_a_lag_window_shorter_than_the_outage_loses_rows_like_naive(tmp_path: Path) -> None:
+    # The lag window is a promise with a limit: the till is offline two days,
+    # the platform only looks back twelve hours.
+    result = run_experiment(
+        EXPERIMENT,
+        lambda root: FakeCursorPlatform(root, "lag", lag=timedelta(hours=12)),
+        tmp_path,
+        target="fake-lag-12h",
+    )
+
+    assert result.outcome is Outcome.SILENT_CORRUPTION, result.render()
 
 
 def test_naive_loses_rows_silently_and_recovery_cannot_bring_them_back(tmp_path: Path) -> None:
@@ -153,6 +166,17 @@ def test_a_baseline_from_another_dataset_is_refused(tmp_path: Path) -> None:
 
     assert result.outcome is Outcome.ERROR
     assert "baseline was run on" in result.problems[0]
+
+
+def test_a_baseline_from_another_target_is_refused(tmp_path: Path) -> None:
+    naive = run_baseline(TINY, CountingFactory("naive"), tmp_path / "naive", target="fake-naive")
+
+    result = run_experiment(
+        EXPERIMENT, CountingFactory("lag"), tmp_path / "exp", target="fake-lag", baseline=naive
+    )
+
+    assert result.outcome is Outcome.ERROR
+    assert "target 'fake-naive'" in result.problems[0]
 
 
 def test_a_reused_baseline_that_is_not_healthy_stops_the_experiment(tmp_path: Path) -> None:

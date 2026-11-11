@@ -7,6 +7,7 @@ that reach the source with a timestamp older than the cursor:
 
     naive              never extracted, nobody notices        -> SILENT_CORRUPTION
     lag                re-extract a 3-day window, all good    -> PASS
+                       (rows later than the window: lost, as in naive)
     alert_then_repair  fail loudly, load them on the next run -> DETECTED
     alert_forever      fail loudly, never load them           -> BROKEN
     lossy              drops one order even on a clean run    -> steady state broken
@@ -36,9 +37,10 @@ LAG = timedelta(days=3)
 
 
 class FakeCursorPlatform(Adapter):
-    def __init__(self, input_root: Path, mode: str) -> None:
+    def __init__(self, input_root: Path, mode: str, *, lag: timedelta = LAG) -> None:
         self.input_root = input_root
         self.mode = mode
+        self.lag = lag
         self.source: dict[str, dict[str, str]] = {}
         self.warehouse: dict[str, dict[str, str]] = {}
         self.cursor: datetime | None = None
@@ -68,7 +70,7 @@ class FakeCursorPlatform(Adapter):
             self.repair_pending = False
             return RunResult(RunStatus.SUCCEEDED)
 
-        since = self.cursor - LAG if (self.mode == "lag" and self.cursor) else self.cursor
+        since = self.cursor - self.lag if (self.mode == "lag" and self.cursor) else self.cursor
         fresh = [r for r in self.source.values() if since is None or _ts(r) > since]
         late = [
             r
