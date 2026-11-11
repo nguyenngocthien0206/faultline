@@ -11,12 +11,12 @@ from pathlib import Path
 import pytest
 from fake_platform import FakeCursorPlatform
 
-from faultline.adapters.base import RunStatus
+from faultline.adapters.base import RunRequest, RunResult, RunStatus
 from faultline.datagen import DatasetSpec
 from faultline.faults.source import PosOfflineSync
 from faultline.outcome import Outcome
 from faultline.properties.core import NoDataLoss, NoSilentCorruption
-from faultline.runner import Experiment, run_experiment
+from faultline.runner import Experiment, run_baseline, run_experiment
 
 TINY = DatasetSpec.from_profile("tiny")
 EXPERIMENT = Experiment(
@@ -108,3 +108,59 @@ def test_the_experiment_object_is_reusable(tmp_path: Path) -> None:
 
     assert first.faults == second.faults
     assert EXPERIMENT.faults[0].store is None  # the runner worked on a copy
+
+
+class CountingFactory:
+    """Builds fake platforms and counts every run they execute."""
+
+    def __init__(self, mode: str) -> None:
+        self.mode = mode
+        self.runs = 0
+
+    def __call__(self, root: Path) -> FakeCursorPlatform:
+        platform = FakeCursorPlatform(root, self.mode)
+        original = platform.run
+
+        def counted(request: RunRequest) -> RunResult:
+            self.runs += 1
+            return original(request)
+
+        platform.run = counted
+        return platform
+
+
+def test_a_reused_baseline_gives_the_same_verdict_with_fewer_runs(tmp_path: Path) -> None:
+    fresh_factory, reuse_factory = CountingFactory("naive"), CountingFactory("naive")
+    baseline = run_baseline(TINY, reuse_factory, tmp_path / "shared")
+    assert baseline.established
+    reuse_factory.runs = 0
+
+    fresh = run_experiment(EXPERIMENT, fresh_factory, tmp_path / "fresh")
+    reused = run_experiment(EXPERIMENT, reuse_factory, tmp_path / "reused", baseline=baseline)
+
+    assert reused.outcome is fresh.outcome is Outcome.SILENT_CORRUPTION
+    assert [p.outcome for p in reused.properties] == [p.outcome for p in fresh.properties]
+    assert fresh_factory.runs - reuse_factory.runs == TINY.days  # the baseline's runs
+    assert "baseline (reused) 4/4 green" in reused.render()
+
+
+def test_a_baseline_from_another_dataset_is_refused(tmp_path: Path) -> None:
+    other = run_baseline(
+        DatasetSpec.from_profile("tiny", seed=7), CountingFactory("naive"), tmp_path / "other"
+    )
+
+    result = run_experiment(EXPERIMENT, CountingFactory("naive"), tmp_path / "exp", baseline=other)
+
+    assert result.outcome is Outcome.ERROR
+    assert "baseline was run on" in result.problems[0]
+
+
+def test_a_reused_baseline_that_is_not_healthy_stops_the_experiment(tmp_path: Path) -> None:
+    unhealthy = run_baseline(TINY, CountingFactory("lossy"), tmp_path / "lossy")
+
+    assert not unhealthy.established
+    result = run_experiment(
+        EXPERIMENT, CountingFactory("lossy"), tmp_path / "exp", baseline=unhealthy
+    )
+    assert result.outcome is Outcome.ERROR
+    assert result.problems[0] == "steady state not established"
