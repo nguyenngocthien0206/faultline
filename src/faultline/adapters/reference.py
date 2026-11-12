@@ -176,8 +176,16 @@ class ReferenceAdapter(Adapter):
         return config
 
     def capabilities(self) -> Capabilities:
+        # Concurrent sandboxes: each workspace has its own source schema,
+        # ClickHouse database, S3 prefix and dlt state, and Dagster starts runs
+        # without a queue.
         features = frozenset(
-            {Capability.DELIVER_DAY, Capability.RUN_PARTITION, Capability.SNAPSHOT}
+            {
+                Capability.DELIVER_DAY,
+                Capability.RUN_PARTITION,
+                Capability.SNAPSHOT,
+                Capability.CONCURRENT_SANDBOXES,
+            }
         )
         return Capabilities(features=features, tables=CONSUMER_TABLES)
 
