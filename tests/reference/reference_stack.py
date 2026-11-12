@@ -42,5 +42,5 @@ class Stack:
                 user=config.clickhouse_user,
                 password=config.clickhouse_password,
             ),
-            dagster=DagsterClient(config.dagster_url, location=config.location, timeout=10),
+            dagster=DagsterClient(config.dagster_url, location=config.location),
         )

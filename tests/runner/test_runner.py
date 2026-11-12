@@ -5,6 +5,8 @@ platform handles rows that arrive behind its cursor. That is the point of
 faultline: the fault is fixed, the platform's behaviour decides the outcome.
 """
 
+import threading
+import time
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -124,19 +126,31 @@ def test_the_experiment_object_is_reusable(tmp_path: Path) -> None:
 
 
 class CountingFactory:
-    """Builds fake platforms and counts every run they execute."""
+    """Builds fake platforms, counts every run they execute and how many overlap."""
 
-    def __init__(self, mode: str) -> None:
+    def __init__(self, mode: str, *, concurrent: bool = True) -> None:
         self.mode = mode
+        self.concurrent = concurrent
         self.runs = 0
+        self.max_active = 0
+        self._active = 0
+        self._lock = threading.Lock()
 
     def __call__(self, root: Path) -> FakeCursorPlatform:
-        platform = FakeCursorPlatform(root, self.mode)
+        platform = FakeCursorPlatform(root, self.mode, concurrent=self.concurrent)
         original = platform.run
 
         def counted(request: RunRequest) -> RunResult:
-            self.runs += 1
-            return original(request)
+            with self._lock:
+                self.runs += 1
+                self._active += 1
+                self.max_active = max(self.max_active, self._active)
+            try:
+                time.sleep(0.005)  # long enough for a concurrent run to overlap
+                return original(request)
+            finally:
+                with self._lock:
+                    self._active -= 1
 
         platform.run = counted
         return platform
@@ -188,3 +202,72 @@ def test_a_reused_baseline_that_is_not_healthy_stops_the_experiment(tmp_path: Pa
     )
     assert result.outcome is Outcome.ERROR
     assert result.problems[0] == "steady state not established"
+
+
+def test_the_two_sandboxes_really_run_at_the_same_time(tmp_path: Path) -> None:
+    # Each sandbox waits at its first run until the other one gets there too.
+    # Run one after the other, the barrier would time out and the result be ERROR.
+    meet = threading.Barrier(2, timeout=10)
+
+    result = run_experiment(
+        EXPERIMENT,
+        lambda root: FakeCursorPlatform(root, "naive", on_first_run=meet.wait),
+        tmp_path,
+    )
+
+    assert result.outcome is Outcome.SILENT_CORRUPTION, result.render()
+
+
+def test_an_adapter_without_the_capability_gets_one_sandbox_at_a_time(tmp_path: Path) -> None:
+    factory = CountingFactory("naive", concurrent=False)
+
+    result = run_experiment(EXPERIMENT, factory, tmp_path)
+
+    assert result.outcome is Outcome.SILENT_CORRUPTION
+    assert factory.max_active == 1
+    assert factory.runs == TINY.days * 2 + 3  # baseline, fault phase, three reruns
+
+
+def test_one_after_the_other_a_broken_baseline_stops_before_the_fault_phase(
+    tmp_path: Path,
+) -> None:
+    factory = CountingFactory("lossy", concurrent=False)
+
+    result = run_experiment(EXPERIMENT, factory, tmp_path)
+
+    assert result.outcome is Outcome.ERROR
+    assert list(result.runs) == ["baseline"]
+    assert factory.runs == TINY.days
+
+
+def test_side_by_side_a_broken_baseline_is_still_an_error(tmp_path: Path) -> None:
+    result = run_experiment(EXPERIMENT, CountingFactory("lossy"), tmp_path)
+
+    assert result.outcome is Outcome.ERROR
+    assert result.problems[0] == "steady state not established"
+    assert list(result.runs) == ["baseline", "fault phase", "recovery"]  # it ran meanwhile
+    assert not result.properties  # nothing is scored against a broken baseline
+
+
+def test_when_one_sandbox_fails_the_other_still_finishes_and_is_torn_down(
+    tmp_path: Path,
+) -> None:
+    torn_down: list[str] = []
+
+    def factory(root: Path) -> FakeCursorPlatform:
+        platform = FakeCursorPlatform(root, "naive")
+        platform.teardown = lambda: torn_down.append(root.name)  # type: ignore[method-assign]
+        if root.name == "faulted_input":
+
+            def broken(request: RunRequest) -> RunResult:
+                raise RuntimeError("the fault sandbox lost its connection")
+
+            platform.run = broken  # type: ignore[method-assign]
+        return platform
+
+    result = run_experiment(EXPERIMENT, factory, tmp_path)
+
+    assert result.outcome is Outcome.ERROR
+    assert result.problems == ("RuntimeError: the fault sandbox lost its connection",)
+    assert sorted(torn_down) == ["faulted_input", "generated"]
+    assert (tmp_path / "baseline").is_dir()  # the clean half ran to the end

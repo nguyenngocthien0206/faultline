@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from faultline.adapters.base import Capability
 from faultline.adapters.reference import (
     HARDENED_EXTRACT_OP,
     Edition,
@@ -68,3 +69,7 @@ def test_an_unknown_edition_is_refused() -> None:
 def test_target_names() -> None:
     assert target_name("naive") == "reference-naive"
     assert target_name(Edition.HARDENED, 0) == "reference-hardened(lag=0d)"
+
+
+def test_sandboxes_are_isolated_enough_to_run_side_by_side() -> None:
+    assert _adapter().capabilities().supports(Capability.CONCURRENT_SANDBOXES)

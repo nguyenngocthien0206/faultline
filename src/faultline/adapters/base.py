@@ -23,6 +23,10 @@ class Capability(StrEnum):
     DELIVER_DAY = "input.deliver_day"  # make one day of input available to the platform
     RUN_PARTITION = "run.partition"  # run the pipeline for one partition
     SNAPSHOT = "output.snapshot"  # export a consumer-visible table to Parquet
+    # Several sandboxes of this adapter can run at the same time without touching
+    # each other. The runner then runs the baseline and the fault phase side by
+    # side; without it, one after the other (a single shared test environment).
+    CONCURRENT_SANDBOXES = "sandbox.concurrent"
 
 
 @dataclass(frozen=True)

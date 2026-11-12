@@ -1,13 +1,22 @@
 """Run one experiment end to end: baseline, fault phase, recovery, verdict.
 
-    1. generate   the dataset, from its seed: this is the truth
+    1. generate   the dataset, from its seed: this is the truth; the faults
+                  then transform a copy of it and the schedule
     2. baseline   a fresh sandbox runs the clean schedule; snapshot; check the
-                  steady state (key invariants). Not established -> ERROR, stop.
-    3. fault      a second fresh sandbox runs the faulted schedule on a faulted
-                  copy of the input; snapshot at checkpoint F
+                  steady state (key invariants). Not established -> ERROR.
+    3. fault      a second fresh sandbox runs the faulted schedule on the
+                  faulted copy of the input; snapshot at checkpoint F
     4. recovery   heal actions, then rerun the affected partitions (the
                   operator's standard move); snapshot at checkpoint R
     5. score      every property at F and R, classified into one outcome
+
+The two sandboxes only meet at step 5. When the adapter declares
+CONCURRENT_SANDBOXES, step 2 runs side by side with steps 3 and 4, and an
+experiment takes as long as its longer half. A baseline that turns out broken
+then still yields ERROR, only after the fault phase has run as well: faultline
+never kills a platform's runs midway. Without the capability (one shared test
+environment, say) the steps run one after the other and stop at a broken
+baseline.
 
 Sandboxes are always torn down. Snapshots stay in the work directory, so a
 verdict can be inspected after the fact.
@@ -23,25 +32,30 @@ from __future__ import annotations
 
 import copy
 import shutil
+import threading
 import traceback
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date
 from functools import reduce
 from pathlib import Path
+from typing import TypeVar
 
-from faultline.adapters.base import Adapter, RunRequest, RunResult, TableContract
+from faultline.adapters.base import Adapter, Capability, RunRequest, RunResult, TableContract
 from faultline.datagen import DatasetSpec, generate
 from faultline.faults.base import Fault
 from faultline.oracle.invariants import complete_keys, unique_keys
 from faultline.oracle.snapshot import snapshot_all
 from faultline.outcome import Outcome, classify, has_signal, worst
 from faultline.properties.base import Checkpoint, Property, PropertyContext, PropertyResult
-from faultline.schedule import Deliver, Run, Schedule, clean_schedule
+from faultline.schedule import Action, Deliver, Run, Schedule, clean_schedule
 
 AdapterFactory = Callable[[Path], Adapter]  # input root -> a fresh sandbox
 Log = Callable[[str], None]
 RunLog = tuple[tuple[date, RunResult], ...]
+A = TypeVar("A")
+B = TypeVar("B")
 
 
 @dataclass(frozen=True)
@@ -146,6 +160,28 @@ class Baseline:
         return not self.problems
 
 
+def generate_truth(spec: DatasetSpec, work_dir: Path, log: Log = lambda _: None) -> Path:
+    """Generate the dataset into `work_dir/generated` (step 1): what a correct platform shows."""
+    truth = Path(work_dir) / "generated"
+    log(f"generating {spec.profile} dataset")
+    generate(spec, truth)
+    return truth
+
+
+def _clean_run(
+    spec: DatasetSpec, truth: Path, adapter: Adapter, work_dir: Path, target: str, log: Log
+) -> Baseline:
+    log("baseline: clean run")
+    with adapter as clean:
+        runs = execute(clean, clean_schedule(spec), log, "baseline")
+        snapshots = snapshot_all(clean, work_dir / "baseline")
+        contracts = clean.capabilities().tables
+        invariants = steady_state_problems(clean, snapshots, truth)
+    failed = [f"baseline run {d} failed: {r.errors}" for d, r in runs if not r.succeeded]
+    problems = (*failed, *invariants)
+    return Baseline(spec, truth, snapshots, contracts, runs, tuple(problems), target)
+
+
 def run_baseline(
     spec: DatasetSpec,
     adapter_factory: AdapterFactory,
@@ -156,18 +192,69 @@ def run_baseline(
 ) -> Baseline:
     """Generate the dataset and run it cleanly in a fresh sandbox (steps 1 and 2)."""
     work_dir = Path(work_dir)
-    truth = work_dir / "generated"
-    log(f"generating {spec.profile} dataset")
-    generate(spec, truth)
-    log("baseline: clean run")
-    with adapter_factory(truth) as clean:
-        runs = execute(clean, clean_schedule(spec), log, "baseline")
-        snapshots = snapshot_all(clean, work_dir / "baseline")
-        contracts = clean.capabilities().tables
-        invariants = steady_state_problems(clean, snapshots, truth)
-    failed = [f"baseline run {d} failed: {r.errors}" for d, r in runs if not r.succeeded]
-    problems = (*failed, *invariants)
-    return Baseline(spec, truth, snapshots, contracts, runs, tuple(problems), target)
+    truth = generate_truth(spec, work_dir, log)
+    return _clean_run(spec, truth, adapter_factory(truth), work_dir, target, log)
+
+
+@dataclass(frozen=True)
+class _FaultPlan:
+    """What the fault phase needs, worked out from the truth before any sandbox runs."""
+
+    input_root: Path
+    schedule: Schedule
+    recovery: tuple[Action, ...]
+    descriptions: tuple[str, ...]
+
+
+def _plan_faults(
+    experiment: Experiment, faults: tuple[Fault, ...], truth: Path, work_dir: Path, log: Log
+) -> _FaultPlan:
+    faulted_input = work_dir / "faulted_input"
+    shutil.copytree(truth, faulted_input)
+    descriptions = []
+    for fault in faults:
+        fault.prepare_input(faulted_input)
+        descriptions.append(fault.describe())
+        log(f"fault: {fault.describe()}")
+    schedule = reduce(lambda s, f: f.apply(s), faults, clean_schedule(experiment.spec))
+    affected = sorted({p for f in faults for p in f.affected_partitions()})
+    heal = tuple(a for f in faults for a in f.heal())
+    recovery = heal + tuple(Run(p) for _ in range(experiment.recovery_rounds) for p in affected)
+    return _FaultPlan(faulted_input, schedule, recovery, tuple(descriptions))
+
+
+def _fault_phases(
+    plan: _FaultPlan, adapter: Adapter, work_dir: Path, log: Log
+) -> tuple[Checkpoint, Checkpoint]:
+    """Steps 3 and 4 in one sandbox: the faulted schedule, then the recovery."""
+    with adapter as sandbox:
+        fault_runs = execute(sandbox, plan.schedule, log, "fault")
+        at_f = Checkpoint("F", snapshot_all(sandbox, work_dir / "checkpoint_F"), fault_runs)
+        recovery_runs = execute(sandbox, plan.recovery, log, "recovery")
+        at_r = Checkpoint("R", snapshot_all(sandbox, work_dir / "checkpoint_R"), recovery_runs)
+    return at_f, at_r
+
+
+def _side_by_side(first: Callable[[], A], second: Callable[[], B]) -> tuple[A, B]:
+    """Run both in their own thread and wait for both, even when one fails.
+
+    Waiting matters: each half tears its own sandbox down, and a half left
+    running would leave a sandbox behind. The first failure is raised after.
+    """
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="sandbox") as pool:
+        a, b = pool.submit(first), pool.submit(second)
+    return a.result(), b.result()
+
+
+def _synchronized(log: Log) -> Log:
+    """One line at a time, when two sandboxes log at once."""
+    lock = threading.Lock()
+
+    def locked(line: str) -> None:
+        with lock:
+            log(line)
+
+    return locked
 
 
 def run_experiment(
@@ -181,6 +268,7 @@ def run_experiment(
 ) -> ExperimentResult:
     """Run one experiment. Pass `baseline` to reuse a clean run of the same dataset."""
     work_dir = Path(work_dir)
+    log = _synchronized(log)
     faults = tuple(copy.deepcopy(f) for f in experiment.faults)  # keep the experiment reusable
     base = {"experiment": experiment.name, "target": target, "work_dir": work_dir}
     try:
@@ -189,6 +277,27 @@ def run_experiment(
         log(traceback.format_exc())
         problem = f"{type(exc).__name__}: {exc}"
         return ExperimentResult(**base, outcome=Outcome.ERROR, problems=(problem,))
+
+
+def _check_reusable(baseline: Baseline, spec: DatasetSpec, target: str) -> None:
+    if baseline.spec != spec:
+        raise ValueError(f"baseline was run on {baseline.spec}, the experiment needs {spec}")
+    if baseline.target != target:
+        raise ValueError(
+            f"baseline was run on target {baseline.target!r}, the experiment runs on {target!r}"
+        )
+
+
+def _not_established(
+    base: dict, runs: dict[str, RunLog], baseline: Baseline, faults: tuple[str, ...] = ()
+) -> ExperimentResult:
+    return ExperimentResult(
+        **base,
+        outcome=Outcome.ERROR,
+        faults=faults,
+        runs=runs,
+        problems=("steady state not established", *baseline.problems),
+    )
 
 
 def _run(
@@ -200,54 +309,44 @@ def _run(
     baseline: Baseline | None,
     log: Log,
 ) -> ExperimentResult:
-    if baseline is None:
-        target = base["target"]
-        baseline = run_baseline(experiment.spec, adapter_factory, work_dir, target=target, log=log)
-        phase = "baseline"
-    elif baseline.spec != experiment.spec:
-        raise ValueError(
-            f"baseline was run on {baseline.spec}, the experiment needs {experiment.spec}"
-        )
-    elif baseline.target != base["target"]:
-        raise ValueError(
-            f"baseline was run on target {baseline.target!r}, "
-            f"the experiment runs on {base['target']!r}"
-        )
-    else:
+    target = base["target"]
+    if baseline is not None:
+        _check_reusable(baseline, experiment.spec, target)
         log("baseline: reused")
         phase = "baseline (reused)"
-    runs = {phase: baseline.runs}
-    if not baseline.established:
+        if not baseline.established:
+            log("steady state not established")
+            return _not_established(base, {phase: baseline.runs}, baseline)
+        plan = _plan_faults(experiment, faults, baseline.truth_root, work_dir, log)
+        at_f, at_r = _fault_phases(plan, adapter_factory(plan.input_root), work_dir, log)
+    else:
+        phase = "baseline"
+        truth = generate_truth(experiment.spec, work_dir, log)
+        plan = _plan_faults(experiment, faults, truth, work_dir, log)
+        # Building an adapter opens nothing (setup happens on entering it), so
+        # both are built up front and the capability is read before any run.
+        clean, sandbox = adapter_factory(truth), adapter_factory(plan.input_root)
+        if clean.capabilities().supports(Capability.CONCURRENT_SANDBOXES):
+            log("baseline and fault phase run side by side")
+            baseline, (at_f, at_r) = _side_by_side(
+                lambda: _clean_run(experiment.spec, truth, clean, work_dir, target, log),
+                lambda: _fault_phases(plan, sandbox, work_dir, log),
+            )
+        else:
+            baseline = _clean_run(experiment.spec, truth, clean, work_dir, target, log)
+            if not baseline.established:
+                log("steady state not established")
+                return _not_established(base, {phase: baseline.runs}, baseline, plan.descriptions)
+            at_f, at_r = _fault_phases(plan, sandbox, work_dir, log)
+
+    runs = {phase: baseline.runs, "fault phase": at_f.runs, "recovery": at_r.runs}
+    if not baseline.established:  # side by side: found out after the fault phase ran
         log("steady state not established")
-        return ExperimentResult(
-            **base,
-            outcome=Outcome.ERROR,
-            runs=runs,
-            problems=("steady state not established", *baseline.problems),
-        )
-    truth, contracts = baseline.truth_root, baseline.contracts
-    descriptions: list[str] = []
+        return _not_established(base, runs, baseline, plan.descriptions)
 
-    faulted_input = work_dir / "faulted_input"
-    shutil.copytree(truth, faulted_input)
-    for fault in faults:
-        fault.prepare_input(faulted_input)
-        descriptions.append(fault.describe())
-        log(f"fault: {fault.describe()}")
-    schedule = reduce(lambda s, f: f.apply(s), faults, clean_schedule(experiment.spec))
-    affected = sorted({p for f in faults for p in f.affected_partitions()})
-    heal = tuple(a for f in faults for a in f.heal())
-
-    with adapter_factory(faulted_input) as sandbox:
-        runs["fault phase"] = execute(sandbox, schedule, log, "fault")
-        at_f = Checkpoint(
-            "F", snapshot_all(sandbox, work_dir / "checkpoint_F"), runs["fault phase"]
-        )
-        recovery = heal + tuple(Run(p) for _ in range(experiment.recovery_rounds) for p in affected)
-        runs["recovery"] = execute(sandbox, recovery, log, "recovery")
-        at_r = Checkpoint("R", snapshot_all(sandbox, work_dir / "checkpoint_R"), runs["recovery"])
-
-    ctx = PropertyContext(contracts=contracts, baseline=baseline.snapshots, truth_root=truth)
+    ctx = PropertyContext(
+        contracts=baseline.contracts, baseline=baseline.snapshots, truth_root=baseline.truth_root
+    )
     signal_f, signal_r = has_signal(at_f.runs), has_signal(at_r.runs)
     verdicts = []
     for prop in experiment.properties:
@@ -259,7 +358,7 @@ def _run(
     return ExperimentResult(
         **base,
         outcome=worst(v.outcome for v in verdicts),
-        faults=tuple(descriptions),
+        faults=plan.descriptions,
         properties=tuple(verdicts),
         runs=runs,
     )

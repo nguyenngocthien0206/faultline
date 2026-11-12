@@ -100,6 +100,9 @@ class Capability(StrEnum):
     DELIVER_DAY = "input.deliver_day"  # make one day of input available to the platform
     RUN_PARTITION = "run.partition"  # run the pipeline for one partition
     SNAPSHOT = "output.snapshot"  # export a consumer-visible table to Parquet
+    # Several sandboxes can run at the same time without touching each other:
+    # the runner then runs the baseline and the fault phase side by side.
+    CONCURRENT_SANDBOXES = "sandbox.concurrent"
 
 
 @dataclass(frozen=True)
@@ -266,19 +269,22 @@ Totals alone are not enough. A unit test builds a snapshot with one key missing,
 Implemented in `faultline.runner.run_experiment(experiment, adapter_factory, work_dir)`:
 
 ```
-1. generate     dataset from its seed -> the truth (work_dir/generated)
+1. generate     dataset from its seed -> the truth (work_dir/generated);
+                  the faults rewrite a copy of it and the schedule
 2. baseline     sandbox A: clean schedule, snapshot, key invariants
-                  a failed run or a broken invariant -> ERROR "steady state not established", stop
-3. fault phase  sandbox B (fresh): faults rewrite a copy of the input and the schedule  -> checkpoint F
+                  a failed run or a broken invariant -> ERROR "steady state not established"
+3. fault phase  sandbox B (fresh): the faulted schedule on the faulted copy    -> checkpoint F
 4. recovery     heal actions, then rerun the affected partitions (recovery_rounds times) -> checkpoint R
 5. score        every property at F and R -> classifier -> one verdict per property and for the experiment
 ```
+
+**Side by side.** The two sandboxes only meet at step 5, so when the adapter declares `CONCURRENT_SANDBOXES`, step 2 runs in one thread and steps 3 and 4 in another, and an experiment takes as long as its longer half: 7 Dagster runs of wall clock instead of 11 for `pos-offline-sync` on `tiny`. The price is ordering: a baseline that turns out broken is only known once the fault phase has run as well. The verdict is still `ERROR` and nothing is scored against that baseline, but the fault phase's runs were spent, because faultline never kills a platform's runs midway to save time. An adapter for a single shared test environment leaves the capability out; the runner then goes one step after the other and stops at a broken baseline before injecting anything. Whichever half fails, the runner waits for the other to finish, so every sandbox is torn down.
 
 Steps 1 and 2 are `run_baseline`, whose result can be passed to several experiments (`run_experiment(..., baseline=...)`) on the same dataset and target, so the clean run is paid for once; a baseline from another dataset spec is refused. Planned additions: the safety guard before step 1 (with the target spec), property probes after step 4, convergence counting (rerun until the outputs match, up to `max_runs`), and results written as JSON for the scorecard.
 
 Notes:
 
-- Never inject faults into a system that is not healthy. That is the first rule of chaos engineering, and step 2 enforces it.
+- Never inject faults into a system that is not healthy. That is the first rule of chaos engineering, and step 2 enforces it (side by side, by refusing to score rather than by not starting).
 - Recovery reruns the affected partitions because that is the standard operator move after an incident.
 - Each phase gets its own sandbox (workspace), so experiments can run in parallel and never contaminate each other. Sandboxes are always torn down; snapshots stay in `work_dir` for inspection.
 - Any exception in the harness ends the experiment as `ERROR` with the message, never as a verdict about the platform.
@@ -606,7 +612,7 @@ At least one experiment must show `BROKEN` (noisy and unrecoverable); which one 
 2. **Non-deterministic baselines.** Volatile columns, floats and row order can make two clean runs differ. Mitigations: canonicalisation, `ignore_columns`, integer money, and a self-check that runs the baseline twice in tests and expects identical fingerprints.
 3. **Failpoints need platform cooperation.** Real tools do not expose them. Mitigation: interrupt points are generic, and each adapter chooses how to realise them (failpoint, cancel API, or kill on an observed event).
 4. **Blurry outcome boundaries.** `DETECTED` versus `BROKEN` versus `SILENT_CORRUPTION` invites argument. Mitigations: the fixed decision table in section 6, injected crashes never count as signals, and every verdict carries evidence.
-5. **Run time.** One `pos_daily` run takes about 27 s on Docker Desktop (measured; about 40 s from launch, since the run worker spends some 13 s importing code first). Most of it is fixed cost: importing dbt and its ClickHouse adapter alone takes about 10 s, while the six models execute in under 2 s. An experiment with dozens of runs therefore takes minutes. Mitigations: baseline caching, the `tiny` profile or short windows for the demo, several workspaces running in parallel on one stack. Not yet done: avoiding dbt's full re-parse on every run (changing `--vars` invalidates partial parsing, about 3 to 4 s). `make demo` target to be re-set once the first experiment runs end to end. The integration suite shares one clean baseline per edition across tests (naive's share: 18 Dagster runs instead of 27). With both editions it is 29 runs, about 21.5 minutes on Docker Desktop run back to back (measured; hardened runs take as long as naive ones, about 30 s, the lag window costs nothing visible at `tiny` scale). CI runs it only on pushes to main, split by edition into two parallel jobs that each start their own stack (`make test-integration EDITION=naive|hardened`), with the platform image built through `docker buildx bake` and its layers cached in GitHub's cache. Pull requests get lint and unit tests (under a minute), and integration is run locally with `make test-integration` before a PR is opened. Not done yet: running sandboxes in parallel on one stack, which would also shorten `faultline run` itself.
+5. **Run time.** One `pos_daily` run takes about 27 s on Docker Desktop (measured; about 40 s from launch, since the run worker spends some 13 s importing code first). Most of it is fixed cost: importing dbt and its ClickHouse adapter alone takes about 10 s, while the six models execute in under 2 s. An experiment with dozens of runs therefore takes minutes. Mitigations: the `tiny` profile or short windows for the demo, reusing a baseline across experiments, and above all running sandboxes side by side on one stack, since they share nothing. Measured on Docker Desktop with 16 CPUs, concurrent runs barely slow each other: one run alone takes 42 s from launch, two at once 44 s each, four 50 s, six 59 s, nine 74 s (1.75 times as long as alone). So `faultline run pos-offline-sync` went from about 8 minutes to 5 (baseline side by side with the fault phase: 7 runs of wall clock instead of 11), and the integration suite from 21.5 minutes run back to back to 6.5 on seven pytest-xdist workers. The suite now spends more compute to get there (41 Dagster runs instead of 29: every experiment runs its own baseline, the determinism check its own two clean runs) and less wall clock, which is the trade worth making while runs mostly wait on imports rather than on CPU. Hardened runs take as long as naive ones; the lag window costs nothing visible at `tiny` scale. Not yet done: avoiding dbt's full re-parse on every run (changing `--vars` invalidates partial parsing, about 3 to 4 s). `make demo` target to be re-set once the first experiment runs end to end. CI runs the integration suite only on pushes to main, split by edition into two parallel jobs that each start their own stack (`make test-integration EDITION=naive|hardened WORKERS=n`, one worker per test unit), with the platform image built through `docker buildx bake` and its layers cached in GitHub's cache. GitHub's 4-vCPU runners execute a run in about 16 to 19 s alone, faster than Docker Desktop; how far they gain from running several at once is measured on the first push. Pull requests get lint and unit tests (under a minute), and integration is run locally with `make test-integration` before a PR is opened.
 6. **Windows versus Linux.** Integration tests need Linux containers, which GitHub's Windows runners cannot host, so they run on ubuntu only (on pushes to main) while unit tests still run on Windows for every pull request. Locally, Git Bash rewrites absolute paths passed to `docker exec` (`/usr/bin/x` becomes `C:/Program Files/Git/usr/bin/x`); set `MSYS_NO_PATHCONV=1` for such commands.
 7. **Combining faults.** With several faults in one experiment, the expected state at intermediate checkpoints becomes hard to define. MVP: one fault per experiment is the norm. Final-state properties stay valid when faults are combined.
 8. **An interface overfitted to one implementation.** Designing the adapter around a single platform risks baking in its quirks. Mitigation: keep the interface minimal now and revise it when the dlt adapter arrives.
