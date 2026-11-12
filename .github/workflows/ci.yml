@@ -49,7 +49,11 @@ jobs:
   # every push to main as the safety net, catching anything that slipped
   # through and drift in images or dependencies.
   # The suite is split by platform edition into two parallel jobs, each with
-  # its own stack: the wall clock is the slower half, not the sum.
+  # its own stack: the wall clock is the slower half, not the sum. Inside a
+  # job, pytest-xdist runs one worker per test unit of that edition (naive:
+  # pipeline checks, oracle, experiment, source replay, smoke; hardened:
+  # pipeline checks, experiment), so no long unit waits behind another. The
+  # runner has 4 vCPUs; replay starts no Dagster run and smoke only two.
   # The stack runs Linux containers, which GitHub's Windows runners cannot
   # host, so this job runs on ubuntu only.
   integration:
@@ -60,7 +64,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        edition: [naive, hardened]
+        include:
+          - { edition: naive, workers: 5 }
+          - { edition: hardened, workers: 2 }
     env:
       UV_PYTHON: "3.11"
     steps:
@@ -104,7 +110,7 @@ jobs:
         run: make ref-up REF_UP_FLAGS=
 
       - name: Integration tests
-        run: make test-integration EDITION=${{ matrix.edition }}
+        run: make test-integration EDITION=${{ matrix.edition }} WORKERS=${{ matrix.workers }}
 
       - name: Stack logs
         if: failure()
