@@ -27,6 +27,9 @@ class Capability(StrEnum):
     # each other. The runner then runs the baseline and the fault phase side by
     # side; without it, one after the other (a single shared test environment).
     CONCURRENT_SANDBOXES = "sandbox.concurrent"
+    # List, read and write the files ingestion leaves for the warehouse (the
+    # landing zone), so landing faults can deliver a file twice, late or broken.
+    LANDING_FILES = "landing.files"
 
 
 @dataclass(frozen=True)
@@ -104,6 +107,24 @@ class Adapter(ABC):
     @abstractmethod
     def teardown(self) -> None:
         """Remove everything `setup` created. Safe to call more than once."""
+
+    # Optional, with Capability.LANDING_FILES. A file is addressed by dataset
+    # (named as in the generated data, "pos/order_items"), partition and bare
+    # file name; where that lives is the adapter's business, so a fault never
+    # needs to know the platform's layout.
+
+    def landing_files(self, dataset: str, partition: date) -> list[str]:
+        """File names (no directories) of `dataset`'s landing files for one partition, sorted."""
+        raise self._lacks(Capability.LANDING_FILES)
+
+    def read_landing_file(self, dataset: str, partition: date, file: str) -> bytes:
+        raise self._lacks(Capability.LANDING_FILES)
+
+    def write_landing_file(self, dataset: str, partition: date, file: str, data: bytes) -> None:
+        raise self._lacks(Capability.LANDING_FILES)
+
+    def _lacks(self, capability: Capability) -> AdapterError:
+        return AdapterError(f"{type(self).__name__} does not offer {capability}")
 
     def __enter__(self) -> Adapter:
         self.setup()

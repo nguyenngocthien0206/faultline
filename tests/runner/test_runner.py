@@ -13,8 +13,9 @@ from pathlib import Path
 import pytest
 from fake_platform import FakeCursorPlatform
 
-from faultline.adapters.base import RunRequest, RunResult, RunStatus
+from faultline.adapters.base import Capability, RunRequest, RunResult, RunStatus
 from faultline.datagen import DatasetSpec
+from faultline.faults.base import Fault, InjectionPoint
 from faultline.faults.source import PosOfflineSync
 from faultline.outcome import Outcome
 from faultline.properties.core import NoDataLoss, NoSilentCorruption
@@ -271,3 +272,34 @@ def test_when_one_sandbox_fails_the_other_still_finishes_and_is_torn_down(
     assert result.problems == ("RuntimeError: the fault sandbox lost its connection",)
     assert sorted(torn_down) == ["faulted_input", "generated"]
     assert (tmp_path / "baseline").is_dir()  # the clean half ran to the end
+
+
+class NeedsLandingFiles(Fault):
+    name = "needs_landing_files"
+    injection_point = InjectionPoint.LANDING
+    requires = frozenset({Capability.LANDING_FILES})
+
+    def affected_partitions(self) -> set[date]:
+        return {TINY.start_date}
+
+    def describe(self) -> str:
+        return "a landing fault"
+
+
+def test_a_fault_the_adapter_cannot_host_is_skipped_before_anything_runs(tmp_path: Path) -> None:
+    experiment = Experiment(
+        name="landing-only",
+        description="needs landing files",
+        spec=TINY,
+        faults=(NeedsLandingFiles(),),
+        properties=(NoDataLoss(),),
+    )
+    factory = CountingFactory("naive")  # the toy cursor platform has no landing zone
+
+    result = run_experiment(experiment, factory, tmp_path)
+
+    assert result.outcome is Outcome.SKIPPED
+    assert result.problems == ("the adapter does not offer landing.files",)
+    assert "Skipped:    the adapter does not offer landing.files" in result.render()
+    assert factory.runs == 0
+    assert not (tmp_path / "generated").exists()  # nothing was even generated

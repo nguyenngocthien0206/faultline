@@ -51,9 +51,10 @@ jobs:
   # The suite is split by platform edition into two parallel jobs, each with
   # its own stack: the wall clock is the slower half, not the sum. Inside a
   # job, pytest-xdist runs one worker per test unit of that edition (naive:
-  # pipeline checks, oracle, experiment, source replay, smoke; hardened:
-  # pipeline checks, experiment), so no long unit waits behind another. The
-  # runner has 4 vCPUs; replay starts no Dagster run and smoke only two.
+  # pipeline checks, oracle, two experiments, landing files, source replay,
+  # smoke; hardened: pipeline checks, two experiments), so no long unit waits
+  # behind another. The runner has 4 vCPUs; landing files and replay start no
+  # Dagster run, smoke only two.
   # The stack runs Linux containers, which GitHub's Windows runners cannot
   # host, so this job runs on ubuntu only.
   integration:
@@ -65,8 +66,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { edition: naive, workers: 5 }
-          - { edition: hardened, workers: 2 }
+          - { edition: naive, workers: 7 }
+          - { edition: hardened, workers: 3 }
     env:
       UV_PYTHON: "3.11"
     steps:

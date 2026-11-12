@@ -29,13 +29,13 @@ INTEGRATION_MARKS_hardened := integration and hardened
 
 # WORKERS pytest-xdist processes share the suite; a test class (or a module
 # outside classes) is the unit one worker takes (tests/reference/conftest.py).
-# Keep WORKERS at least the number of units (7 today): xdist queues a second
+# Keep WORKERS at least the number of units (10 today): xdist queues a second
 # unit on a worker that has two tests or fewer left, so with fewer workers one
 # seven-run experiment can wait behind another. With fewer, units start in
 # file order (--no-loadscope-reorder), which puts the long ones first.
 # On Docker Desktop with 16 CPUs, nine concurrent runs take about 1.75 times
 # as long as one alone. WORKERS=0 runs everything in one process, in order.
-WORKERS ?= 7
+WORKERS ?= 10
 
 test-integration: ## Run the tests against the reference stack (start it with ref-up)
 	$(if $(filter-out naive hardened,$(EDITION)),$(error EDITION must be naive or hardened, not '$(EDITION)'))

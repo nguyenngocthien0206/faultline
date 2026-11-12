@@ -5,6 +5,7 @@ import pytest
 
 from faultline.adapters.base import (
     Adapter,
+    AdapterError,
     Capabilities,
     Capability,
     RunRequest,
@@ -69,3 +70,12 @@ def test_only_succeeded_counts_as_success() -> None:
     assert RunResult(RunStatus.SUCCEEDED).succeeded
     assert not RunResult(RunStatus.FAILED, errors=("boom",)).succeeded
     assert not RunResult(RunStatus.INTERRUPTED).succeeded
+
+
+def test_an_adapter_without_landing_files_says_so() -> None:
+    adapter = RecordingAdapter()
+
+    with pytest.raises(AdapterError, match=r"RecordingAdapter does not offer landing\.files"):
+        adapter.landing_files("pos/orders", date(2026, 11, 1))
+    with pytest.raises(AdapterError, match=r"landing\.files"):
+        adapter.write_landing_file("pos/orders", date(2026, 11, 1), "x.parquet", b"")

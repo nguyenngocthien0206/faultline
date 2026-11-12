@@ -16,13 +16,9 @@ from pathlib import Path
 from typing import ClassVar
 
 from faultline.datagen.writer import partition_dir
-from faultline.faults.base import Fault, InjectionPoint
+from faultline.faults.base import Fault, FaultSetupError, InjectionPoint
 
 POS_DATASETS = ("orders", "order_items", "payments")
-
-
-class FaultSetupError(ValueError):
-    """The fault cannot be applied to this input (wrong store, empty days, bad dates)."""
 
 
 @dataclass

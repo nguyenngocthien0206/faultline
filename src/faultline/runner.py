@@ -18,6 +18,9 @@ never kills a platform's runs midway. Without the capability (one shared test
 environment, say) the steps run one after the other and stop at a broken
 baseline.
 
+A fault that needs a capability the adapter does not declare (landing files,
+say) makes the experiment SKIPPED before anything is generated or run.
+
 Sandboxes are always torn down. Snapshots stay in the work directory, so a
 verdict can be inspected after the fact.
 
@@ -42,14 +45,21 @@ from functools import reduce
 from pathlib import Path
 from typing import TypeVar
 
-from faultline.adapters.base import Adapter, Capability, RunRequest, RunResult, TableContract
+from faultline.adapters.base import (
+    Adapter,
+    AdapterError,
+    Capability,
+    RunRequest,
+    RunResult,
+    TableContract,
+)
 from faultline.datagen import DatasetSpec, generate
 from faultline.faults.base import Fault
 from faultline.oracle.invariants import complete_keys, unique_keys
 from faultline.oracle.snapshot import snapshot_all
 from faultline.outcome import Outcome, classify, has_signal, worst
 from faultline.properties.base import Checkpoint, Property, PropertyContext, PropertyResult
-from faultline.schedule import Action, Deliver, Run, Schedule, clean_schedule
+from faultline.schedule import Action, CopyLandingFiles, Deliver, Run, Schedule, clean_schedule
 
 AdapterFactory = Callable[[Path], Adapter]  # input root -> a fresh sandbox
 Log = Callable[[str], None]
@@ -84,7 +94,7 @@ class ExperimentResult:
     faults: tuple[str, ...] = ()
     properties: tuple[PropertyVerdict, ...] = ()
     runs: dict[str, RunLog] = field(default_factory=dict)
-    problems: tuple[str, ...] = ()  # why the result is ERROR, if it is
+    problems: tuple[str, ...] = ()  # why the result is ERROR or SKIPPED, if it is
     work_dir: Path | None = None
 
     def render(self) -> str:
@@ -103,7 +113,8 @@ class ExperimentResult:
                 r = "holds" if p.at_r.holds else "violated"
                 lines.append(f"  {p.name:<24}{f:<10}{r:<10}{p.outcome}")
         lines.append(f"Verdict:    {self.outcome}")
-        lines += [f"Problem:    {p}" for p in self.problems]
+        label = "Skipped:    " if self.outcome is Outcome.SKIPPED else "Problem:    "
+        lines += [f"{label}{p}" for p in self.problems]
         for checkpoint in ("F", "R"):
             evidence = sorted(
                 {e for p in self.properties for e in self._at(p, checkpoint).evidence}
@@ -129,7 +140,26 @@ def execute(adapter: Adapter, schedule: Schedule, log: Log, phase: str) -> RunLo
             result = adapter.run(RunRequest(partition=action.partition))
             log(f"  [{phase}] run {action.partition}: {result.status}")
             runs.append((action.partition, result))
+        elif isinstance(action, CopyLandingFiles):
+            files = copy_landing_files(adapter, action)
+            log(
+                f"  [{phase}] {action.dataset}: {len(files)} file(s) of {action.from_partition} "
+                f"landed again under {action.to_partition}"
+            )
     return tuple(runs)
+
+
+def copy_landing_files(adapter: Adapter, action: CopyLandingFiles) -> list[str]:
+    """Copy byte for byte, so the platform sees exactly what it already loaded once."""
+    files = adapter.landing_files(action.dataset, action.from_partition)
+    if not files:
+        raise AdapterError(
+            f"no landing files of {action.dataset} for {action.from_partition} to copy"
+        )
+    for file in files:
+        data = adapter.read_landing_file(action.dataset, action.from_partition, file)
+        adapter.write_landing_file(action.dataset, action.to_partition, action.prefix + file, data)
+    return files
 
 
 def steady_state_problems(adapter: Adapter, snapshots: dict[str, Path], truth: Path) -> list[str]:
@@ -279,6 +309,20 @@ def run_experiment(
         return ExperimentResult(**base, outcome=Outcome.ERROR, problems=(problem,))
 
 
+def _missing_capabilities(
+    faults: tuple[Fault, ...], adapter_factory: AdapterFactory, work_dir: Path
+) -> list[str]:
+    """What the faults need that the adapter does not declare, checked before anything runs.
+
+    Building an adapter opens nothing, so asking a throwaway one is free.
+    """
+    needed = frozenset().union(*(f.requires for f in faults))
+    if not needed:
+        return []
+    offered = adapter_factory(work_dir / "generated").capabilities().features
+    return sorted(str(c) for c in needed - offered)
+
+
 def _check_reusable(baseline: Baseline, spec: DatasetSpec, target: str) -> None:
     if baseline.spec != spec:
         raise ValueError(f"baseline was run on {baseline.spec}, the experiment needs {spec}")
@@ -310,6 +354,15 @@ def _run(
     log: Log,
 ) -> ExperimentResult:
     target = base["target"]
+    missing = _missing_capabilities(faults, adapter_factory, work_dir)
+    if missing:
+        log(f"skipped: the adapter does not offer {', '.join(missing)}")
+        return ExperimentResult(
+            **base,
+            outcome=Outcome.SKIPPED,
+            faults=tuple(f.describe() for f in faults),
+            problems=(f"the adapter does not offer {', '.join(missing)}",),
+        )
     if baseline is not None:
         _check_reusable(baseline, experiment.spec, target)
         log("baseline: reused")

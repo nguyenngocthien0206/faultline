@@ -31,6 +31,7 @@ from faultline.adapters.base import (
 from faultline.connectors.clickhouse import ClickHouseClient
 from faultline.connectors.dagster import DagsterClient
 from faultline.connectors.postgres import SourceDatabase
+from faultline.connectors.s3 import LandingBucket
 from faultline.connectors.workspace import new_workspace_name, validate_workspace_name
 from faultline.sources.pos import apply_day, create_tables
 
@@ -86,11 +87,24 @@ CONSUMER_TABLES: tuple[TableContract, ...] = (
 )
 
 
+# Generated dataset -> where the platform lands its files, under the workspace
+# prefix of the landing bucket (dlt: <dataset>/<table>/dt=<partition>/).
+LANDING_DATASETS: dict[str, str] = {
+    "pos/orders": "pos/orders",
+    "pos/order_items": "pos/order_items",
+    "pos/payments": "pos/payments",
+}
+
+
 @dataclass(frozen=True)
 class ReferenceStackConfig:
     source_dsn: str
     clickhouse_user: str
     clickhouse_password: str
+    s3_access_key: str = ""
+    s3_secret_key: str = ""
+    s3_url: str = "http://127.0.0.1:9000"
+    landing_bucket: str = "landing"
     clickhouse_url: str = "http://127.0.0.1:8123"
     dagster_url: str = "http://127.0.0.1:3000/graphql"
     location: str = "coffee_platform"
@@ -129,6 +143,8 @@ def config_from_env_file(
         ),
         clickhouse_user=settings["CLICKHOUSE_USER"],
         clickhouse_password=settings["CLICKHOUSE_PASSWORD"],
+        s3_access_key=settings["S3_ACCESS_KEY"],
+        s3_secret_key=settings["S3_SECRET_KEY"],
     )
 
 
@@ -156,6 +172,12 @@ class ReferenceAdapter(Adapter):
             config.clickhouse_url, user=config.clickhouse_user, password=config.clickhouse_password
         )
         self.dagster = DagsterClient(config.dagster_url, location=config.location)
+        self.landing = LandingBucket(
+            config.s3_url,
+            access_key=config.s3_access_key,
+            secret_key=config.s3_secret_key,
+            bucket=config.landing_bucket,
+        )
         self._created = False
 
     @property
@@ -185,6 +207,7 @@ class ReferenceAdapter(Adapter):
                 Capability.RUN_PARTITION,
                 Capability.SNAPSHOT,
                 Capability.CONCURRENT_SANDBOXES,
+                Capability.LANDING_FILES,
             }
         )
         return Capabilities(features=features, tables=CONSUMER_TABLES)
@@ -217,10 +240,36 @@ class ReferenceAdapter(Adapter):
             f"SELECT * FROM {self.workspace}.{contract.name}", dest
         )
 
+    def landing_files(self, dataset: str, partition: date) -> list[str]:
+        prefix = self.landing_key(dataset, partition)
+        return [key.removeprefix(prefix) for key in self.landing.list(prefix)]
+
+    def read_landing_file(self, dataset: str, partition: date, file: str) -> bytes:
+        return self.landing.get(self.landing_key(dataset, partition, file))
+
+    def write_landing_file(self, dataset: str, partition: date, file: str, data: bytes) -> None:
+        self.landing.put(self.landing_key(dataset, partition, file), data)
+
+    def landing_key(self, dataset: str, partition: date, file: str = "") -> str:
+        """The bucket key of one landing file (with no file: of the partition's folder).
+
+        Always inside this workspace and a declared dataset: a file name with a
+        separator or a dot path is refused, so no fault can reach anywhere else.
+        """
+        if dataset not in LANDING_DATASETS:
+            raise AdapterError(
+                f"no landing files for {dataset!r}; known: {sorted(LANDING_DATASETS)}"
+            )
+        if file in (".", "..") or "/" in file or "\\" in file:
+            raise AdapterError(f"refusing landing file name {file!r}")
+        folder = f"{self.workspace}/{LANDING_DATASETS[dataset]}/dt={partition.isoformat()}/"
+        return folder + file
+
     def teardown(self) -> None:
         if not self._created:
             return
         self.source.drop_workspace(self.workspace)
         self.clickhouse.drop_workspace(self.workspace)
+        self.landing.delete_workspace(self.workspace)
         self.source.close()
         self._created = False

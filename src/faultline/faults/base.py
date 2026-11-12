@@ -19,6 +19,10 @@ from faultline.adapters.base import Capability
 from faultline.schedule import Action, Schedule
 
 
+class FaultSetupError(ValueError):
+    """The fault cannot be applied to this input or schedule (wrong store, dates, files)."""
+
+
 class InjectionPoint(StrEnum):
     SOURCE = "source"  # the systems ingestion reads from
     LANDING = "landing"  # files between ingestion and the warehouse

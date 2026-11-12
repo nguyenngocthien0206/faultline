@@ -3,11 +3,12 @@
 Building an adapter opens no connection, so these need no Docker.
 """
 
+from datetime import date
 from pathlib import Path
 
 import pytest
 
-from faultline.adapters.base import Capability
+from faultline.adapters.base import AdapterError, Capability
 from faultline.adapters.reference import (
     HARDENED_EXTRACT_OP,
     Edition,
@@ -16,6 +17,7 @@ from faultline.adapters.reference import (
     target_name,
 )
 
+DAY = date(2026, 11, 2)
 CONFIG = ReferenceStackConfig(
     source_dsn="postgresql://user:secret@127.0.0.1:5433/db",
     clickhouse_user="user",
@@ -73,3 +75,34 @@ def test_target_names() -> None:
 
 def test_sandboxes_are_isolated_enough_to_run_side_by_side() -> None:
     assert _adapter().capabilities().supports(Capability.CONCURRENT_SANDBOXES)
+
+
+def test_landing_files_are_offered() -> None:
+    assert _adapter().capabilities().supports(Capability.LANDING_FILES)
+
+
+def test_landing_files_map_to_keys_inside_the_workspace() -> None:
+    adapter = _adapter()
+
+    assert adapter.landing_key("pos/orders", DAY, "a.parquet") == (
+        "fl_0123abcd/pos/orders/dt=2026-11-02/a.parquet"
+    )
+    assert adapter.landing_key("pos/payments", DAY) == "fl_0123abcd/pos/payments/dt=2026-11-02/"
+
+
+@pytest.mark.parametrize(
+    "file",
+    ["..", ".", "../../fl_99999999/pos/orders/x.parquet", "dt=2026-11-03/x.parquet", "a\\b"],
+)
+def test_a_landing_file_name_cannot_leave_its_folder(file: str) -> None:
+    with pytest.raises(AdapterError, match="refusing landing file name"):
+        _adapter().landing_key("pos/orders", DAY, file)
+
+
+def test_an_undeclared_dataset_has_no_landing_files() -> None:
+    adapter = _adapter()
+
+    with pytest.raises(AdapterError, match="no landing files for 'crm/members'"):
+        adapter.landing_files("crm/members", DAY)
+    with pytest.raises(AdapterError, match="no landing files for '_dlt_pipeline_state'"):
+        adapter.write_landing_file("_dlt_pipeline_state", DAY, "x.parquet", b"")
