@@ -1,9 +1,9 @@
 """Schedules: an experiment as plain data before anything executes.
 
 A schedule is the ordered list of things that happen to the platform: input
-arriving for a day, a run of a partition. Faults transform schedules (and the
-input they deliver), so an experiment can be printed, compared and tested
-without starting a platform.
+arriving for a day, a run of a partition, a landing file appearing again.
+Faults transform schedules (and the input they deliver), so an experiment can
+be printed, compared and tested without starting a platform.
 """
 
 from __future__ import annotations
@@ -28,7 +28,21 @@ class Run:
     partition: date
 
 
-Action = Deliver | Run
+@dataclass(frozen=True)
+class CopyLandingFiles:
+    """`dataset`'s landing files of one partition land again under another one.
+
+    The copies are named `prefix` + the original name, as a retried upload or
+    a resent extract would be. Needs the adapter's landing files capability.
+    """
+
+    dataset: str  # as in the generated data, e.g. "pos/order_items"
+    from_partition: date
+    to_partition: date
+    prefix: str = "redelivered-"
+
+
+Action = Deliver | Run | CopyLandingFiles
 Schedule = tuple[Action, ...]
 
 
