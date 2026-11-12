@@ -64,3 +64,5 @@ def test_config_comes_from_the_env_file_and_the_environment_wins(tmp_path: Path)
     assert plain.source_dsn == "postgresql://faultline:faultline@127.0.0.1:5433/coffee"
     assert plain.clickhouse_user == "faultline"
     assert overridden.clickhouse_password == "rotated"
+    assert plain.s3_access_key == "faultline"  # the landing bucket, for landing faults
+    assert plain.s3_secret_key == "faultline-secret"
