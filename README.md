@@ -15,7 +15,7 @@ With Docker running:
 ```sh
 make install
 make ref-up                                              # Postgres, dlt, S3, ClickHouse, dbt, Dagster
-uv run faultline run pos-offline-sync                    # naive edition, about 8 minutes on a laptop
+uv run faultline run pos-offline-sync                    # naive edition, about 5 minutes on a laptop
 uv run faultline run pos-offline-sync --target hardened  # hardened edition
 ```
 
@@ -45,7 +45,8 @@ make install            # create .venv and install dependencies
 make check              # lint, format check and the tests that need no Docker
 
 make ref-up             # build and start the reference platform (first build takes a few minutes)
-make test-integration   # run the tests that drive the real platform (about 21 min; EDITION=naive|hardened for one half)
+make test-integration   # run the tests that drive the real platform (about 7 min on 7 parallel workers;
+                        #   EDITION=naive|hardened for one half, WORKERS=0 for one process)
 make ref-down           # stop it and delete its data
 ```
 
