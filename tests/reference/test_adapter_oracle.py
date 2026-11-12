@@ -1,68 +1,83 @@
 """The adapter and the oracle together, on the real stack.
 
-A second clean naive baseline, in its own workspace, must fingerprint exactly like
-the shared one, or the differential oracle would report false alarms in every
-experiment. Then rerunning one day on that second sandbox shows that the diff
+Two clean naive runs of the same input, in two workspaces running at the same
+time, must fingerprint exactly alike, or the differential oracle would report
+false alarms in every experiment (and running sandboxes side by side would not
+be safe). Then rerunning one day on the second sandbox shows that the diff
 points exactly at the damage, while the job stays green and silver stays clean.
-(The shared baseline's key invariants are asserted by its fixture.)
 """
 
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from reference_stack import reference_config
+from reference_stack import Stack, reference_config
 
-from faultline.adapters.base import RunRequest
+from faultline.adapters.base import RunRequest, TableContract
 from faultline.adapters.reference import ReferenceAdapter
+from faultline.datagen import DatasetSpec
 from faultline.oracle.diff import diff
 from faultline.oracle.fingerprint import fingerprint
 from faultline.oracle.snapshot import snapshot_all
-from faultline.runner import Baseline, execute
+from faultline.runner import execute, generate_truth
 from faultline.schedule import clean_schedule
 
 pytestmark = pytest.mark.integration
 
+TINY = DatasetSpec.from_profile("tiny")
+
 
 @dataclass
-class LiveBaseline:
-    adapter: ReferenceAdapter
-    snapshots: dict[str, Path]
+class Pair:
+    contracts: tuple[TableContract, ...]
+    first: dict[str, Path]  # snapshots of a clean run whose sandbox is gone
+    second: dict[str, Path]  # snapshots of a clean run whose sandbox is still up
+    live: ReferenceAdapter  # that second sandbox, for the rerun test
 
 
 @pytest.fixture(scope="module")
-def second(
-    naive_baseline: Baseline, tmp_path_factory: pytest.TempPathFactory
-) -> Iterator[LiveBaseline]:
-    """Another clean run of the same input, kept alive for the rerun test."""
-    adapter = ReferenceAdapter(reference_config(), naive_baseline.truth_root)
-    with adapter:
-        runs = execute(adapter, clean_schedule(naive_baseline.spec), lambda _: None, "second")
+def pair(stack: Stack, tmp_path_factory: pytest.TempPathFactory) -> Iterator[Pair]:
+    """Two clean runs of one input, side by side; the second sandbox stays alive."""
+    work = tmp_path_factory.mktemp("pair")
+    truth = generate_truth(TINY, work)
+    config = reference_config()
+    first, live = ReferenceAdapter(config, truth), ReferenceAdapter(config, truth)
+
+    def clean_run(adapter: ReferenceAdapter, name: str) -> dict[str, Path]:
+        runs = execute(adapter, clean_schedule(TINY), lambda _: None, name)
         assert all(r.succeeded for _, r in runs), runs
-        yield LiveBaseline(adapter, snapshot_all(adapter, tmp_path_factory.mktemp("second")))
+        return snapshot_all(adapter, work / name)
+
+    def run_and_tear_down() -> dict[str, Path]:
+        with first:
+            return clean_run(first, "first")
+
+    with live:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            a = pool.submit(run_and_tear_down)
+            b = pool.submit(clean_run, live, "second")
+        yield Pair(live.capabilities().tables, a.result(), b.result(), live)
 
 
-def test_two_clean_baselines_fingerprint_identically(
-    naive_baseline: Baseline, second: LiveBaseline
-) -> None:
-    for contract in naive_baseline.contracts:
-        fa = fingerprint(naive_baseline.snapshots[contract.name], contract)
-        fb = fingerprint(second.snapshots[contract.name], contract)
+def test_two_clean_runs_side_by_side_fingerprint_identically(pair: Pair) -> None:
+    for contract in pair.contracts:
+        fa = fingerprint(pair.first[contract.name], contract)
+        fb = fingerprint(pair.second[contract.name], contract)
         assert fa == fb, contract.name
         assert fa.rows > 0, contract.name
 
 
 def test_a_rerun_is_green_silver_stays_clean_and_the_diff_finds_the_damage(
-    naive_baseline: Baseline, second: LiveBaseline, tmp_path: Path
+    pair: Pair, tmp_path: Path
 ) -> None:
     # Changes the second sandbox, so it runs after the fingerprint comparison.
-    result = second.adapter.run(RunRequest(partition=naive_baseline.spec.end_date))
+    result = pair.live.run(RunRequest(partition=TINY.end_date))
     assert result.succeeded, result.errors
-    after = snapshot_all(second.adapter, tmp_path)
-    tables = second.adapter.capabilities().tables
+    after = snapshot_all(pair.live, tmp_path)
 
-    diffs = {t.name: diff(second.snapshots[t.name], after[t.name], t) for t in tables}
+    diffs = {t.name: diff(pair.second[t.name], after[t.name], t) for t in pair.contracts}
     for d in diffs.values():
         print(d.summary())
 

@@ -7,6 +7,21 @@ failure: a broken stack must never pass silently.
 Tests that exercise the hardened edition carry the `hardened` marker; CI runs
 them in a job of their own (`make test-integration EDITION=hardened`), next to
 everything else (EDITION=naive).
+
+The suite runs on several pytest-xdist workers with `--dist loadscope`: all
+tests of one class (or, outside classes, of one module) go to the same worker.
+Every worker is its own process with its own session fixtures, so the tests
+that share a heavy fixture (a clean baseline, a live sandbox) live in one class
+or module: each baseline is built once. Experiments share no baseline at all;
+they run whole, baseline side by side with the fault phase.
+
+Run with at least as many workers as units (`make test-integration` does):
+xdist queues a second unit on a worker with two tests or fewer left, so an
+experiment, a single long test, could otherwise wait behind another.
+
+Not `--dist loadgroup` with `xdist_group` marks: with pytest 9, pytest-xdist
+3.8 fails to attach the group to a test (it writes `item._nodeid`, which
+pytest no longer reads), and every grouped test is scheduled on its own.
 """
 
 import os
@@ -74,10 +89,9 @@ def _clean_baseline(edition: Edition, tmp_path_factory: pytest.TempPathFactory) 
 
 @pytest.fixture(scope="session")
 def naive_baseline(stack: Stack, tmp_path_factory: pytest.TempPathFactory) -> Baseline:
-    """One clean run of the tiny dataset on the naive pipeline, shared by every test.
+    """One clean run of the tiny dataset on the naive pipeline, for the pipeline checks.
 
-    A baseline is four Dagster runs; several tests need one, and running it once
-    per session instead of once per test keeps the suite several minutes shorter.
+    A baseline is four Dagster runs; the checks of one edition all read the same one.
     Its snapshots live on disk; the sandbox itself is already torn down.
     """
     return _clean_baseline(Edition.NAIVE, tmp_path_factory)
@@ -87,9 +101,3 @@ def naive_baseline(stack: Stack, tmp_path_factory: pytest.TempPathFactory) -> Ba
 def hardened_baseline(stack: Stack, tmp_path_factory: pytest.TempPathFactory) -> Baseline:
     """The same, on the hardened pipeline (with the platform's default lag window)."""
     return _clean_baseline(Edition.HARDENED, tmp_path_factory)
-
-
-@pytest.fixture(params=["naive", pytest.param("hardened", marks=pytest.mark.hardened)])
-def baseline(request: pytest.FixtureRequest) -> Baseline:
-    """Each edition's shared clean baseline in turn: for checks both editions must pass."""
-    return request.getfixturevalue(f"{request.param}_baseline")
