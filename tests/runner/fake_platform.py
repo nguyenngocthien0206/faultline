@@ -11,9 +11,14 @@ that reach the source with a timestamp older than the cursor:
     alert_then_repair  fail loudly, load them on the next run -> DETECTED
     alert_forever      fail loudly, never load them           -> BROKEN
     lossy              drops one order even on a clean run    -> steady state broken
+
+It declares CONCURRENT_SANDBOXES unless built with `concurrent=False`, so the
+runner's side by side and one-after-the-other paths can both be tested.
+`on_first_run` is called before the sandbox's first run (a barrier, say).
 """
 
 import csv
+from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -37,20 +42,30 @@ LAG = timedelta(days=3)
 
 
 class FakeCursorPlatform(Adapter):
-    def __init__(self, input_root: Path, mode: str, *, lag: timedelta = LAG) -> None:
+    def __init__(
+        self,
+        input_root: Path,
+        mode: str,
+        *,
+        lag: timedelta = LAG,
+        concurrent: bool = True,
+        on_first_run: Callable[[], object] | None = None,
+    ) -> None:
         self.input_root = input_root
         self.mode = mode
         self.lag = lag
+        self.concurrent = concurrent
+        self.on_first_run = on_first_run
         self.source: dict[str, dict[str, str]] = {}
         self.warehouse: dict[str, dict[str, str]] = {}
         self.cursor: datetime | None = None
         self.repair_pending = False
 
     def capabilities(self) -> Capabilities:
-        features = frozenset(
-            {Capability.DELIVER_DAY, Capability.RUN_PARTITION, Capability.SNAPSHOT}
-        )
-        return Capabilities(features, (ORDERS,))
+        features = {Capability.DELIVER_DAY, Capability.RUN_PARTITION, Capability.SNAPSHOT}
+        if self.concurrent:
+            features.add(Capability.CONCURRENT_SANDBOXES)
+        return Capabilities(frozenset(features), (ORDERS,))
 
     def setup(self) -> None: ...
 
@@ -65,6 +80,9 @@ class FakeCursorPlatform(Adapter):
                         self.source[row["order_id"]] = row
 
     def run(self, request: RunRequest) -> RunResult:
+        if self.on_first_run is not None:
+            hook, self.on_first_run = self.on_first_run, None
+            hook()
         if self.mode == "alert_then_repair" and self.repair_pending:
             self._load(self.source.values())
             self.repair_pending = False
