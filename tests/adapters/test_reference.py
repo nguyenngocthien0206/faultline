@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from faultline.adapters.base import AdapterError, Capability
+from faultline.adapters.base import AdapterError, Capability, Stage
 from faultline.adapters.reference import (
     HARDENED_EXTRACT_OP,
     Edition,
@@ -106,3 +106,34 @@ def test_an_undeclared_dataset_has_no_landing_files() -> None:
         adapter.landing_files("crm/members", DAY)
     with pytest.raises(AdapterError, match="no landing files for '_dlt_pipeline_state'"):
         adapter.write_landing_file("_dlt_pipeline_state", DAY, "x.parquet", b"")
+
+
+@pytest.mark.parametrize(
+    ("edition", "stage", "job"),
+    [
+        ("naive", None, "pos_daily"),
+        ("naive", Stage.INGEST, "pos_ingest"),
+        ("naive", Stage.LOAD, "pos_load"),
+        ("hardened", None, "pos_daily_hardened"),
+        ("hardened", Stage.INGEST, "pos_ingest_hardened"),
+        ("hardened", Stage.LOAD, "pos_load_hardened"),
+    ],
+)
+def test_each_stage_runs_its_own_job(edition: str, stage: Stage | None, job: str) -> None:
+    adapter = _adapter(edition=edition)
+
+    assert adapter.capabilities().supports(Capability.RUN_STAGES)
+    assert adapter.job_for(stage) == job
+
+
+def test_the_lag_window_only_goes_to_jobs_that_extract() -> None:
+    adapter = _adapter(edition="hardened", lag_days=2)
+
+    assert "ops" in adapter.run_config(None)
+    assert "ops" in adapter.run_config(Stage.INGEST)
+    assert "ops" not in adapter.run_config(Stage.LOAD)  # Dagster refuses config for absent ops
+
+
+def test_deleting_a_landing_file_needs_its_name() -> None:
+    with pytest.raises(AdapterError, match="name the landing file"):
+        _adapter().delete_landing_file("pos/orders", DAY, "")

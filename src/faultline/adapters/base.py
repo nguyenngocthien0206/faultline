@@ -30,6 +30,9 @@ class Capability(StrEnum):
     # List, read and write the files ingestion leaves for the warehouse (the
     # landing zone), so landing faults can deliver a file twice, late or broken.
     LANDING_FILES = "landing.files"
+    # Run one half of a partition: ingest (source to landing files) or load
+    # (landing files to the consumer tables), so a fault can act in between.
+    RUN_STAGES = "run.stages"
 
 
 @dataclass(frozen=True)
@@ -65,9 +68,15 @@ class RunStatus(StrEnum):
     INTERRUPTED = "INTERRUPTED"  # killed by faultline on purpose: not a signal
 
 
+class Stage(StrEnum):
+    INGEST = "ingest"  # from the source into the landing zone
+    LOAD = "load"  # from the landing zone into the consumer tables
+
+
 @dataclass(frozen=True)
 class RunRequest:
     partition: date
+    stage: Stage | None = None  # None: the whole partition, both halves
 
 
 @dataclass(frozen=True)
@@ -121,6 +130,9 @@ class Adapter(ABC):
         raise self._lacks(Capability.LANDING_FILES)
 
     def write_landing_file(self, dataset: str, partition: date, file: str, data: bytes) -> None:
+        raise self._lacks(Capability.LANDING_FILES)
+
+    def delete_landing_file(self, dataset: str, partition: date, file: str) -> None:
         raise self._lacks(Capability.LANDING_FILES)
 
     def _lacks(self, capability: Capability) -> AdapterError:

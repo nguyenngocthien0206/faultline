@@ -26,6 +26,7 @@ from faultline.adapters.base import (
     RunRequest,
     RunResult,
     RunStatus,
+    Stage,
     TableContract,
 )
 from faultline.connectors.clickhouse import ClickHouseClient
@@ -41,7 +42,16 @@ class Edition(StrEnum):
     HARDENED = "hardened"
 
 
-JOBS: dict[Edition, str] = {Edition.NAIVE: "pos_daily", Edition.HARDENED: "pos_daily_hardened"}
+# (edition, stage) -> Dagster job. A stage is half a day: ingest lands the
+# files, load turns them into tables; None runs both in one job.
+JOBS: dict[tuple[Edition, Stage | None], str] = {
+    (Edition.NAIVE, None): "pos_daily",
+    (Edition.NAIVE, Stage.INGEST): "pos_ingest",
+    (Edition.NAIVE, Stage.LOAD): "pos_load",
+    (Edition.HARDENED, None): "pos_daily_hardened",
+    (Edition.HARDENED, Stage.INGEST): "pos_ingest_hardened",
+    (Edition.HARDENED, Stage.LOAD): "pos_load_hardened",
+}
 HARDENED_EXTRACT_OP = "hardened_pos_landing"  # takes the lag window as op config
 
 
@@ -182,18 +192,25 @@ class ReferenceAdapter(Adapter):
 
     @property
     def job(self) -> str:
-        return JOBS[self.edition]
+        return self.job_for(None)
+
+    def job_for(self, stage: Stage | None) -> str:
+        return JOBS[self.edition, stage]
 
     @property
     def target(self) -> str:
         return target_name(self.edition, self.lag_days)
 
-    def run_config(self) -> dict[str, object]:
-        """Dagster run config: the sandbox to work in and, if set, the lag window."""
+    def run_config(self, stage: Stage | None = None) -> dict[str, object]:
+        """Dagster run config: the sandbox to work in and, if set, the lag window.
+
+        The lag window is config of the extract op, which a load job does not
+        have; Dagster refuses config for an op that is not in the job.
+        """
         config: dict[str, object] = {
             "resources": {"workspace": {"config": {"name": self.workspace}}}
         }
-        if self.lag_days is not None:
+        if self.lag_days is not None and stage is not Stage.LOAD:
             config["ops"] = {HARDENED_EXTRACT_OP: {"config": {"lag_days": self.lag_days}}}
         return config
 
@@ -208,6 +225,7 @@ class ReferenceAdapter(Adapter):
                 Capability.SNAPSHOT,
                 Capability.CONCURRENT_SANDBOXES,
                 Capability.LANDING_FILES,
+                Capability.RUN_STAGES,
             }
         )
         return Capabilities(features=features, tables=CONSUMER_TABLES)
@@ -225,9 +243,9 @@ class ReferenceAdapter(Adapter):
 
     def run(self, request: RunRequest) -> RunResult:
         run_id = self.dagster.launch_run(
-            self.job,
+            self.job_for(request.stage),
             partition=request.partition.isoformat(),
-            run_config=self.run_config(),
+            run_config=self.run_config(request.stage),
             tags={"faultline/workspace": self.workspace},
         )
         outcome = self.dagster.wait_for_run(run_id, timeout=self.config.run_timeout_seconds)
@@ -249,6 +267,11 @@ class ReferenceAdapter(Adapter):
 
     def write_landing_file(self, dataset: str, partition: date, file: str, data: bytes) -> None:
         self.landing.put(self.landing_key(dataset, partition, file), data)
+
+    def delete_landing_file(self, dataset: str, partition: date, file: str) -> None:
+        if not file:
+            raise AdapterError("name the landing file to delete")
+        self.landing.delete(self.landing_key(dataset, partition, file))
 
     def landing_key(self, dataset: str, partition: date, file: str = "") -> str:
         """The bucket key of one landing file (with no file: of the partition's folder).

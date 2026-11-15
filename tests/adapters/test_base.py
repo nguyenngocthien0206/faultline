@@ -11,6 +11,7 @@ from faultline.adapters.base import (
     RunRequest,
     RunResult,
     RunStatus,
+    Stage,
     TableContract,
 )
 
@@ -79,3 +80,8 @@ def test_an_adapter_without_landing_files_says_so() -> None:
         adapter.landing_files("pos/orders", date(2026, 11, 1))
     with pytest.raises(AdapterError, match=r"landing\.files"):
         adapter.write_landing_file("pos/orders", date(2026, 11, 1), "x.parquet", b"")
+
+
+def test_a_run_request_covers_the_whole_partition_unless_a_stage_is_named() -> None:
+    assert RunRequest(date(2026, 11, 1)).stage is None
+    assert RunRequest(date(2026, 11, 1), Stage.LOAD).stage == "load"

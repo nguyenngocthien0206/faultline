@@ -72,6 +72,11 @@ class LandingBucket:
     def put(self, key: str, data: bytes) -> None:
         self.client.put_object(Bucket=self.bucket, Key=key, Body=data)
 
+    def delete(self, key: str) -> None:
+        """Delete one key, which must lie inside a workspace."""
+        validate_workspace_name(key.split("/", 1)[0])
+        self.client.delete_object(Bucket=self.bucket, Key=key)
+
     def delete_workspace(self, workspace: str) -> int:
         """Delete every key under `<workspace>/`. Returns how many were deleted."""
         keys = self.list(f"{validate_workspace_name(workspace)}/")
