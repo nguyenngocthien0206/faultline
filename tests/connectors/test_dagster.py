@@ -2,8 +2,10 @@ import pytest
 from http_stub import StubServer
 
 from faultline.connectors.dagster import (
+    LAUNCH_TAG,
     DagsterClient,
     DagsterError,
+    DagsterUnavailable,
     RunOutcome,
     RunTimeoutError,
 )
@@ -209,3 +211,93 @@ def test_unknown_run_raises(stub: StubServer) -> None:
 
     with pytest.raises(DagsterError, match="Run r9 not found"):
         client(stub).run_status("r9")
+
+
+# A busy webserver: the client gives up on an answer after `timeout` seconds.
+
+
+def _impatient(stub: StubServer) -> DagsterClient:
+    return DagsterClient(f"{stub.url}/graphql", location="coffee_platform", timeout=0.3)
+
+
+def _launched(run_id: str) -> dict[str, object]:
+    return {"data": {"launchRun": {"__typename": "LaunchRunSuccess", "run": {"runId": run_id}}}}
+
+
+def _found(*run_ids: str) -> dict[str, object]:
+    results = [{"runId": r} for r in run_ids]
+    return {"data": {"runsOrError": {"__typename": "Runs", "results": results}}}
+
+
+def test_a_slow_answer_is_unavailable_not_a_crash(stub: StubServer) -> None:
+    stub.reply(200, {"data": {"version": "1"}}, delay=1.0)
+
+    with pytest.raises(DagsterUnavailable, match="no answer from Dagster"):
+        _impatient(stub).version()
+
+
+def test_waiting_rides_out_polls_dagster_did_not_answer(stub: StubServer) -> None:
+    stub.reply(200, _status("STARTED"))
+    stub.reply(200, _status("STARTED"), delay=1.0)  # too slow: tried again
+    stub.reply(200, _status("SUCCESS"))
+
+    outcome = _impatient(stub).wait_for_run("r1", poll_interval=0, sleep=lambda _: None)
+
+    assert outcome.succeeded
+
+
+def test_waiting_gives_up_at_the_deadline_when_dagster_never_answers() -> None:
+    dead = DagsterClient("http://127.0.0.1:9/graphql", location="x", timeout=0.3)
+    ticks = iter(range(100))
+
+    with pytest.raises(RunTimeoutError, match="Dagster stopped answering"):
+        dead.wait_for_run("r1", timeout=5, sleep=lambda _: None, clock=lambda: next(ticks))
+
+
+def test_a_launch_without_an_answer_is_found_by_its_tag_not_launched_twice(
+    stub: StubServer,
+) -> None:
+    stub.reply(200, _launched("r1"), delay=1.0)  # the run starts, the answer is lost
+    stub.reply(200, _found("r1"))
+
+    run_id = _impatient(stub).launch_run("pos_daily", sleep=lambda _: None)
+
+    assert run_id == "r1"
+    launch, lookup = stub.requests
+    tag = next(
+        t
+        for t in launch.json()["variables"]["executionParams"]["executionMetadata"]["tags"]
+        if t["key"] == LAUNCH_TAG
+    )
+    assert lookup.json()["variables"] == {"tags": [tag]}  # looked up by this launch's own tag
+    assert len(stub.requests) == 2  # no second launch
+
+
+def test_a_launch_that_never_started_is_tried_again(stub: StubServer) -> None:
+    stub.reply(200, _launched("lost"), delay=1.0)
+    stub.reply(200, _found())  # no run carries the tag: the launch did not happen
+    stub.reply(200, _launched("r2"))
+
+    run_id = _impatient(stub).launch_run("pos_daily", sleep=lambda _: None)
+
+    assert run_id == "r2"
+    launches = [r for r in stub.requests if "launchRun" in r.json()["query"]]
+    assert len(launches) == 2
+
+
+def test_every_launch_carries_its_own_tag(stub: StubServer) -> None:
+    stub.reply(200, _launched("a"))
+    stub.reply(200, _launched("b"))
+
+    for _ in range(2):
+        client(stub).launch_run("pos_daily")
+
+    tags = [
+        next(
+            t["value"]
+            for t in r.json()["variables"]["executionParams"]["executionMetadata"]["tags"]
+            if t["key"] == LAUNCH_TAG
+        )
+        for r in stub.requests
+    ]
+    assert len(set(tags)) == 2

@@ -59,7 +59,16 @@ from faultline.oracle.invariants import complete_keys, unique_keys
 from faultline.oracle.snapshot import snapshot_all
 from faultline.outcome import Outcome, classify, has_signal, worst
 from faultline.properties.base import Checkpoint, Property, PropertyContext, PropertyResult
-from faultline.schedule import Action, CopyLandingFiles, Deliver, Run, Schedule, clean_schedule
+from faultline.schedule import (
+    Action,
+    CopyLandingFiles,
+    Deliver,
+    HoldLandingFiles,
+    ReleaseLandingFiles,
+    Run,
+    Schedule,
+    clean_schedule,
+)
 
 AdapterFactory = Callable[[Path], Adapter]  # input root -> a fresh sandbox
 Log = Callable[[str], None]
@@ -133,13 +142,32 @@ class ExperimentResult:
 
 def execute(adapter: Adapter, schedule: Schedule, log: Log, phase: str) -> RunLog:
     runs: list[tuple[date, RunResult]] = []
+    held: dict[tuple[str, date], list[tuple[str, bytes]]] = {}  # this sandbox, this phase
     for action in schedule:
         if isinstance(action, Deliver):
             adapter.deliver(action.day)
         elif isinstance(action, Run):
-            result = adapter.run(RunRequest(partition=action.partition))
-            log(f"  [{phase}] run {action.partition}: {result.status}")
+            result = adapter.run(RunRequest(partition=action.partition, stage=action.stage))
+            stage = f" ({action.stage})" if action.stage else ""
+            log(f"  [{phase}] run {action.partition}{stage}: {result.status}")
             runs.append((action.partition, result))
+        elif isinstance(action, HoldLandingFiles):
+            files = hold_landing_files(adapter, action)
+            held[action.dataset, action.partition] = files
+            n = len(files)
+            log(f"  [{phase}] {action.dataset}: {n} file(s) of {action.partition} held back")
+        elif isinstance(action, ReleaseLandingFiles):
+            files = held.pop((action.dataset, action.partition), None)
+            if files is None:
+                raise AdapterError(
+                    f"nothing of {action.dataset} for {action.partition} was held back to release"
+                )
+            for file, data in files:
+                adapter.write_landing_file(action.dataset, action.partition, file, data)
+            log(
+                f"  [{phase}] {action.dataset}: {len(files)} file(s) of {action.partition} "
+                "landed late"
+            )
         elif isinstance(action, CopyLandingFiles):
             files = copy_landing_files(adapter, action)
             log(
@@ -147,6 +175,19 @@ def execute(adapter: Adapter, schedule: Schedule, log: Log, phase: str) -> RunLo
                 f"landed again under {action.to_partition}"
             )
     return tuple(runs)
+
+
+def hold_landing_files(adapter: Adapter, action: HoldLandingFiles) -> list[tuple[str, bytes]]:
+    """Read every file, then delete it: the load that follows finds nothing to take."""
+    names = adapter.landing_files(action.dataset, action.partition)
+    if not names:
+        raise AdapterError(f"no landing files of {action.dataset} for {action.partition} to hold")
+    files = [
+        (name, adapter.read_landing_file(action.dataset, action.partition, name)) for name in names
+    ]
+    for name, _ in files:
+        adapter.delete_landing_file(action.dataset, action.partition, name)
+    return files
 
 
 def copy_landing_files(adapter: Adapter, action: CopyLandingFiles) -> list[str]:

@@ -19,3 +19,9 @@ def test_building_a_bucket_opens_nothing() -> None:
 def test_deleting_refuses_anything_but_a_workspace(name: str) -> None:
     with pytest.raises(UnsafeWorkspaceError):
         _bucket().delete_workspace(name)
+
+
+@pytest.mark.parametrize("key", ["landing/x.parquet", "x.parquet", "fl_zz/pos/x.parquet"])
+def test_deleting_a_key_outside_a_workspace_is_refused(key: str) -> None:
+    with pytest.raises(UnsafeWorkspaceError):
+        _bucket().delete(key)

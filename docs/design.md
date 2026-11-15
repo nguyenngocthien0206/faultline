@@ -105,6 +105,8 @@ class Capability(StrEnum):
     CONCURRENT_SANDBOXES = "sandbox.concurrent"
     # List, read and write the files ingestion leaves for the warehouse.
     LANDING_FILES = "landing.files"
+    # Run one half of a partition: ingest (source to landing) or load (landing to tables).
+    RUN_STAGES = "run.stages"
 
 
 @dataclass(frozen=True)
@@ -129,8 +131,15 @@ class RunStatus(StrEnum):
 
 
 @dataclass(frozen=True)
+class Stage(StrEnum):
+    INGEST = "ingest"
+    LOAD = "load"
+
+
+@dataclass(frozen=True)
 class RunRequest:
     partition: date
+    stage: Stage | None = None  # None: both halves, as every normal day
 
 
 @dataclass(frozen=True)
@@ -153,13 +162,18 @@ class Adapter(ABC):  # also a context manager: setup on enter, teardown on exit
     def landing_files(self, dataset: str, partition: date) -> list[str]: ...
     def read_landing_file(self, dataset: str, partition: date, file: str) -> bytes: ...
     def write_landing_file(self, dataset: str, partition: date, file: str, data: bytes) -> None: ...
+    def delete_landing_file(self, dataset: str, partition: date, file: str) -> None: ...
 ```
 
 **`deliver(day)` instead of `place_input(file)`.** The steady-state input is whatever "one more day" means for the platform: the reference stack replays the day's changes into its source Postgres, a file-based platform would drop the day's files into its landing zone. faultline does not need to know which. Faults that reach deeper (dropping an extra file into S3, rewriting a source row, killing a run) use optional hooks declared as capabilities, added together with the faults that need them: `landing.files` (built, with `duplicate_file`), then `source.mutate`, `interrupt.failpoint`, `run.backfill`.
 
+**Stages: a gap between landing and loading.** Most landing faults act on a file after ingestion wrote it and before the warehouse read it: a file held back, cut short or with a renamed column. A platform that lands and loads in one run leaves no such gap, so an adapter can declare `run.stages` and run a partition's two halves on request: `ingest` (source to landing files) and `load` (landing files to the consumer tables). That is how many platforms already run (an ingestion tool, then the transformations), and a fault rewrites one day's `Run(D)` into `Run(D, ingest)`, its own actions, `Run(D, load)`. Every other day still runs whole. The reference stack has one job per edition and stage (`pos_ingest`, `pos_load`, and their hardened twins) next to `pos_daily`.
+
 **Landing files without the layout.** A landing fault names a dataset, a partition and a file name, never a path. Where the file lives (`<workspace>/pos/order_items/dt=2026-11-02/` in the reference stack's bucket) is the adapter's business, so the same fault works on a platform that lands files anywhere else. The reference adapter reaches the bucket with boto3 (in the `reference` extra), refuses file names with a separator or a dot path and datasets it does not declare, so a fault cannot reach outside its sandbox, and empties the workspace's prefix on teardown.
 
 The reference adapter checks that the Dagster code location loaded before setting up anything, creates the workspace (Postgres schema and source tables), replays days with `faultline.sources.pos`, launches `pos_daily` through GraphQL, and snapshots tables with ClickHouse's `FORMAT Parquet` streamed to disk (written to a temporary name and renamed, so a failed export never looks like a valid snapshot). It only exports tables it declares.
+
+**A slow orchestrator is not a failed platform.** With a dozen sandboxes running at once, Dagster's webserver sometimes takes longer than the client's 30 s to answer. The first version of the client turned that into an exception: the experiment ended as `ERROR`, and worse, its teardown dropped the sandbox under a run that was still going, which then failed on tables that no longer existed. The client now tells the two apart. Reading a run's status is safe to repeat, so an unanswered poll is retried until the run's own deadline. A launch is not (an unanswered launch may still have started the run), so every launch carries a unique `faultline/launch-id` tag, and a launch that got no answer looks its run up by that tag before launching again. Any adapter that drives an orchestrator over HTTP needs the same care.
 
 Design note, deviation from the brief: the brief lists `interrupt` as an optional method. Here an interrupt will be part of the `RunRequest` and implemented as a **failpoint**: the platform exits hard (`os._exit`) at a named point. An asynchronous `interrupt()` call would race with the run (did the write finish before the kill arrived?) and would make results flaky. Failpoints are deterministic, behave the same on Windows and Linux, and are a well known technique (FoundationDB, TiKV and etcd all use them). Black-box adapters that cannot host failpoints can still implement an interrupt point by other means, such as a cancel API or "kill when this file appears".
 
@@ -193,6 +207,8 @@ A fault acts only on what faultline controls: its private copy of the generated 
 **Built so far: `PosOfflineSync(offline_from, sync_on, store=None)`** (source, point 1). A store's till is offline for some days; everything it recorded reaches the source database on `sync_on`, with its real, older timestamps. faultline moves that store's `pos/{orders,order_items,payments}` extracts for the offline days into the sync day's input; the adapter replays them like any other day. With no store given, the first store (by id) open on every day involved is chosen, deterministically. Replay into the source keeps the latest version per key and never moves a row back in time, as a real till sync would.
 
 **Built: `DuplicateFile(original_day, redelivered_on, datasets=all POS)`** (landing, point 2, requires `landing.files`). A day's extract lands a second time, under a later partition and new names (`redelivered-<name>`), as a retried upload or a supplier resending yesterday's files would. It adds `CopyLandingFiles` actions right before the run of `redelivered_on`; the runner copies byte for byte through the adapter, and an empty source partition is an error rather than a silent no-op (a fault that injected nothing would score the platform on nothing). Recovery reruns `redelivered_on`.
+
+**Built: `LateFile(partition, lands_before, datasets=("pos/order_items",))`** (landing, point 2, requires `landing.files` and `run.stages`). One file of a day's extract arrives after that day was loaded, under its own partition. The day runs as ingest, `HoldLandingFiles` (read, then delete), load; `ReleaseLandingFiles` puts the file back, byte for byte and under its own name, right before the run of `lands_before`. Held files live in the runner for one phase of one sandbox, and releasing what was never held is an error. Recovery reruns the late file's day.
 
 MVP faults:
 
@@ -376,7 +392,7 @@ Every port binds to `127.0.0.1`. Credentials are test-only values kept in one pl
 
 **Black box.** The platform code (`reference/dagster/coffee_platform`) never imports faultline, and faultline never imports it; they live in different processes, images and dependency sets. faultline touches the platform only through the source database, the bucket, Dagster's GraphQL API and ClickHouse's HTTP API, exactly what an adapter for a team's stack would use. The demo therefore cannot cheat.
 
-**The POS pipeline.** Two editions of the same pipeline live side by side in one code location: `pos_daily` (naive, described here) and `pos_daily_hardened` (below). They write the same tables, so one table contract and one set of experiments serve both, and an adapter picks the edition by the job it launches. The naive job is partitioned by day; each run executes in a single process (`in_process_executor`, which saves about 15 s of re-imports per step):
+**The POS pipeline.** Two editions of the same pipeline live side by side in one code location: `pos_daily` (naive, described here) and `pos_daily_hardened` (below). They write the same tables, so one table contract and one set of experiments serve both, and an adapter picks the edition by the job it launches. Each edition also has an ingest job (the landing asset alone) and a load job (bronze and dbt), for faults that act in between (see stages in section 4.1). The naive job is partitioned by day; each run executes in a single process (`in_process_executor`, which saves about 15 s of re-imports per step):
 
 1. `pos_landing` (dlt `sql_database`): extracts `orders`, `order_items` and `payments` incrementally on `updated_at`, `created_at` and `paid_at`, and writes Parquet to `landing/<ws>/pos/<table>/dt=<partition>/`.
 2. `bronze_<table>` (ClickHouse): appends the partition's landing files with `INSERT ... SELECT FROM s3()`, adding `_source_file` and `_dt`. Tables take the schema of the first file seen.
@@ -403,9 +419,11 @@ Gold recomputes only the business days touched by the run's extract: the day its
 | Order updates | gold nets change events (completed adds, refunded subtracts), trusting each event to arrive exactly once | silver keeps the latest row per key (`argMax`); gold aggregates final states (an order counts if its latest status is `completed`) | yes |
 | Gold refresh | `delete+insert` incremental: two statements, a reader can see the gap | `insert_overwrite` partitioned by business day: one `ALTER TABLE ... REPLACE PARTITION` statement for all touched days | yes |
 | Duplicate files in landing | loaded again: lines, payments and gold counted twice | keyed silver and final-state gold absorb the copies (bronze still holds them); no ledger needed while every table has a key | yes |
-| Late files in landing | reads only `dt=<run date>` | finds unprocessed files in a lookback window and recomputes the business dates they touch | with late-file |
+| Late files in landing | reads only `dt=<run date>`, and dlt's cursor has moved on: the rows never arrive | the lag window reads the rows again from the source on the next run; no look back over landing files needed while the source can be read again | yes |
 | Schema drift | schema inferred from Parquet; a renamed column silently becomes NULL | explicit contract (dbt contracts and tests); mismatch alerts and fails the run | with schema-drift |
 | Partial file | loads whatever rows are there | reconciles row counts against dlt's load metadata, quarantines and alerts | with truncated-file |
+
+A **look back over landing files** (reload the last few partitions, or every partition whose files changed) is the textbook answer to late files, and it is not built either: on the late-file experiment hardened passes because the lag window reads the same rows again from the source database. That is a property of this source, not a general cure. A source that only drops files (a delivery partner's exports, say) cannot be read again, and there a late file stays lost unless bronze looks back; it will come with the delivery app's files.
 
 A **ledger of loaded files** (skip a file whose name or checksum was loaded before) is the classic answer to duplicate files, and it is deliberately not built: the duplicate-file experiment passes without it, because every POS table has a key and silver keeps one row per key. A ledger becomes necessary for data without a natural key, an append-only ledger of loyalty points or stock movements, where a copied row is indistinguishable from a real second movement. It will come with a dataset like that.
 
@@ -599,7 +617,7 @@ Runtime dependencies: typer, faker, duckdb (1.x, the oracle's engine), then pyda
 | Experiment | naive | hardened |
 |---|---|---|
 | duplicate-file (a day's extract lands again, as a retried upload) | SILENT_CORRUPTION (measured, see below) | PASS (measured) |
-| late-file | SILENT_CORRUPTION | PASS |
+| late-file (one file of a day lands two days late) | SILENT_CORRUPTION (measured, see below) | PASS (measured, through the lag window) |
 | schema-drift (column rename) | SILENT_CORRUPTION | DETECTED |
 | truncated-file (line boundary) | SILENT_CORRUPTION | DETECTED |
 | late-row-at-source (`updated_at` older than the dlt cursor) | SILENT_CORRUPTION (row never extracted) | PASS |
@@ -626,13 +644,19 @@ At least one experiment must show `BROKEN` (noisy and unrecoverable); which one 
 - Naive at R, after rerunning day 3: bronze appends every file of day 3 once more, and net revenue reaches +67.7% against the baseline. The standard fix makes it worse.
 - Hardened: `PASS` at F and R. Bronze holds the copies, consumers never see them.
 
+**late-file** (`faultline run late-file`, profile `tiny`): every run green on both editions (4 baseline, 5 fault phase with day 2 in two halves, 1 recovery).
+
+- Naive at F: all 163 order lines of day 2 missing, items sold -22.0%, and revenue to the dong unchanged: orders and payments arrived on time, so a revenue dashboard shows nothing wrong. The file did land, two days late, but naive only reads the partition it runs, and dlt's cursor had already moved past those rows.
+- Naive at R, after rerunning day 2: the lines are back (`no_data_loss` holds), but the rerun loaded the day's orders and payments a second time, so net revenue is now +21.4%. One gap closed, another opened.
+- Hardened: `PASS` at F and R, through the lag window (see section 8 on why a file-only source would need a look back instead).
+
 ## 13. Design risks
 
 1. **A self-fulfilling demo.** We write both the bugs and the tests, so faultline could end up catching only bugs designed for it. Mitigations: faults are defined against generic contracts (files, runs, keys), never against naive internals; hardened uses established patterns rather than tricks tuned to pass; the reference stack is built from real tools (dlt, Dagster, dbt, ClickHouse), and the first adapter for a team's own platform is the real check.
 2. **Non-deterministic baselines.** Volatile columns, floats and row order can make two clean runs differ. Mitigations: canonicalisation, `ignore_columns`, integer money, and a self-check that runs the baseline twice in tests and expects identical fingerprints.
 3. **Failpoints need platform cooperation.** Real tools do not expose them. Mitigation: interrupt points are generic, and each adapter chooses how to realise them (failpoint, cancel API, or kill on an observed event).
 4. **Blurry outcome boundaries.** `DETECTED` versus `BROKEN` versus `SILENT_CORRUPTION` invites argument. Mitigations: the fixed decision table in section 6, injected crashes never count as signals, and every verdict carries evidence.
-5. **Run time.** One `pos_daily` run takes about 27 s on Docker Desktop (measured; about 40 s from launch, since the run worker spends some 13 s importing code first). Most of it is fixed cost: importing dbt and its ClickHouse adapter alone takes about 10 s, while the six models execute in under 2 s. An experiment with dozens of runs therefore takes minutes. Mitigations: the `tiny` profile or short windows for the demo, reusing a baseline across experiments, and above all running sandboxes side by side on one stack, since they share nothing. Measured on Docker Desktop with 16 CPUs, concurrent runs barely slow each other: one run alone takes 42 s from launch, two at once 44 s each, four 50 s, six 59 s, nine 74 s (1.75 times as long as alone). So `faultline run pos-offline-sync` went from about 8 minutes to 5 (baseline side by side with the fault phase: 7 runs of wall clock instead of 11), and the integration suite from 21.5 minutes run back to back to 6.5 on seven pytest-xdist workers. With the duplicate-file experiment on both editions it holds 22 tests and 57 `pos_daily` runs, and takes 8 minutes on ten workers (one per test unit): about twelve runs at a time, 51 s each on average. The suite spends more compute to get there (every experiment runs its own baseline, the determinism check its own two clean runs) and less wall clock, which is the trade worth making while runs mostly wait on imports rather than on CPU. Hardened runs take as long as naive ones; the lag window costs nothing visible at `tiny` scale. Not yet done: avoiding dbt's full re-parse on every run (changing `--vars` invalidates partial parsing, about 3 to 4 s). `make demo` target to be re-set once the first experiment runs end to end. CI runs the integration suite only on pushes to main, split by edition into two parallel jobs that each start their own stack (`make test-integration EDITION=naive|hardened WORKERS=n`, one worker per test unit), with the platform image built through `docker buildx bake` and its layers cached in GitHub's cache. GitHub's 4-vCPU runners execute a run in about 16 to 19 s alone, faster than Docker Desktop; how far they gain from running several at once is measured on the first push. Pull requests get lint and unit tests (under a minute), and integration is run locally with `make test-integration` before a PR is opened.
+5. **Run time.** One `pos_daily` run takes about 27 s on Docker Desktop (measured; about 40 s from launch, since the run worker spends some 13 s importing code first). Most of it is fixed cost: importing dbt and its ClickHouse adapter alone takes about 10 s, while the six models execute in under 2 s. An experiment with dozens of runs therefore takes minutes. Mitigations: the `tiny` profile or short windows for the demo, reusing a baseline across experiments, and above all running sandboxes side by side on one stack, since they share nothing. Measured on Docker Desktop with 16 CPUs, concurrent runs barely slow each other: one run alone takes 42 s from launch, two at once 44 s each, four 50 s, six 59 s, nine 74 s (1.75 times as long as alone). So `faultline run pos-offline-sync` went from about 8 minutes to 5 (baseline side by side with the fault phase: 7 runs of wall clock instead of 11), and the integration suite from 21.5 minutes run back to back to 6.5 on seven pytest-xdist workers. With the duplicate-file experiment on both editions it held 22 tests and 57 `pos_daily` runs, and took 8 minutes on ten workers (one per test unit): about twelve runs at a time, 51 s each on average. With late-file too: 25 tests, 79 runs, 11.5 minutes on twelve workers, some sixteen runs at a time and 71 s each. That is where the gain from running side by side flattens on 16 CPUs, and where Dagster's webserver started to answer slower than the client's timeout (see section 4.1). The suite spends more compute to get there (every experiment runs its own baseline, the determinism check its own two clean runs) and less wall clock, which is the trade worth making while runs mostly wait on imports rather than on CPU. Hardened runs take as long as naive ones; the lag window costs nothing visible at `tiny` scale. Not yet done: avoiding dbt's full re-parse on every run (changing `--vars` invalidates partial parsing, about 3 to 4 s). `make demo` target to be re-set once the first experiment runs end to end. CI runs the integration suite only on pushes to main, split by edition into two parallel jobs that each start their own stack (`make test-integration EDITION=naive|hardened WORKERS=n`, one worker per test unit), with the platform image built through `docker buildx bake` and its layers cached in GitHub's cache. GitHub's 4-vCPU runners execute a run in about 16 to 19 s alone, faster than Docker Desktop; how far they gain from running several at once is measured on the first push. Pull requests get lint and unit tests (under a minute), and integration is run locally with `make test-integration` before a PR is opened.
 6. **Windows versus Linux.** Integration tests need Linux containers, which GitHub's Windows runners cannot host, so they run on ubuntu only (on pushes to main) while unit tests still run on Windows for every pull request. Locally, Git Bash rewrites absolute paths passed to `docker exec` (`/usr/bin/x` becomes `C:/Program Files/Git/usr/bin/x`); set `MSYS_NO_PATHCONV=1` for such commands.
 7. **Combining faults.** With several faults in one experiment, the expected state at intermediate checkpoints becomes hard to define. MVP: one fault per experiment is the norm. Final-state properties stay valid when faults are combined.
 8. **An interface overfitted to one implementation.** Designing the adapter around a single platform risks baking in its quirks. Mitigation: keep the interface minimal now and revise it when the dlt adapter arrives.
