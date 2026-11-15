@@ -166,3 +166,20 @@ pos_daily = define_asset_job(
     partitions_def=daily,
     executor_def=in_process_executor,
 )
+
+# The same day in two halves, as many platforms run them (an ingestion tool,
+# then the warehouse transformations): ingest = source to landing files, load =
+# landing files to the consumer tables. The landing zone sits in between, which
+# is where files can arrive late, broken or renamed.
+pos_ingest = define_asset_job(
+    "pos_ingest",
+    selection=AssetSelection.assets(pos_landing),
+    partitions_def=daily,
+    executor_def=in_process_executor,
+)
+pos_load = define_asset_job(
+    "pos_load",
+    selection=AssetSelection.assets(*BRONZE_ASSETS, pos_dbt),
+    partitions_def=daily,
+    executor_def=in_process_executor,
+)

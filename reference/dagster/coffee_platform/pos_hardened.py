@@ -167,3 +167,18 @@ pos_daily_hardened = define_asset_job(
     partitions_def=daily,
     executor_def=in_process_executor,
 )
+
+# Ingest and load halves, as for naive (see pos.py). The lag window is config
+# of the extract op, so only the jobs that extract take it.
+pos_ingest_hardened = define_asset_job(
+    "pos_ingest_hardened",
+    selection=AssetSelection.assets(hardened_pos_landing),
+    partitions_def=daily,
+    executor_def=in_process_executor,
+)
+pos_load_hardened = define_asset_job(
+    "pos_load_hardened",
+    selection=AssetSelection.assets(*HARDENED_BRONZE_ASSETS, hardened_pos_dbt),
+    partitions_def=daily,
+    executor_def=in_process_executor,
+)
