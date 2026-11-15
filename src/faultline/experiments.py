@@ -6,7 +6,7 @@ from collections.abc import Callable
 from datetime import timedelta
 
 from faultline.datagen.spec import DatasetSpec
-from faultline.faults.landing import DuplicateFile
+from faultline.faults.landing import DuplicateFile, LateFile
 from faultline.faults.source import PosOfflineSync
 from faultline.properties.core import NoDataLoss, NoSilentCorruption
 from faultline.runner import Experiment
@@ -54,7 +54,27 @@ def duplicate_file(spec: DatasetSpec) -> Experiment:
     )
 
 
+def late_file(spec: DatasetSpec) -> Experiment:
+    """Day 2's order lines file lands late: after day 3 was processed, before day 4 runs."""
+    if spec.days < 4:
+        raise ValueError("late-file needs at least 4 days of data")
+    start = spec.start_date
+    return Experiment(
+        name="late-file",
+        description=(
+            "One file of a day's extract (the order lines) arrives after that day was "
+            "loaded, under its own partition, two days late."
+        ),
+        spec=spec,
+        faults=(
+            LateFile(partition=start + timedelta(days=1), lands_before=start + timedelta(days=3)),
+        ),
+        properties=(NoDataLoss(), NoSilentCorruption()),
+    )
+
+
 BUILTIN: dict[str, Callable[[DatasetSpec], Experiment]] = {
     "pos-offline-sync": pos_offline_sync,
     "duplicate-file": duplicate_file,
+    "late-file": late_file,
 }
