@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -22,9 +23,9 @@ class Recorded:
 
 @dataclass
 class StubServer:
-    """Answers each request with the next queued (status, body) pair."""
+    """Answers each request with the next queued (status, body, delay) reply."""
 
-    responses: list[tuple[int, bytes]] = field(default_factory=list)
+    responses: list[tuple[int, bytes, float]] = field(default_factory=list)
     requests: list[Recorded] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -41,11 +42,17 @@ class StubServer:
                         self.rfile.read(length),
                     )
                 )
-                status, body = stub.responses.pop(0) if stub.responses else (500, b"no response")
-                self.send_response(status)
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                status, body, delay = (
+                    stub.responses.pop(0) if stub.responses else (500, b"no response", 0.0)
+                )
+                time.sleep(delay)  # a busy server: the client may give up first
+                try:
+                    self.send_response(status)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    pass  # the client stopped waiting
 
             do_GET = _answer
             do_POST = _answer
@@ -64,10 +71,11 @@ class StubServer:
         host, port = self._server.server_address[:2]
         return f"http://{host!s}:{port}"
 
-    def reply(self, status: int, body: bytes | str | dict[str, Any]) -> None:
+    def reply(self, status: int, body: bytes | str | dict[str, Any], *, delay: float = 0.0) -> None:
         if isinstance(body, dict):
             body = json.dumps(body)
-        self.responses.append((status, body.encode() if isinstance(body, str) else body))
+        data = body.encode() if isinstance(body, str) else body
+        self.responses.append((status, data, delay))
 
     def close(self) -> None:
         self._server.shutdown()

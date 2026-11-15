@@ -2,6 +2,13 @@
 
 This is how production tooling talks to Dagster, and it is the only coupling
 faultline has with a Dagster-based platform: no Dagster import, just HTTP.
+
+A busy webserver can be slow to answer while the run itself is fine. Waiting
+rides that out: reading a run's status is safe to repeat. Launching is not (a
+launch that timed out may have started the run anyway), so every launch
+carries a unique tag, and a launch that got no answer first looks for its run
+by that tag before trying again. Giving up early would be worse than slow: the
+caller would tear its sandbox down under a run that is still going.
 """
 
 from __future__ import annotations
@@ -10,9 +17,13 @@ import json
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
+
+T = TypeVar("T")
+LAUNCH_TAG = "faultline/launch-id"
 
 TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILURE", "CANCELED"})
 
@@ -40,6 +51,16 @@ mutation LaunchRun($executionParams: ExecutionParams!) {
     __typename
     ... on LaunchRunSuccess { run { runId } }
     ... on RunConfigValidationInvalid { errors { message } }
+    ... on Error { message }
+  }
+}
+"""
+
+_FIND_RUN = """
+query FindRun($tags: [ExecutionTag!]) {
+  runsOrError(filter: {tags: $tags}, limit: 1) {
+    __typename
+    ... on Runs { results { runId } }
     ... on Error { message }
   }
 }
@@ -77,6 +98,10 @@ query RunErrors($runId: ID!) {
 
 class DagsterError(Exception):
     """The GraphQL call itself failed (transport error, schema error, rejected launch)."""
+
+
+class DagsterUnavailable(DagsterError):
+    """No answer in time, or no connection: the same request may succeed later."""
 
 
 class RunTimeoutError(DagsterError):
@@ -122,7 +147,11 @@ class DagsterClient:
             detail = exc.read().decode(errors="replace")
             raise DagsterError(f"HTTP {exc.code} from {self.url}: {detail}") from exc
         except urllib.error.URLError as exc:
-            raise DagsterError(f"cannot reach Dagster at {self.url}: {exc.reason}") from exc
+            raise DagsterUnavailable(f"cannot reach Dagster at {self.url}: {exc.reason}") from exc
+        except (TimeoutError, ConnectionError) as exc:  # a read timeout is not wrapped in URLError
+            raise DagsterUnavailable(
+                f"no answer from Dagster at {self.url} within {self.timeout:.0f}s ({exc})"
+            ) from exc
         if payload.get("errors"):
             messages = "; ".join(e.get("message", str(e)) for e in payload["errors"])
             raise DagsterError(f"GraphQL error: {messages}")
@@ -160,9 +189,16 @@ class DagsterClient:
         partition: str | None = None,
         run_config: Mapping[str, Any] | None = None,
         tags: Mapping[str, str] | None = None,
+        attempts: int = 3,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> str:
-        """Launch `job` and return its run id. Does not wait for completion."""
-        all_tags = dict(tags or {})
+        """Launch `job` once and return its run id. Does not wait for completion.
+
+        Once, even when Dagster is slow: an unanswered launch is looked up by
+        its launch tag, and only launched again if no run carries that tag.
+        """
+        launch_id = uuid.uuid4().hex
+        all_tags = {**(tags or {}), LAUNCH_TAG: launch_id}
         if partition is not None:
             all_tags["dagster/partition"] = partition
         params = {
@@ -174,11 +210,40 @@ class DagsterClient:
             "runConfigData": dict(run_config or {}),
             "executionMetadata": {"tags": [{"key": k, "value": v} for k, v in all_tags.items()]},
         }
-        result = self.execute(_LAUNCH_RUN, {"executionParams": params})["launchRun"]
+        for attempt in range(1, attempts + 1):
+            try:
+                result = self.execute(_LAUNCH_RUN, {"executionParams": params})["launchRun"]
+                break
+            except DagsterUnavailable:
+                launched = self._find_launched(launch_id, sleep=sleep)
+                if launched is not None:
+                    return launched
+                if attempt == attempts:
+                    raise
+                sleep(1.0)
         if result["__typename"] == "LaunchRunSuccess":
             return str(result["run"]["runId"])
         details = [e["message"] for e in result.get("errors", [])] or [result.get("message", "")]
         raise DagsterError(f"launch of {job!r} rejected ({result['__typename']}): {details}")
+
+    def _find_launched(
+        self, launch_id: str, *, sleep: Callable[[float], None], tries: int = 10
+    ) -> str | None:
+        """The run a launch started, if it did; None if no run carries the launch tag."""
+        variables = {"tags": [{"key": LAUNCH_TAG, "value": launch_id}]}
+        for attempt in range(1, tries + 1):
+            try:
+                result = self.execute(_FIND_RUN, variables)["runsOrError"]
+            except DagsterUnavailable:
+                if attempt == tries:
+                    raise
+                sleep(1.0)
+                continue
+            if result["__typename"] != "Runs":
+                raise DagsterError(f"cannot look up runs: {result.get('message')}")
+            found = result["results"]
+            return str(found[0]["runId"]) if found else None
+        return None  # pragma: no cover - the loop always returns or raises
 
     def run_status(self, run_id: str) -> str:
         result = self.execute(_RUN_STATUS, {"runId": run_id})["runOrError"]
@@ -215,12 +280,28 @@ class DagsterClient:
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
     ) -> RunOutcome:
-        """Poll until the run reaches SUCCESS, FAILURE or CANCELED."""
+        """Poll until the run reaches SUCCESS, FAILURE or CANCELED.
+
+        A poll Dagster does not answer is tried again until the deadline: the
+        run goes on regardless, and reading its status twice is harmless.
+        """
         deadline = clock() + timeout
+
+        def patiently(call: Callable[[], T]) -> T:
+            while True:
+                try:
+                    return call()
+                except DagsterUnavailable as exc:
+                    if clock() >= deadline:
+                        raise RunTimeoutError(
+                            f"run {run_id}: Dagster stopped answering ({exc})"
+                        ) from exc
+                    sleep(poll_interval)
+
         while True:
-            status = self.run_status(run_id)
+            status = patiently(lambda: self.run_status(run_id))
             if status in TERMINAL_STATUSES:
-                errors = self.run_errors(run_id) if status != "SUCCESS" else ()
+                errors = patiently(lambda: self.run_errors(run_id)) if status != "SUCCESS" else ()
                 return RunOutcome(run_id=run_id, status=status, errors=errors)
             if clock() >= deadline:
                 raise RunTimeoutError(f"run {run_id} still {status} after {timeout:.0f}s")
