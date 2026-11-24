@@ -10,6 +10,11 @@ upload, a partner's late drop). The day runs as ingest and load with the file
 held back in between, and the file lands, under its own partition, days later.
 A loader that only reads today's partition never looks back; nothing fails,
 and the rows are simply not there.
+
+TruncatedFile: a file loses its last rows, cut on a row boundary (an upload
+that stopped early, a writer that crashed after flushing). It still parses,
+every value is valid, keys are unique: only a count of what was promised can
+tell. Recovery gets the full file redelivered, then reruns the day.
 """
 
 from __future__ import annotations
@@ -21,11 +26,13 @@ from typing import ClassVar
 from faultline.adapters.base import Capability, Stage
 from faultline.faults.base import Fault, FaultSetupError, InjectionPoint
 from faultline.schedule import (
+    Action,
     CopyLandingFiles,
     HoldLandingFiles,
     ReleaseLandingFiles,
     Run,
     Schedule,
+    TruncateLandingFiles,
 )
 
 POS_DATASETS = ("pos/orders", "pos/order_items", "pos/payments")
@@ -117,4 +124,46 @@ class LateFile(Fault):
         return (
             f"the {what} file of {self.partition} lands late, "
             f"just before the run of {self.lands_before}"
+        )
+
+
+@dataclass
+class TruncatedFile(Fault):
+    partition: date
+    keep: float = 0.8  # share of rows the cut file keeps
+    datasets: tuple[str, ...] = ("pos/order_items",)
+
+    name: ClassVar[str] = "truncated_file"
+    injection_point: ClassVar[InjectionPoint] = InjectionPoint.LANDING
+    requires: ClassVar[frozenset[Capability]] = frozenset(
+        {Capability.LANDING_FILES, Capability.RUN_STAGES}
+    )
+
+    def __post_init__(self) -> None:
+        if not 0 < self.keep < 1:
+            raise FaultSetupError(f"keep must be between 0 and 1, got {self.keep}")
+        if not self.datasets:
+            raise FaultSetupError("name at least one dataset whose file is cut")
+
+    def apply(self, schedule: Schedule) -> Schedule:
+        """Split the partition's run around the cut: ingest, cut, load."""
+        if Run(self.partition) not in schedule:
+            raise FaultSetupError(f"{self.partition} is never run in this schedule")
+        cuts = tuple(TruncateLandingFiles(d, self.partition, self.keep) for d in self.datasets)
+        split = (Run(self.partition, Stage.INGEST), *cuts, Run(self.partition, Stage.LOAD))
+        at = schedule.index(Run(self.partition))
+        return schedule[:at] + split + schedule[at + 1 :]
+
+    def heal(self) -> list[Action]:
+        """The supplier redelivers the full file, under the same name."""
+        return [ReleaseLandingFiles(d, self.partition) for d in self.datasets]
+
+    def affected_partitions(self) -> set[date]:
+        return {self.partition}
+
+    def describe(self) -> str:
+        what = ", ".join(self.datasets)
+        return (
+            f"the {what} file of {self.partition} is cut to {self.keep:.0%} of its rows, "
+            "on a row boundary"
         )

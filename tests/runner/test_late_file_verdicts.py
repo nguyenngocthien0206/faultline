@@ -50,3 +50,14 @@ def test_the_day_runs_in_two_halves_with_the_file_held_between(tmp_path: Path) -
     assert result.faults == (
         "the pos/order_items file of 2026-11-02 lands late, just before the run of 2026-11-04",
     )
+
+
+def test_with_a_manifest_the_missing_file_fails_the_load_and_the_lag_still_fills_it(
+    tmp_path: Path,
+) -> None:
+    result = _run("keyed", tmp_path)
+
+    failed = [r for _, r in result.runs["fault phase"] if not r.succeeded]
+    assert len(failed) == 1
+    assert any("missing" in e for e in failed[0].errors)
+    assert result.outcome is Outcome.PASS  # noticed, and the data is right anyway
