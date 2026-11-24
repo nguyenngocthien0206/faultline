@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from reference_stack import Stack, reference_config
 
-from faultline.adapters.base import RunRequest, Stage
+from faultline.adapters.base import RunRequest, RunStatus, Stage
 from faultline.adapters.reference import ReferenceAdapter, clean_reference_stack
 from faultline.connectors.s3 import LandingBucket
 from faultline.connectors.workspace import new_workspace_name
@@ -80,3 +80,20 @@ def test_clean_removes_a_leftover_sandbox_everywhere_and_nothing_else(stack: Sta
         assert alive in stack.clickhouse.list_workspaces()
     finally:
         clean_reference_stack(config, force=True, only={alive})
+
+
+def test_a_run_crashed_at_a_failpoint_is_interrupted_with_its_files_landed(
+    stack: Stack, tmp_path: Path
+) -> None:
+    spec = DatasetSpec.from_profile("tiny")
+    adapter = ReferenceAdapter(reference_config(), generate_truth(spec, tmp_path))
+    day = spec.start_date
+
+    with adapter:
+        adapter.deliver(day)
+        result = adapter.run(RunRequest(day, failpoint="after_landing"))
+
+        assert result.status is RunStatus.INTERRUPTED, result.errors  # faultline's crash
+        assert adapter.landing_files("pos/order_items", day)  # landed...
+        sql = f"SELECT count() AS n FROM system.tables WHERE database = '{adapter.workspace}'"
+        assert int(stack.clickhouse.query(sql)[0]["n"]) == 0  # ...never loaded
