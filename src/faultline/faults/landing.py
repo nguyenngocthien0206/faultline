@@ -15,6 +15,13 @@ TruncatedFile: a file loses its last rows, cut on a row boundary (an upload
 that stopped early, a writer that crashed after flushing). It still parses,
 every value is valid, keys are unique: only a count of what was promised can
 tell. Recovery gets the full file redelivered, then reruns the day.
+
+ColumnDrift: a file arrives with a column renamed (amount_vnd is now
+total_amount_vnd), in place or moved to the end. Nothing in it is malformed. A
+loader that reads by name finds the expected column missing and, unless told
+otherwise, fills it with a default; one that reads by position puts values in
+whatever column sits there. Recovery gets the file redelivered with the agreed
+schema, then reruns the day.
 """
 
 from __future__ import annotations
@@ -30,6 +37,7 @@ from faultline.schedule import (
     CopyLandingFiles,
     HoldLandingFiles,
     ReleaseLandingFiles,
+    RenameLandingColumn,
     Run,
     Schedule,
     TruncateLandingFiles,
@@ -166,4 +174,48 @@ class TruncatedFile(Fault):
         return (
             f"the {what} file of {self.partition} is cut to {self.keep:.0%} of its rows, "
             "on a row boundary"
+        )
+
+
+@dataclass
+class ColumnDrift(Fault):
+    partition: date
+    dataset: str = "pos/payments"
+    old: str = "amount_vnd"
+    new: str = "total_amount_vnd"
+    move_to_end: bool = False  # as a schema evolution that appends the new column would
+
+    name: ClassVar[str] = "column_drift"
+    injection_point: ClassVar[InjectionPoint] = InjectionPoint.LANDING
+    requires: ClassVar[frozenset[Capability]] = frozenset(
+        {Capability.LANDING_FILES, Capability.RUN_STAGES}
+    )
+
+    def __post_init__(self) -> None:
+        if not self.old or not self.new or self.old == self.new:
+            raise FaultSetupError("a rename needs two different, non-empty column names")
+
+    def apply(self, schedule: Schedule) -> Schedule:
+        """Split the partition's run around the rename: ingest, rename, load."""
+        if Run(self.partition) not in schedule:
+            raise FaultSetupError(f"{self.partition} is never run in this schedule")
+        rename = RenameLandingColumn(
+            self.dataset, self.partition, self.old, self.new, move_to_end=self.move_to_end
+        )
+        split = (Run(self.partition, Stage.INGEST), rename, Run(self.partition, Stage.LOAD))
+        at = schedule.index(Run(self.partition))
+        return schedule[:at] + split + schedule[at + 1 :]
+
+    def heal(self) -> list[Action]:
+        """The producer redelivers the file with the agreed schema."""
+        return [ReleaseLandingFiles(self.dataset, self.partition)]
+
+    def affected_partitions(self) -> set[date]:
+        return {self.partition}
+
+    def describe(self) -> str:
+        moved = ", moved to the end" if self.move_to_end else ""
+        return (
+            f"the {self.dataset} file of {self.partition} arrives with {self.old} "
+            f"renamed {self.new}{moved}"
         )
