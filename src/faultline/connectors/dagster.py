@@ -56,6 +56,16 @@ mutation LaunchRun($executionParams: ExecutionParams!) {
 }
 """
 
+_RUN_MESSAGES = """
+query RunMessages($runId: ID!) {
+  logsForRun(runId: $runId, limit: 1000) {
+    __typename
+    ... on EventConnection { events { __typename ... on MessageEvent { message } } }
+    ... on Error { message }
+  }
+}
+"""
+
 _FIND_RUN = """
 query FindRun($tags: [ExecutionTag!]) {
   runsOrError(filter: {tags: $tags}, limit: 1) {
@@ -275,6 +285,24 @@ class DagsterClient:
         if result["__typename"] != "Run":
             raise DagsterError(f"run {run_id}: {result.get('message', result['__typename'])}")
         return str(result["status"])
+
+    def run_logged(self, run_id: str, text: str, *, tries: int = 10) -> bool:
+        """Whether any message in the run's event log contains `text`.
+
+        Asked right after a run ends, when the webserver may be busy: an
+        unanswered request is tried again a few times.
+        """
+        for attempt in range(1, tries + 1):
+            try:
+                result = self.execute(_RUN_MESSAGES, {"runId": run_id})["logsForRun"]
+                break
+            except DagsterUnavailable:
+                if attempt == tries:
+                    raise
+                time.sleep(1.0)
+        if result["__typename"] != "EventConnection":
+            raise DagsterError(f"run {run_id}: {result.get('message', result['__typename'])}")
+        return any(text in (event.get("message") or "") for event in result["events"])
 
     def run_errors(self, run_id: str) -> tuple[str, ...]:
         """Human readable failure messages of a run, step failures first.

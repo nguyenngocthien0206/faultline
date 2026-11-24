@@ -215,3 +215,13 @@ def test_renaming_in_no_file_is_an_error() -> None:
 
     with pytest.raises(AdapterError, match="no landing files of pos/payments for 2026-11-02"):
         execute(MemoryLanding(), (rename,), print, "fault")
+
+
+def test_a_run_can_be_asked_to_crash_at_a_failpoint() -> None:
+    landing = MemoryLanding()
+    lines: list[str] = []
+
+    execute(landing, (Run(D2, failpoint="after_landing"),), lines.append, "fault")
+
+    assert landing.requests == [RunRequest(D2, failpoint="after_landing")]
+    assert lines == ["  [fault] run 2026-11-02 (crash after_landing): SUCCEEDED"]

@@ -161,9 +161,12 @@ def execute(
         if isinstance(action, Deliver):
             adapter.deliver(action.day)
         elif isinstance(action, Run):
-            result = adapter.run(RunRequest(partition=action.partition, stage=action.stage))
-            stage = f" ({action.stage})" if action.stage else ""
-            log(f"  [{phase}] run {action.partition}{stage}: {result.status}")
+            request = RunRequest(action.partition, action.stage, action.failpoint)
+            result = adapter.run(request)
+            notes = [str(action.stage)] if action.stage else []
+            notes += [f"crash {action.failpoint}"] if action.failpoint else []
+            note = f" ({', '.join(notes)})" if notes else ""
+            log(f"  [{phase}] run {action.partition}{note}: {result.status}")
             runs.append((action.partition, result))
         elif isinstance(action, HoldLandingFiles):
             files = hold_landing_files(adapter, action)

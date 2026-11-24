@@ -54,6 +54,11 @@ JOBS: dict[tuple[Edition, Stage | None], str] = {
     (Edition.HARDENED, Stage.LOAD): "pos_load_hardened",
 }
 HARDENED_EXTRACT_OP = "hardened_pos_landing"  # takes the lag window as op config
+# The platform dies at a failpoint named by this run tag, after logging the
+# line below (reference/dagster/coffee_platform/failpoints.py): a failed run
+# with that line was crashed by faultline, any other failed run failed by itself.
+FAILPOINT_TAG = "faultline/failpoint"
+FAILPOINT_REACHED = "faultline failpoint reached: "
 
 
 def target_name(edition: Edition | str, lag_days: int | None = None) -> str:
@@ -227,6 +232,7 @@ class ReferenceAdapter(Adapter):
                 Capability.CONCURRENT_SANDBOXES,
                 Capability.LANDING_FILES,
                 Capability.RUN_STAGES,
+                Capability.FAILPOINTS,
             }
         )
         return Capabilities(features=features, tables=CONSUMER_TABLES)
@@ -243,15 +249,24 @@ class ReferenceAdapter(Adapter):
         apply_day(self.source, self.workspace, self.generated_root, day)
 
     def run(self, request: RunRequest) -> RunResult:
+        tags = {"faultline/workspace": self.workspace}
+        if request.failpoint:
+            tags[FAILPOINT_TAG] = request.failpoint
         run_id = self.dagster.launch_run(
             self.job_for(request.stage),
             partition=request.partition.isoformat(),
             run_config=self.run_config(request.stage),
-            tags={"faultline/workspace": self.workspace},
+            tags=tags,
         )
         outcome = self.dagster.wait_for_run(run_id, timeout=self.config.run_timeout_seconds)
-        status = RunStatus.SUCCEEDED if outcome.succeeded else RunStatus.FAILED
-        return RunResult(status=status, errors=outcome.errors, run_id=run_id)
+        if outcome.succeeded:
+            return RunResult(RunStatus.SUCCEEDED, run_id=run_id)
+        if request.failpoint and self.dagster.run_logged(
+            run_id, FAILPOINT_REACHED + request.failpoint
+        ):
+            # faultline's own crash: the platform logged the failpoint, then died
+            return RunResult(RunStatus.INTERRUPTED, errors=outcome.errors, run_id=run_id)
+        return RunResult(RunStatus.FAILED, errors=outcome.errors, run_id=run_id)
 
     def snapshot(self, table: str, dest: Path) -> Path:
         contract = self.capabilities().table(table)  # only declared tables can be read

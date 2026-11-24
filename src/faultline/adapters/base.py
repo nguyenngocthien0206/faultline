@@ -33,6 +33,9 @@ class Capability(StrEnum):
     # Run one half of a partition: ingest (source to landing files) or load
     # (landing files to the consumer tables), so a fault can act in between.
     RUN_STAGES = "run.stages"
+    # Make a run die, hard, at a named point (a failpoint), and tell that
+    # crash from a failure of the platform's own: RunStatus.INTERRUPTED.
+    FAILPOINTS = "interrupt.failpoint"
 
 
 @dataclass(frozen=True)
@@ -77,6 +80,7 @@ class Stage(StrEnum):
 class RunRequest:
     partition: date
     stage: Stage | None = None  # None: the whole partition, both halves
+    failpoint: str | None = None  # die there (Capability.FAILPOINTS); None: run normally
 
 
 @dataclass(frozen=True)
