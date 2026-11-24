@@ -20,6 +20,7 @@ from faultline.schedule import (
     CopyLandingFiles,
     HoldLandingFiles,
     ReleaseLandingFiles,
+    RenameLandingColumn,
     Run,
     TruncateLandingFiles,
 )
@@ -188,3 +189,29 @@ def test_a_cut_file_is_shorter_and_a_later_release_brings_the_full_one_back() ->
 def test_cutting_nothing_is_an_error() -> None:
     with pytest.raises(AdapterError, match="no landing files of pos/orders for 2026-11-02 to cut"):
         execute(MemoryLanding(), (TruncateLandingFiles("pos/orders", D2),), print, "fault")
+
+
+def test_a_renamed_column_and_the_agreed_schema_coming_back() -> None:
+    landing = MemoryLanding()
+    agreed = b"payment_id,amount_vnd\np1,100\np2,200\n"
+    landing.files["pos/payments", D3, "load-1.csv"] = agreed
+    held: dict[tuple[str, date], list[tuple[str, bytes]]] = {}
+    lines: list[str] = []
+
+    rename = RenameLandingColumn("pos/payments", D3, "amount_vnd", "total_amount_vnd")
+    execute(landing, (rename,), lines.append, "fault", held)
+    drifted = landing.files["pos/payments", D3, "load-1.csv"]
+    execute(landing, (ReleaseLandingFiles("pos/payments", D3),), lines.append, "recovery", held)
+
+    assert drifted == b"payment_id,total_amount_vnd\np1,100\np2,200\n"
+    assert landing.files["pos/payments", D3, "load-1.csv"] == agreed
+    assert lines[0] == (
+        "  [fault] pos/payments: 1 file(s) of 2026-11-03 had amount_vnd renamed total_amount_vnd"
+    )
+
+
+def test_renaming_in_no_file_is_an_error() -> None:
+    rename = RenameLandingColumn("pos/payments", D2, "amount_vnd", "total_amount_vnd")
+
+    with pytest.raises(AdapterError, match="no landing files of pos/payments for 2026-11-02"):
+        execute(MemoryLanding(), (rename,), print, "fault")

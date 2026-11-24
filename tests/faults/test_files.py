@@ -5,7 +5,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from faultline.faults.base import FaultSetupError
-from faultline.faults.files import rows_to_keep, truncate
+from faultline.faults.files import rename_column, rows_to_keep, truncate
 
 # Like a dlt file: every column REQUIRED, a timezone-aware timestamp.
 SCHEMA = pa.schema(
@@ -63,3 +63,36 @@ def test_an_empty_file_cannot_be_cut() -> None:
 def test_only_parquet_and_csv_can_be_cut() -> None:
     with pytest.raises(FaultSetupError, match="only Parquet and CSV"):
         truncate("a.json", b"{}", keep=0.8)
+
+
+def test_a_renamed_parquet_column_keeps_its_place_type_and_values() -> None:
+    table = pq.read_table(io.BytesIO(rename_column("a.parquet", _parquet(3), "qty", "quantity")))
+
+    assert table.column_names == ["order_id", "quantity", "created_at"]
+    assert table.schema.field("quantity").type == pa.int64()
+    assert not table.schema.field("quantity").nullable  # as the writer made it
+    assert table.column("quantity").to_pylist() == [0, 1, 2]
+
+
+def test_a_renamed_parquet_column_can_move_to_the_end() -> None:
+    data = rename_column("a.parquet", _parquet(3), "qty", "quantity", move_to_end=True)
+
+    assert pq.read_table(io.BytesIO(data)).column_names == ["order_id", "created_at", "quantity"]
+
+
+def test_a_renamed_csv_column_in_place_and_moved() -> None:
+    data = b"order_id,qty,price\no1,1,10\no2,2,20\n"
+
+    assert rename_column("a.csv", data, "qty", "quantity") == (
+        b"order_id,quantity,price\no1,1,10\no2,2,20\n"
+    )
+    assert rename_column("a.csv", data, "qty", "quantity", move_to_end=True) == (
+        b"order_id,price,quantity\no1,10,1\no2,20,2\n"
+    )
+
+
+def test_renaming_a_column_the_file_does_not_have_is_refused() -> None:
+    with pytest.raises(FaultSetupError, match="has no column 'amount'"):
+        rename_column("a.parquet", _parquet(3), "amount", "total_amount")
+    with pytest.raises(FaultSetupError, match="has no column 'amount'"):
+        rename_column("a.csv", b"order_id,qty\no1,1\n", "amount", "total_amount")
