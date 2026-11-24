@@ -6,6 +6,7 @@ from collections.abc import Callable
 from datetime import timedelta
 
 from faultline.datagen.spec import DatasetSpec
+from faultline.faults.execution import CrashAfterLanding
 from faultline.faults.landing import ColumnDrift, DuplicateFile, LateFile, TruncatedFile
 from faultline.faults.source import PosOfflineSync
 from faultline.properties.core import NoDataLoss, NoSilentCorruption
@@ -101,10 +102,27 @@ def column_rename(spec: DatasetSpec) -> Experiment:
     )
 
 
+def crash_after_landing(spec: DatasetSpec) -> Experiment:
+    """Day 2's run dies right after landing its files, before loading anything."""
+    if spec.days < 3:
+        raise ValueError("crash-after-landing needs at least 3 days of data")
+    return Experiment(
+        name="crash-after-landing",
+        description=(
+            "The run of day 2 is killed, hard, between ingestion and loading: the files and "
+            "the ingestion cursor are saved, the warehouse has nothing of the day."
+        ),
+        spec=spec,
+        faults=(CrashAfterLanding(partition=spec.start_date + timedelta(days=1)),),
+        properties=(NoDataLoss(), NoSilentCorruption()),
+    )
+
+
 BUILTIN: dict[str, Callable[[DatasetSpec], Experiment]] = {
     "pos-offline-sync": pos_offline_sync,
     "duplicate-file": duplicate_file,
     "late-file": late_file,
     "truncated-file": truncated_file,
     "column-rename": column_rename,
+    "crash-after-landing": crash_after_landing,
 }
