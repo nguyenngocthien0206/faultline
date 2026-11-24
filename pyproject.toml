@@ -31,12 +31,14 @@ faultline = "faultline.cli:app"
 reference = [
     "boto3>=1.40",
     "psycopg[binary]>=3.3.8",
+    "pyarrow>=18",
 ]
 
 [dependency-groups]
 dev = [
     "boto3>=1.40",
     "psycopg[binary]>=3.3.8",
+    "pyarrow>=18",
     "pytest>=9.2.0",
     "pytest-xdist>=3.8.0",
     "ruff>=0.17.4",

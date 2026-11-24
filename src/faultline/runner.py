@@ -55,6 +55,7 @@ from faultline.adapters.base import (
 )
 from faultline.datagen import DatasetSpec, generate
 from faultline.faults.base import Fault
+from faultline.faults.files import truncate
 from faultline.oracle.invariants import complete_keys, unique_keys
 from faultline.oracle.snapshot import snapshot_all
 from faultline.outcome import Outcome, classify, has_signal, worst
@@ -67,6 +68,7 @@ from faultline.schedule import (
     ReleaseLandingFiles,
     Run,
     Schedule,
+    TruncateLandingFiles,
     clean_schedule,
 )
 
@@ -140,9 +142,20 @@ class ExperimentResult:
         return p.at_f if checkpoint == "F" else p.at_r
 
 
-def execute(adapter: Adapter, schedule: Schedule, log: Log, phase: str) -> RunLog:
+Held = dict[tuple[str, date], list[tuple[str, bytes]]]  # (dataset, partition) -> files
+
+
+def execute(
+    adapter: Adapter, schedule: Schedule, log: Log, phase: str, held: Held | None = None
+) -> RunLog:
+    """Carry out a schedule on one sandbox.
+
+    `held` keeps files taken out of the landing zone (held back, or the
+    originals of cut files) for a later release; pass the same one to every
+    phase of a sandbox so that a heal can put back what the fault removed.
+    """
     runs: list[tuple[date, RunResult]] = []
-    held: dict[tuple[str, date], list[tuple[str, bytes]]] = {}  # this sandbox, this phase
+    held = {} if held is None else held
     for action in schedule:
         if isinstance(action, Deliver):
             adapter.deliver(action.day)
@@ -156,6 +169,13 @@ def execute(adapter: Adapter, schedule: Schedule, log: Log, phase: str) -> RunLo
             held[action.dataset, action.partition] = files
             n = len(files)
             log(f"  [{phase}] {action.dataset}: {n} file(s) of {action.partition} held back")
+        elif isinstance(action, TruncateLandingFiles):
+            files = truncate_landing_files(adapter, action)
+            held[action.dataset, action.partition] = files
+            log(
+                f"  [{phase}] {action.dataset}: {len(files)} file(s) of {action.partition} "
+                f"cut to {action.keep:.0%} of their rows"
+            )
         elif isinstance(action, ReleaseLandingFiles):
             files = held.pop((action.dataset, action.partition), None)
             if files is None:
@@ -166,7 +186,7 @@ def execute(adapter: Adapter, schedule: Schedule, log: Log, phase: str) -> RunLo
                 adapter.write_landing_file(action.dataset, action.partition, file, data)
             log(
                 f"  [{phase}] {action.dataset}: {len(files)} file(s) of {action.partition} "
-                "landed late"
+                "put back in place"
             )
         elif isinstance(action, CopyLandingFiles):
             files = copy_landing_files(adapter, action)
@@ -188,6 +208,22 @@ def hold_landing_files(adapter: Adapter, action: HoldLandingFiles) -> list[tuple
     for name, _ in files:
         adapter.delete_landing_file(action.dataset, action.partition, name)
     return files
+
+
+def truncate_landing_files(
+    adapter: Adapter, action: TruncateLandingFiles
+) -> list[tuple[str, bytes]]:
+    """Cut every file in place, under its own name; return the originals."""
+    names = adapter.landing_files(action.dataset, action.partition)
+    if not names:
+        raise AdapterError(f"no landing files of {action.dataset} for {action.partition} to cut")
+    originals = []
+    for name in names:
+        data = adapter.read_landing_file(action.dataset, action.partition, name)
+        originals.append((name, data))
+        cut = truncate(name, data, action.keep)
+        adapter.write_landing_file(action.dataset, action.partition, name, cut)
+    return originals
 
 
 def copy_landing_files(adapter: Adapter, action: CopyLandingFiles) -> list[str]:
@@ -297,11 +333,16 @@ def _plan_faults(
 def _fault_phases(
     plan: _FaultPlan, adapter: Adapter, work_dir: Path, log: Log
 ) -> tuple[Checkpoint, Checkpoint]:
-    """Steps 3 and 4 in one sandbox: the faulted schedule, then the recovery."""
+    """Steps 3 and 4 in one sandbox: the faulted schedule, then the recovery.
+
+    One store of held files serves both, so a heal can give back the files the
+    fault took away (the full version of a cut file, say).
+    """
+    held: Held = {}
     with adapter as sandbox:
-        fault_runs = execute(sandbox, plan.schedule, log, "fault")
+        fault_runs = execute(sandbox, plan.schedule, log, "fault", held)
         at_f = Checkpoint("F", snapshot_all(sandbox, work_dir / "checkpoint_F"), fault_runs)
-        recovery_runs = execute(sandbox, plan.recovery, log, "recovery")
+        recovery_runs = execute(sandbox, plan.recovery, log, "recovery", held)
         at_r = Checkpoint("R", snapshot_all(sandbox, work_dir / "checkpoint_R"), recovery_runs)
     return at_f, at_r
 
