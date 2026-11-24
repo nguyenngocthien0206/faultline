@@ -8,9 +8,11 @@ partition, and dlt's cursor has moved on, so day 2's lines never arrive. Every
 run is green: SILENT_CORRUPTION. Rerunning day 2 picks the file up, but loads
 the day's orders and payments a second time.
 
-Hardened: the lag window re-reads day 2's lines from the source on day 3, so
-consumers see the clean numbers: PASS. That holds because this source can be
-read again; a source that only drops files would need a look back in bronze.
+Hardened: the manifest of day 2's extract lists the lines file, so its load
+fails on the missing file, loudly. The lag window re-reads day 2's lines from
+the source on day 3, so consumers see the clean numbers: PASS, with the red
+run as the notice. That holds because this source can be read again; a source
+that only drops files would need a look back in bronze.
 
 Each edition is its own class, the unit pytest-xdist schedules.
 """
@@ -62,11 +64,16 @@ class TestNaive:
 
 @pytest.mark.hardened
 class TestHardened:
-    def test_reads_the_lines_again_from_the_source(self, stack: Stack, tmp_path: Path) -> None:
+    def test_flags_the_missing_file_and_reads_the_lines_again_from_the_source(
+        self, stack: Stack, tmp_path: Path
+    ) -> None:
         result = _run(Edition.HARDENED, tmp_path)
 
         assert result.outcome is Outcome.PASS, result.render()
         for prop in result.properties:
             assert prop.at_f.holds, prop.at_f.evidence
             assert prop.at_r.holds, prop.at_r.evidence
-        assert _all_green(result)
+        failed = [(d, r) for d, r in result.runs["fault phase"] if r.status is RunStatus.FAILED]
+        assert len(failed) == 1  # the load of day 2
+        assert any("is missing" in e for e in failed[0][1].errors), failed[0][1].errors
+        assert all(r.succeeded for _, r in result.runs["recovery"])
