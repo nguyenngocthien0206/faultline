@@ -28,6 +28,7 @@ from dagster import (
 from dagster_dbt import DbtCliResource, DbtProject, dbt_assets
 from dlt.sources.sql_database import sql_database
 
+from coffee_platform.failpoints import failpoint
 from coffee_platform.partitions import daily
 from coffee_platform.resources import ClickHouse, Workspace
 
@@ -103,6 +104,9 @@ def extract_to_landing(
 def pos_landing(context: AssetExecutionContext, workspace: Workspace):
     """Naive: dlt's default incremental cursor, no lag window."""
     extract = extract_to_landing(context, workspace)
+    # Files landed, dlt's cursor saved with them, nothing loaded yet: the
+    # window between two systems that a crash here leaves open.
+    failpoint(context, "after_landing")
     for table, rows in extract.rows.items():
         yield MaterializeResult(asset_key=f"landing_{table}", metadata={"rows": rows})
 
