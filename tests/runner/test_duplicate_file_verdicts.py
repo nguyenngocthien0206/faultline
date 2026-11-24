@@ -54,3 +54,12 @@ def test_appending_loses_nothing_but_counts_lines_twice(tmp_path: Path) -> None:
         e.startswith("silver_order_items:") and "duplicated" in e for e in corruption.at_f.evidence
     ), corruption.at_f.evidence
     assert not any(e.startswith("silver_orders:") for e in corruption.at_f.evidence)
+
+
+def test_with_a_manifest_the_copies_are_stray_files_and_fail_the_load(tmp_path: Path) -> None:
+    result = _run("keyed", tmp_path)
+
+    failed = [r for _, r in result.runs["fault phase"] if not r.succeeded]
+    assert failed
+    assert all(any("stray file" in e for e in r.errors) for r in failed)
+    assert result.outcome is Outcome.PASS  # noticed, and keyed silver keeps the data right

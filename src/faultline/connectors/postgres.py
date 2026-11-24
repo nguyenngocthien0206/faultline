@@ -11,7 +11,7 @@ from collections.abc import Iterable, Sequence
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
-from faultline.connectors.workspace import validate_workspace_name
+from faultline.connectors.workspace import is_workspace_name, validate_workspace_name
 
 if TYPE_CHECKING:
     import psycopg
@@ -102,6 +102,11 @@ class SourceDatabase:
         self.execute(
             sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(validate_workspace_name(name)))
         )
+
+    def list_workspaces(self) -> list[str]:
+        """Schemas that are faultline workspaces, sorted."""
+        rows = self.fetch_all("SELECT schema_name FROM information_schema.schemata")
+        return sorted(name for (name,) in rows if is_workspace_name(name))
 
     def drop_workspace(self, name: str) -> None:
         """Drop a faultline workspace schema and everything in it. Refuses any other name."""

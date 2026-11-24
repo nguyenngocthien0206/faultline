@@ -6,7 +6,7 @@ from collections.abc import Callable
 from datetime import timedelta
 
 from faultline.datagen.spec import DatasetSpec
-from faultline.faults.landing import DuplicateFile, LateFile
+from faultline.faults.landing import DuplicateFile, LateFile, TruncatedFile
 from faultline.faults.source import PosOfflineSync
 from faultline.properties.core import NoDataLoss, NoSilentCorruption
 from faultline.runner import Experiment
@@ -73,8 +73,23 @@ def late_file(spec: DatasetSpec) -> Experiment:
     )
 
 
+def truncated_file(spec: DatasetSpec) -> Experiment:
+    """The last day's order lines file is cut to 80% of its rows; it still reads fine."""
+    return Experiment(
+        name="truncated-file",
+        description=(
+            "One file of the last day's extract (the order lines) lands short: cut on a row "
+            "boundary, so it parses and nothing in it is invalid. Recovery redelivers it in full."
+        ),
+        spec=spec,
+        faults=(TruncatedFile(partition=spec.end_date),),
+        properties=(NoDataLoss(), NoSilentCorruption()),
+    )
+
+
 BUILTIN: dict[str, Callable[[DatasetSpec], Experiment]] = {
     "pos-offline-sync": pos_offline_sync,
     "duplicate-file": duplicate_file,
     "late-file": late_file,
+    "truncated-file": truncated_file,
 }

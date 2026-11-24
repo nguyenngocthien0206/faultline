@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help install lint fmt test test-integration check clean ref-up ref-down ref-ps ref-logs
+.PHONY: help install lint fmt test test-integration check clean ref-up ref-down ref-clean ref-ps ref-logs
 
 COMPOSE := docker compose -f reference/docker-compose.yml
 
@@ -29,13 +29,13 @@ INTEGRATION_MARKS_hardened := integration and hardened
 
 # WORKERS pytest-xdist processes share the suite; a test class (or a module
 # outside classes) is the unit one worker takes (tests/reference/conftest.py).
-# Keep WORKERS at least the number of units (12 today): xdist queues a second
+# Keep WORKERS at least the number of units (14 today): xdist queues a second
 # unit on a worker that has two tests or fewer left, so with fewer workers one
 # seven-run experiment can wait behind another. With fewer, units start in
 # file order (--no-loadscope-reorder), which puts the long ones first.
 # On Docker Desktop with 16 CPUs, nine concurrent runs take about 1.75 times
 # as long as one alone. WORKERS=0 runs everything in one process, in order.
-WORKERS ?= 12
+WORKERS ?= 14
 
 test-integration: ## Run the tests against the reference stack (start it with ref-up)
 	$(if $(filter-out naive hardened,$(EDITION)),$(error EDITION must be naive or hardened, not '$(EDITION)'))
@@ -58,6 +58,12 @@ ref-up: reference/.env ## Build and start the reference stack, wait until it is 
 
 ref-down: reference/.env ## Stop the reference stack and delete its volumes
 	$(COMPOSE) down -v
+
+# Sandboxes remove themselves; this sweeps up what crashes and interrupted tests
+# left behind (fl_* only, in the bucket, the source and the warehouse). Refuses
+# while the stack is in use or was in the last ten minutes; FORCE=1 overrides.
+ref-clean: reference/.env ## Delete leftover sandboxes (fl_*) from the reference stack
+	uv run faultline clean $(if $(FORCE),--force)
 
 ref-ps: reference/.env ## Show the reference stack services
 	$(COMPOSE) ps -a

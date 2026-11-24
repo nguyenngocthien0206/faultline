@@ -8,13 +8,15 @@ look clean (silver keeps the latest state per order), but order lines and
 payments are there twice and gold counts day 2 twice. Rerunning day 3 appends
 everything once more. Every run is green: SILENT_CORRUPTION.
 
-Hardened: bronze still holds the copies, but silver keeps one row per key and
-gold reads final states, so consumers see exactly the clean numbers: PASS,
-without a ledger of loaded files (every POS table has a key).
+Hardened: the copies are in no load manifest, so bronze refuses day 3 and the
+run fails, loudly; day 4's lag window reads day 3's rows again from the source,
+and silver keeps one row per key, so consumers see exactly the clean numbers:
+PASS, with the red run as the notice. No ledger of loaded files is needed.
 
 Each edition is its own class, the unit pytest-xdist schedules.
 """
 
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -44,6 +46,10 @@ def _run(edition: Edition, work_dir: Path) -> ExperimentResult:
     return result
 
 
+def _failed(result: ExperimentResult, phase: str) -> list:
+    return [(d, r) for d, r in result.runs[phase] if r.status is RunStatus.FAILED]
+
+
 def _all_green(result: ExperimentResult) -> bool:
     return all(r.status is RunStatus.SUCCEEDED for runs in result.runs.values() for _, r in runs)
 
@@ -68,11 +74,15 @@ class TestNaive:
 
 @pytest.mark.hardened
 class TestHardened:
-    def test_absorbs_the_resent_files(self, stack: Stack, tmp_path: Path) -> None:
+    def test_refuses_the_resent_files_and_keeps_the_numbers(
+        self, stack: Stack, tmp_path: Path
+    ) -> None:
         result = _run(Edition.HARDENED, tmp_path)
 
         assert result.outcome is Outcome.PASS, result.render()
         for prop in result.properties:
             assert prop.at_f.holds, prop.at_f.evidence
             assert prop.at_r.holds, prop.at_r.evidence
-        assert _all_green(result)
+        failed = _failed(result, "fault phase")
+        assert [day for day, _ in failed] == [date(2026, 11, 3)]  # the day the copies sit in
+        assert all(any("stray file" in e for e in r.errors) for _, r in failed)

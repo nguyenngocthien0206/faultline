@@ -1,4 +1,4 @@
-"""The reference adapter's landing files and run stages, on the real stack."""
+"""The reference adapter's landing files, run stages and cleanup, on the real stack."""
 
 from datetime import date
 from pathlib import Path
@@ -7,7 +7,9 @@ import pytest
 from reference_stack import Stack, reference_config
 
 from faultline.adapters.base import RunRequest, Stage
-from faultline.adapters.reference import ReferenceAdapter
+from faultline.adapters.reference import ReferenceAdapter, clean_reference_stack
+from faultline.connectors.s3 import LandingBucket
+from faultline.connectors.workspace import new_workspace_name
 from faultline.datagen import DatasetSpec
 from faultline.runner import generate_truth
 
@@ -52,3 +54,29 @@ def test_ingest_lands_the_files_and_load_builds_the_tables(stack: Stack, tmp_pat
 
         adapter.delete_landing_file("pos/order_items", day, lines)
         assert adapter.landing_files("pos/order_items", day) == []
+
+
+def test_clean_removes_a_leftover_sandbox_everywhere_and_nothing_else(stack: Stack) -> None:
+    config = reference_config()
+    bucket = LandingBucket(
+        config.s3_url, access_key=config.s3_access_key, secret_key=config.s3_secret_key
+    )
+    leftover, alive = new_workspace_name(), new_workspace_name()
+    for name in (leftover, alive):
+        stack.source.create_workspace(name)
+        stack.clickhouse.command(f"CREATE DATABASE {name}")
+        bucket.put(f"{name}/pos/orders/dt=2026-11-01/x.parquet", b"left behind")
+    try:
+        # force: the rest of the suite runs alongside, so the stack is never quiet;
+        # only: never touch the other tests' live sandboxes.
+        report = clean_reference_stack(config, force=True, only={leftover})
+
+        assert (report.landing, report.source, report.warehouse) == ((leftover,),) * 3
+        assert leftover not in bucket.list_workspaces()
+        assert leftover not in stack.source.list_workspaces()
+        assert leftover not in stack.clickhouse.list_workspaces()
+        for names in (bucket.list_workspaces(), stack.source.list_workspaces()):
+            assert alive in names
+        assert alive in stack.clickhouse.list_workspaces()
+    finally:
+        clean_reference_stack(config, force=True, only={alive})

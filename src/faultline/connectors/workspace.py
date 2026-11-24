@@ -23,6 +23,10 @@ def new_workspace_name() -> str:
     return f"fl_{secrets.token_hex(4)}"
 
 
+def is_workspace_name(name: str) -> bool:
+    return WORKSPACE_PATTERN.fullmatch(name) is not None
+
+
 def validate_workspace_name(name: str) -> str:
     """Return `name` unchanged if it is a faultline workspace, else raise."""
     if not WORKSPACE_PATTERN.fullmatch(name):

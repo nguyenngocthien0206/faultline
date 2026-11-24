@@ -10,6 +10,7 @@ No `from __future__ import annotations` in Dagster code (see smoke.py).
 """
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import dlt
@@ -45,9 +46,21 @@ DBT_PROJECT = DbtProject(project_dir=Path(__file__).resolve().parent.parent / "d
 # ------------------------------------------------------------------ extract
 
 
+@dataclass(frozen=True)
+class Extract:
+    """What one dlt load put in the landing zone: rows per table, and its id.
+
+    dlt names every file it writes `<load_id>.<file_id>.<ext>`, so the id
+    tells which files a load wrote.
+    """
+
+    rows: dict[str, int]
+    load_id: str | None  # None: nothing new, no load, no files
+
+
 def extract_to_landing(
     context: AssetExecutionContext, workspace: Workspace, *, lag_seconds: float | None = None
-) -> dict[str, int]:
+) -> Extract:
     """dlt: rows past each table's cursor, as Parquet under dt=<partition>.
 
     `lag_seconds` steps the start of the window back from the stored cursor, so
@@ -75,7 +88,12 @@ def extract_to_landing(
     pipeline.run(source, loader_file_format="parquet")
     counts = pipeline.last_trace.last_normalize_info.row_counts
     context.log.info(f"extracted {counts}")
-    return {table: int(counts.get(table, 0)) for table in POS_TABLES}
+    load_info = pipeline.last_trace.last_load_info
+    load_ids = list(load_info.loads_ids) if load_info else []
+    return Extract(
+        rows={table: int(counts.get(table, 0)) for table in POS_TABLES},
+        load_id=load_ids[-1] if load_ids else None,
+    )
 
 
 @multi_asset(
@@ -84,8 +102,8 @@ def extract_to_landing(
 )
 def pos_landing(context: AssetExecutionContext, workspace: Workspace):
     """Naive: dlt's default incremental cursor, no lag window."""
-    counts = extract_to_landing(context, workspace)
-    for table, rows in counts.items():
+    extract = extract_to_landing(context, workspace)
+    for table, rows in extract.rows.items():
         yield MaterializeResult(asset_key=f"landing_{table}", metadata={"rows": rows})
 
 

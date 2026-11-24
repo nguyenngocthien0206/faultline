@@ -11,8 +11,11 @@ A plain run does both. The mode plays the two reference editions:
 
     append  no look back at the source, every file loaded as it comes, order
             lines appended                                    -> naive
-    keyed   the extract re-reads the last three days, and one row per key
-            survives, latest version wins                     -> hardened
+    keyed   the extract re-reads the last three days, one row per key
+            survives, latest version wins, and every load is checked
+            against the extract's manifest (stray file, missing file,
+            fewer rows than promised: that dataset is not loaded and the
+            run fails)                                        -> hardened
 
 Orders are kept as latest state per order in both modes (as both editions
 do), so damage shows in the order lines, where a uniqueness check on orders
@@ -59,6 +62,7 @@ class FakeFilePlatform(Adapter):
         self.cursor: date | None = None  # last delivered day already extracted
         self.files: dict[tuple[str, date, str], bytes] = {}
         self.extracts = 0
+        self.manifest: dict[tuple[str, date], dict[str, int]] = {}  # promised rows per file
         self.orders: dict[str, dict[str, str]] = {}
         self.lines: list[dict[str, str]] = []
 
@@ -90,8 +94,11 @@ class FakeFilePlatform(Adapter):
     def run(self, request: RunRequest) -> RunResult:
         if request.stage in (None, Stage.INGEST):
             self._ingest(request.partition)
+        problems = []
         if request.stage in (None, Stage.LOAD):
-            self._load(request.partition)
+            problems = self._load(request.partition)
+        if problems:
+            return RunResult(RunStatus.FAILED, errors=tuple(problems))
         return RunResult(RunStatus.SUCCEEDED)
 
     def _ingest(self, partition: date) -> None:
@@ -110,13 +117,21 @@ class FakeFilePlatform(Adapter):
                 writer.writerows(rows)
                 name = f"extract-{self.extracts}.csv"
                 self.files[dataset, partition, name] = out.getvalue().encode("utf-8")
+                self.manifest.setdefault((dataset, partition), {})[name] = len(rows)
         delivered = [day for by_day in self.source.values() for day in by_day]
         if delivered:
             self.cursor = max(delivered)
 
-    def _load(self, partition: date) -> None:
+    def _load(self, partition: date) -> list[str]:
+        problems: list[str] = []
         for dataset in DATASETS:
-            for file in self.landing_files(dataset, partition):
+            found = self.landing_files(dataset, partition)
+            if self.mode == "keyed":
+                wrong = self._reconcile(dataset, partition, found)
+                if wrong:
+                    problems += wrong
+                    continue  # this dataset's day stays as it was
+            for file in found:
                 text = self.files[dataset, partition, file].decode("utf-8")
                 rows = list(csv.DictReader(io.StringIO(text)))
                 if dataset == "pos/orders":
@@ -129,6 +144,19 @@ class FakeFilePlatform(Adapter):
         if self.mode == "keyed":
             latest = {(r["order_id"], r["line_no"]): r for r in self.lines}
             self.lines = list(latest.values())
+        return problems
+
+    def _reconcile(self, dataset: str, partition: date, found: list[str]) -> list[str]:
+        promised = self.manifest.get((dataset, partition), {})
+        problems = [f"{dataset}: stray file {f}" for f in found if f not in promised]
+        for file, rows in promised.items():
+            if file not in found:
+                problems.append(f"{dataset}: file {file} is missing")
+                continue
+            held = self.files[dataset, partition, file].decode("utf-8").count("\n") - 1
+            if held != rows:
+                problems.append(f"{dataset}: {file} promised {rows} rows, holds {held}")
+        return problems
 
     def snapshot(self, table: str, dest: Path) -> Path:
         if table == "silver_orders":

@@ -1,8 +1,10 @@
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from faultline import __version__
+from faultline.adapters.reference import CleanReport, StackBusyError
 from faultline.cli import app
 
 runner = CliRunner()
@@ -108,3 +110,49 @@ def test_run_accepts_a_lag_window_on_hardened(tmp_path: Path) -> None:
 
     assert result.exit_code == 2
     assert "make ref-up" in result.output
+
+
+def test_clean_explains_a_missing_stack(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["clean", "--stack-env", str(tmp_path / ".env")])
+
+    assert result.exit_code == 2
+    assert "make ref-up" in result.output
+
+
+def _env_file(tmp_path: Path) -> Path:
+    env = tmp_path / ".env"
+    example = Path(__file__).resolve().parents[1] / "reference" / ".env.example"
+    env.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
+    return env
+
+
+def test_clean_refuses_a_busy_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def busy(config: object, *, force: bool) -> None:
+        assert not force
+        raise StackBusyError("a Dagster run is in progress")
+
+    monkeypatch.setattr("faultline.adapters.reference.clean_reference_stack", busy)
+
+    result = runner.invoke(app, ["clean", "--stack-env", str(_env_file(tmp_path))])
+
+    assert result.exit_code == 1
+    assert "Not cleaning: a Dagster run is in progress" in result.output
+    assert "--force" in result.output
+
+
+def test_clean_reports_what_it_removed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[bool] = []
+
+    def cleaned(config: object, *, force: bool) -> CleanReport:
+        seen.append(force)
+        return CleanReport(landing=("fl_00000001", "fl_00000002"), source=("fl_00000001",))
+
+    monkeypatch.setattr("faultline.adapters.reference.clean_reference_stack", cleaned)
+
+    result = runner.invoke(app, ["clean", "--force", "--stack-env", str(_env_file(tmp_path))])
+
+    assert result.exit_code == 0, result.output
+    assert seen == [True]
+    assert result.output.strip() == (
+        "Removed 2 leftover sandboxes: 2 landing prefixes, 1 source schemas, 0 warehouse databases"
+    )

@@ -16,7 +16,13 @@ from faultline.adapters.base import (
     Stage,
 )
 from faultline.runner import execute
-from faultline.schedule import CopyLandingFiles, HoldLandingFiles, ReleaseLandingFiles, Run
+from faultline.schedule import (
+    CopyLandingFiles,
+    HoldLandingFiles,
+    ReleaseLandingFiles,
+    Run,
+    TruncateLandingFiles,
+)
 
 D2, D3 = date(2026, 11, 2), date(2026, 11, 3)
 
@@ -129,7 +135,7 @@ def test_held_files_skip_the_load_and_land_late_unchanged() -> None:
         "  [fault] run 2026-11-02 (ingest): SUCCEEDED",
         "  [fault] pos/order_items: 1 file(s) of 2026-11-02 held back",
         "  [fault] run 2026-11-02 (load): SUCCEEDED",
-        "  [fault] pos/order_items: 1 file(s) of 2026-11-02 landed late",
+        "  [fault] pos/order_items: 1 file(s) of 2026-11-02 put back in place",
     ]
 
 
@@ -151,3 +157,34 @@ def test_a_plain_run_covers_the_whole_partition() -> None:
 
     assert landing.requests == [RunRequest(D3)]
     assert lines == ["  [baseline] run 2026-11-03: SUCCEEDED"]
+
+
+def test_a_cut_file_is_shorter_and_a_later_release_brings_the_full_one_back() -> None:
+    landing = MemoryLanding()
+    full = b"order_id,qty\no1,1\no2,2\no3,3\no4,4\no5,5\n"
+    landing.files["pos/order_items", D3, "load-1.csv"] = full
+    held: dict[tuple[str, date], list[tuple[str, bytes]]] = {}
+    lines: list[str] = []
+
+    execute(
+        landing,
+        (TruncateLandingFiles("pos/order_items", D3, keep=0.6),),
+        lines.append,
+        "fault",
+        held,
+    )
+    cut = landing.files["pos/order_items", D3, "load-1.csv"]
+    # The recovery is another phase: the same store of held files carries the original over.
+    execute(landing, (ReleaseLandingFiles("pos/order_items", D3),), lines.append, "recovery", held)
+
+    assert cut == b"order_id,qty\no1,1\no2,2\no3,3\n"
+    assert landing.files["pos/order_items", D3, "load-1.csv"] == full
+    assert lines == [
+        "  [fault] pos/order_items: 1 file(s) of 2026-11-03 cut to 60% of their rows",
+        "  [recovery] pos/order_items: 1 file(s) of 2026-11-03 put back in place",
+    ]
+
+
+def test_cutting_nothing_is_an_error() -> None:
+    with pytest.raises(AdapterError, match="no landing files of pos/orders for 2026-11-02 to cut"):
+        execute(MemoryLanding(), (TruncateLandingFiles("pos/orders", D2),), print, "fault")

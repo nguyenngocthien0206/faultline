@@ -173,3 +173,38 @@ def run(
     typer.echo(result.render())
     if result.outcome is Outcome.ERROR:
         raise typer.Exit(code=1)
+
+
+@app.command()
+def clean(
+    stack_env: Annotated[
+        Path, typer.Option(help="Env file of the reference stack (created by `make ref-up`).")
+    ] = Path("reference/.env"),
+    force: Annotated[
+        bool, typer.Option(help="Clean even if the stack was used in the last ten minutes.")
+    ] = False,
+) -> None:
+    """Delete leftover sandboxes (fl_*) from the local reference stack.
+
+    A sandbox removes itself when an experiment ends; this sweeps up the ones
+    a crash or an interrupted test left in the bucket, the source or the warehouse.
+    """
+    from faultline.adapters.reference import (
+        StackBusyError,
+        clean_reference_stack,
+        config_from_env_file,
+    )
+
+    if not stack_env.exists():
+        typer.echo(f"Error: {stack_env} not found; start the stack with `make ref-up`", err=True)
+        raise typer.Exit(code=2)
+    try:
+        report = clean_reference_stack(config_from_env_file(stack_env), force=force)
+    except StackBusyError as exc:
+        typer.echo(f"Not cleaning: {exc}. Wait until nothing runs, or pass --force.", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        f"Removed {len(report.workspaces)} leftover sandboxes: "
+        f"{len(report.landing)} landing prefixes, {len(report.source)} source schemas, "
+        f"{len(report.warehouse)} warehouse databases"
+    )
