@@ -94,3 +94,10 @@ def test_failed_export_leaves_no_file_behind(stub: StubServer, tmp_path: Path) -
         client(stub).export_parquet("SELECT * FROM gold", dest)
 
     assert list(tmp_path.iterdir()) == []
+
+
+def test_only_workspace_databases_are_listed(stub: StubServer) -> None:
+    names = ["default", "system", "fl_0123abcd", "fl_xyz", "fl_00000001", "INFORMATION_SCHEMA"]
+    stub.reply(200, "\n".join(f'{{"name": "{n}"}}' for n in names))
+
+    assert client(stub).list_workspaces() == ["fl_00000001", "fl_0123abcd"]

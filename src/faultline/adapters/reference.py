@@ -12,6 +12,7 @@ tables, so one contract and one set of experiments serve both.
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
@@ -296,3 +297,87 @@ class ReferenceAdapter(Adapter):
         self.landing.delete_workspace(self.workspace)
         self.source.close()
         self._created = False
+
+
+# ------------------------------------------------------------------ cleanup
+
+QUIET_SECONDS = 600.0  # no run in progress, none finished in the last ten minutes
+
+
+class StackBusyError(RuntimeError):
+    """The stack is in use, so a sandbox that looks left over may still be alive."""
+
+
+@dataclass(frozen=True)
+class CleanReport:
+    landing: tuple[str, ...] = ()  # S3 prefixes deleted
+    source: tuple[str, ...] = ()  # Postgres schemas dropped
+    warehouse: tuple[str, ...] = ()  # ClickHouse databases dropped
+
+    @property
+    def workspaces(self) -> set[str]:
+        return {*self.landing, *self.source, *self.warehouse}
+
+
+def busy_reason(
+    active: bool, last_update: float | None, now: float, quiet: float = QUIET_SECONDS
+) -> str | None:
+    """Why the stack cannot be cleaned now, or None when it has been quiet long enough.
+
+    Between two runs a sandbox has no run in progress yet is very much alive
+    (it is delivering a day, or taking a snapshot), hence the quiet period.
+    """
+    if active:
+        return "a Dagster run is in progress"
+    if last_update is not None and now - last_update < quiet:
+        ago, period = (now - last_update) / 60, quiet / 60
+        return f"the last Dagster run changed {ago:.0f} min ago (quiet period {period:.0f} min)"
+    return None
+
+
+def clean_reference_stack(
+    config: ReferenceStackConfig,
+    *,
+    force: bool = False,
+    only: set[str] | None = None,
+    now: float | None = None,
+) -> CleanReport:
+    """Delete leftover sandboxes (fl_* only) from the landing bucket, source and warehouse.
+
+    A sandbox normally cleans up after itself; this is for the ones a crash,
+    an interrupted test or an older faultline left behind. Refuses while the
+    stack is in use unless `force`; `only` limits it to the given workspaces.
+    """
+
+    if not force:
+        dagster = DagsterClient(config.dagster_url, location=config.location)
+        active, last_update = dagster.activity()
+        reason = busy_reason(active, last_update, time.time() if now is None else now)
+        if reason:
+            raise StackBusyError(reason)
+
+    def chosen(names: list[str]) -> tuple[str, ...]:
+        return tuple(n for n in names if only is None or n in only)
+
+    landing = LandingBucket(
+        config.s3_url,
+        access_key=config.s3_access_key,
+        secret_key=config.s3_secret_key,
+        bucket=config.landing_bucket,
+    )
+    clickhouse = ClickHouseClient(
+        config.clickhouse_url, user=config.clickhouse_user, password=config.clickhouse_password
+    )
+    with SourceDatabase(config.source_dsn) as source:
+        report = CleanReport(
+            landing=chosen(landing.list_workspaces()),
+            source=chosen(source.list_workspaces()),
+            warehouse=chosen(clickhouse.list_workspaces()),
+        )
+        for name in report.landing:
+            landing.delete_workspace(name)
+        for name in report.source:
+            source.drop_workspace(name)
+    for name in report.warehouse:
+        clickhouse.drop_workspace(name)
+    return report

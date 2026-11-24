@@ -66,6 +66,18 @@ query FindRun($tags: [ExecutionTag!]) {
 }
 """
 
+_LATEST_RUN = """
+query LatestRun($statuses: [RunStatus!]) {
+  runsOrError(filter: {statuses: $statuses}, limit: 1) {
+    __typename
+    ... on Runs { results { runId status updateTime } }
+    ... on Error { message }
+  }
+}
+"""
+
+ACTIVE_STATUSES = ("QUEUED", "NOT_STARTED", "STARTING", "STARTED", "CANCELING")
+
 _RUN_STATUS = """
 query RunStatus($runId: ID!) {
   runOrError(runId: $runId) {
@@ -244,6 +256,19 @@ class DagsterClient:
             found = result["results"]
             return str(found[0]["runId"]) if found else None
         return None  # pragma: no cover - the loop always returns or raises
+
+    def activity(self) -> tuple[bool, float | None]:
+        """Whether any run is in progress, and when the latest run last changed (epoch s)."""
+
+        def latest(statuses: list[str] | None) -> dict[str, Any] | None:
+            result = self.execute(_LATEST_RUN, {"statuses": statuses})["runsOrError"]
+            if result["__typename"] != "Runs":
+                raise DagsterError(f"cannot list runs: {result.get('message')}")
+            return result["results"][0] if result["results"] else None
+
+        active = latest(list(ACTIVE_STATUSES)) is not None
+        last = latest(None)
+        return active, (float(last["updateTime"]) if last and last["updateTime"] else None)
 
     def run_status(self, run_id: str) -> str:
         result = self.execute(_RUN_STATUS, {"runId": run_id})["runOrError"]

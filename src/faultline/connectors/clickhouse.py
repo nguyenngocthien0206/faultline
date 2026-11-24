@@ -15,7 +15,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from faultline.connectors.workspace import validate_workspace_name
+from faultline.connectors.workspace import is_workspace_name, validate_workspace_name
 
 
 class ClickHouseError(Exception):
@@ -93,6 +93,11 @@ class ClickHouseClient:
         finally:
             partial.unlink(missing_ok=True)
         return dest
+
+    def list_workspaces(self) -> list[str]:
+        """Databases that are faultline workspaces, sorted."""
+        rows = self.query("SELECT name FROM system.databases")
+        return sorted(r["name"] for r in rows if is_workspace_name(r["name"]))
 
     def drop_workspace(self, name: str) -> None:
         """Drop the database of a faultline workspace. Refuses any other name."""

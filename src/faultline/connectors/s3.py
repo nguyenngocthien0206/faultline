@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from faultline.connectors.workspace import validate_workspace_name
+from faultline.connectors.workspace import is_workspace_name, validate_workspace_name
 
 
 def _boto3() -> Any:
@@ -76,6 +76,16 @@ class LandingBucket:
         """Delete one key, which must lie inside a workspace."""
         validate_workspace_name(key.split("/", 1)[0])
         self.client.delete_object(Bucket=self.bucket, Key=key)
+
+    def list_workspaces(self) -> list[str]:
+        """Top-level prefixes that are faultline workspaces, sorted."""
+        prefixes: set[str] = set()
+        pages = self.client.get_paginator("list_objects_v2").paginate(
+            Bucket=self.bucket, Delimiter="/"
+        )
+        for page in pages:
+            prefixes |= {p["Prefix"].rstrip("/") for p in page.get("CommonPrefixes", [])}
+        return sorted(p for p in prefixes if is_workspace_name(p))
 
     def delete_workspace(self, workspace: str) -> int:
         """Delete every key under `<workspace>/`. Returns how many were deleted."""

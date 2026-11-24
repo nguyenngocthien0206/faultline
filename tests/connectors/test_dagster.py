@@ -301,3 +301,25 @@ def test_every_launch_carries_its_own_tag(stub: StubServer) -> None:
         for r in stub.requests
     ]
     assert len(set(tags)) == 2
+
+
+def _runs(*runs: dict[str, object]) -> dict[str, object]:
+    return {"data": {"runsOrError": {"__typename": "Runs", "results": list(runs)}}}
+
+
+def test_activity_reports_a_run_in_progress_and_the_last_change(stub: StubServer) -> None:
+    stub.reply(200, _runs({"runId": "a", "status": "STARTED", "updateTime": 20.0}))
+    stub.reply(200, _runs({"runId": "a", "status": "STARTED", "updateTime": 20.0}))
+
+    assert client(stub).activity() == (True, 20.0)
+    statuses = stub.requests[0].json()["variables"]["statuses"]
+    assert "STARTED" in statuses
+    assert "SUCCESS" not in statuses
+    assert stub.requests[1].json()["variables"]["statuses"] is None  # any status
+
+
+def test_activity_of_an_unused_stack(stub: StubServer) -> None:
+    stub.reply(200, _runs())
+    stub.reply(200, _runs())
+
+    assert client(stub).activity() == (False, None)
