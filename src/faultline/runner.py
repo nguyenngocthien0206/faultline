@@ -55,7 +55,7 @@ from faultline.adapters.base import (
 )
 from faultline.datagen import DatasetSpec, generate
 from faultline.faults.base import Fault
-from faultline.faults.files import truncate
+from faultline.faults.files import rename_column, truncate
 from faultline.oracle.invariants import complete_keys, unique_keys
 from faultline.oracle.snapshot import snapshot_all
 from faultline.outcome import Outcome, classify, has_signal, worst
@@ -66,6 +66,7 @@ from faultline.schedule import (
     Deliver,
     HoldLandingFiles,
     ReleaseLandingFiles,
+    RenameLandingColumn,
     Run,
     Schedule,
     TruncateLandingFiles,
@@ -176,6 +177,13 @@ def execute(
                 f"  [{phase}] {action.dataset}: {len(files)} file(s) of {action.partition} "
                 f"cut to {action.keep:.0%} of their rows"
             )
+        elif isinstance(action, RenameLandingColumn):
+            files = rename_landing_column(adapter, action)
+            held[action.dataset, action.partition] = files
+            log(
+                f"  [{phase}] {action.dataset}: {len(files)} file(s) of {action.partition} "
+                f"had {action.old} renamed {action.new}"
+            )
         elif isinstance(action, ReleaseLandingFiles):
             files = held.pop((action.dataset, action.partition), None)
             if files is None:
@@ -223,6 +231,22 @@ def truncate_landing_files(
         originals.append((name, data))
         cut = truncate(name, data, action.keep)
         adapter.write_landing_file(action.dataset, action.partition, name, cut)
+    return originals
+
+
+def rename_landing_column(adapter: Adapter, action: RenameLandingColumn) -> list[tuple[str, bytes]]:
+    """Rename the column in every file, in place, under its own name; return the originals."""
+    names = adapter.landing_files(action.dataset, action.partition)
+    if not names:
+        raise AdapterError(
+            f"no landing files of {action.dataset} for {action.partition} to rename a column in"
+        )
+    originals = []
+    for name in names:
+        data = adapter.read_landing_file(action.dataset, action.partition, name)
+        originals.append((name, data))
+        edited = rename_column(name, data, action.old, action.new, move_to_end=action.move_to_end)
+        adapter.write_landing_file(action.dataset, action.partition, name, edited)
     return originals
 
 

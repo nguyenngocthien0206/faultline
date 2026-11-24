@@ -26,6 +26,14 @@ whose files hold another number of rows than it promised (a cut file still
 parses, so only the count gives it away). The run fails, loudly, and the day
 is left as it was until the files are right.
 
+Contract, the consumer's side of the deal. Bronze also checks every file's
+columns against the schema the platform expects (CONTRACTS), before loading:
+a missing column, an unexpected one, or one of another type refuses the day.
+The manifest cannot do that job: it is written by the producer, who may well
+mean the new schema. And ClickHouse would not complain either: it reads a
+file through the target table's structure, matching columns by name, so a
+renamed column is dropped and the expected one silently filled with zeros.
+
 Same ClickHouse table names as naive (a workspace runs one edition), different
 Dagster asset keys (prefix `hardened`), so both live in one code location.
 
@@ -145,6 +153,72 @@ def write_manifest(
     return {t: r for t, r in extract.rows.items() if r}
 
 
+# The columns each landing table must have, with the types ClickHouse reads
+# from dlt's Parquet. dlt's own bookkeeping (_dlt_*) and the hive partition
+# column taken from the path (dt) are not part of the deal.
+CONTRACTS: dict[str, dict[str, str]] = {
+    "orders": {
+        "order_id": "String",
+        "store_id": "String",
+        "member_id": "Nullable(String)",
+        "channel": "String",
+        "status": "String",
+        "ordered_at": "DateTime64(6, 'UTC')",
+        "updated_at": "DateTime64(6, 'UTC')",
+        "subtotal_vnd": "Int64",
+        "discount_vnd": "Int64",
+        "total_vnd": "Int64",
+        "promo_code": "Nullable(String)",
+        "item_count": "Int64",
+    },
+    "order_items": {
+        "order_id": "String",
+        "line_no": "Int64",
+        "item_id": "String",
+        "qty": "Int64",
+        "unit_price_vnd": "Int64",
+        "created_at": "DateTime64(6, 'UTC')",
+    },
+    "payments": {
+        "payment_id": "String",
+        "order_id": "String",
+        "kind": "String",
+        "method": "String",
+        "amount_vnd": "Int64",
+        "paid_at": "DateTime64(6, 'UTC')",
+    },
+}
+
+
+def _outside_the_contract(column: str) -> bool:
+    return column.startswith("_dlt_") or column == "dt"
+
+
+def breaches(clickhouse: ClickHouse, workspace: Workspace, table: str, dt: str) -> list[str]:
+    """How a day's landing files of `table` differ from its contract; empty if they do not."""
+    client = clickhouse.client()
+    folder = f"{workspace.name}/{LANDING_DATASET}/{table}/dt={dt}"
+    files = client.query(
+        f"SELECT DISTINCT _file FROM s3(landing_s3, filename = '{folder}/*.parquet', "
+        "format = 'One') SETTINGS s3_throw_on_zero_files_match = 0"
+    ).result_rows
+    expected = CONTRACTS[table]
+    problems = []
+    for (file,) in sorted(files):
+        described = client.query(
+            f"DESCRIBE s3(landing_s3, filename = '{folder}/{file}', format = 'Parquet')"
+        ).result_rows
+        found = {name: kind for name, kind, *_ in described if not _outside_the_contract(name)}
+        problems += [f"{file}: missing {c}" for c in expected if c not in found]
+        problems += [f"{file}: unexpected {c}" for c in found if c not in expected]
+        problems += [
+            f"{file}: {c} is {found[c]}, the contract says {kind}"
+            for c, kind in expected.items()
+            if c in found and found[c] != kind
+        ]
+    return problems
+
+
 def reconcile(clickhouse: ClickHouse, workspace: Workspace, table: str, dt: str) -> list[str]:
     """What is wrong with a day's landing files of `table` against its manifests; empty if none."""
     client = clickhouse.client()
@@ -196,7 +270,7 @@ def _bronze_asset(table: str):
     def _bronze(
         context: AssetExecutionContext, workspace: Workspace, clickhouse: ClickHouse
     ) -> MaterializeResult:
-        """Hardened: check the day's files against their manifest, rebuild the day, swap it in."""
+        """Hardened: check the day's files (manifest, contract), rebuild the day, swap it in."""
         dt = context.partition_key
         problems = reconcile(clickhouse, workspace, table, dt)
         if problems:
@@ -204,6 +278,13 @@ def _bronze_asset(table: str):
                 description=f"{table} on {dt}: landing files do not match their manifest: "
                 + "; ".join(problems),
                 metadata={"problems": problems},
+            )
+        drift = breaches(clickhouse, workspace, table, dt)
+        if drift:
+            raise Failure(
+                description=f"{table} on {dt}: landing files break the schema contract: "
+                + "; ".join(drift),
+                metadata={"problems": drift},
             )
         files, data_fn = landing_files(clickhouse, workspace, table, dt)
         if files == 0:  # dlt writes nothing when a table had no changes

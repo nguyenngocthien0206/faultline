@@ -6,7 +6,7 @@ faultline injects faults into ingestion and pipelines (duplicate files, late dat
 
 > **Warning:** faultline deliberately corrupts and deletes data. Point it only at disposable test or CI environments. A target must declare `environment: test` and `allow_destructive: true`, or faultline refuses to run.
 
-**Status:** early development. Four experiments, one at the source and three in the landing zone, run end to end against both editions of the bundled reference platform. See [docs/design.md](docs/design.md) for the design.
+**Status:** early development. Five experiments, one at the source and four in the landing zone, run end to end against both editions of the bundled reference platform. See [docs/design.md](docs/design.md) for the design.
 
 ## Try it
 
@@ -20,6 +20,7 @@ uv run faultline run pos-offline-sync --target hardened  # hardened edition
 uv run faultline run duplicate-file                      # a resent extract, about 4 minutes
 uv run faultline run late-file                           # a file that lands two days late
 uv run faultline run truncated-file                      # a file cut short, still well formed
+uv run faultline run column-rename                       # a file with a column renamed
 ```
 
 `pos-offline-sync` takes a store's till offline for two days. When it reconnects, its orders reach the source database with their real, older timestamps, behind the incremental cursor of the ingestion tool. On the reference platform's naive pipeline the result looks like this:
@@ -45,6 +46,8 @@ The hardened edition runs the same tools with established patterns: a lag window
 
 `truncated-file` is the quietest of the four: the last day's order lines file loses a fifth of its rows, cut on a row boundary, so it parses and every value in it is valid. Naive loads it and every run stays green; 27 lines are simply not there. Hardened now keeps a delivery note: each extract writes a small manifest next to its files (rows promised, files written), and bronze refuses a day whose files do not match it. Day 4's load fails with `load ... promised 424 rows, its files hold 339`, the full file is redelivered, the rerun reconciles, and the numbers are right: `DETECTED`, noticed and healed. The same note also catches the earlier faults on hardened, a stray resent copy or a missing late file, as red runs with the right numbers. A count only proves something when it comes from the side that sent the data, which is why the manifest sits where faults cannot reach it.
 
+`column-rename` renames one column of the last day's payments file, `amount_vnd` to `total_amount_vnd`. Naive's warehouse reads files by column name, finds `amount_vnd` missing and quietly fills it with zeros: every run green, every payment present, 84 of them worth nothing. The sales report does not move, since it is built from orders, so two official numbers for the same day now disagree by a fifth. The manifest cannot help here, because the producer writes it and may mean the new schema; hardened keeps its own schema contract instead, refuses the day on `missing amount_vnd; unexpected total_amount_vnd`, and loads it once the file comes back with the agreed schema: `DETECTED`. Who owns a schema change, and who has to be told, is exactly what that red run forces into the open.
+
 ## Development
 
 Requires [uv](https://docs.astral.sh/uv/) and GNU Make. The reference platform (Postgres, dlt, an S3 landing bucket, ClickHouse, dbt and Dagster) also needs Docker, for example Docker Desktop.
@@ -54,7 +57,7 @@ make install            # create .venv and install dependencies
 make check              # lint, format check and the tests that need no Docker
 
 make ref-up             # build and start the reference platform (first build takes a few minutes)
-make test-integration   # run the tests that drive the real platform (about 12 min on 14 parallel workers;
+make test-integration   # run the tests that drive the real platform (about 18 min on 16 parallel workers;
                         #   EDITION=naive|hardened for one half, WORKERS=0 for one process)
 make ref-clean          # delete leftover sandboxes (fl_*) once nothing runs; FORCE=1 to insist
 make ref-down           # stop it and delete its data

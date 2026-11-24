@@ -14,8 +14,12 @@ A plain run does both. The mode plays the two reference editions:
     keyed   the extract re-reads the last three days, one row per key
             survives, latest version wins, and every load is checked
             against the extract's manifest (stray file, missing file,
-            fewer rows than promised: that dataset is not loaded and the
-            run fails)                                        -> hardened
+            fewer rows than promised) and the schema contract (missing or
+            unexpected column): that dataset is not loaded and the run
+            fails                                             -> hardened
+
+Both read files by column name, as ClickHouse does: in append mode a column
+the file lacks is silently filled with 0.
 
 Orders are kept as latest state per order in both modes (as both editions
 do), so damage shows in the order lines, where a uniqueness check on orders
@@ -39,6 +43,7 @@ from faultline.adapters.base import (
     Stage,
     TableContract,
 )
+from faultline.datagen.pos import ORDER_COLUMNS, ORDER_ITEM_COLUMNS
 from faultline.sources.pos import day_files
 
 ORDERS = TableContract(
@@ -51,6 +56,7 @@ LINES = TableContract(
     truth_dataset="pos/order_items",
 )
 DATASETS = {"pos/orders": "orders", "pos/order_items": "order_items"}
+CONTRACTS = {"pos/orders": ORDER_COLUMNS, "pos/order_items": ORDER_ITEM_COLUMNS}
 LAG = timedelta(days=3)
 
 
@@ -133,7 +139,11 @@ class FakeFilePlatform(Adapter):
                     continue  # this dataset's day stays as it was
             for file in found:
                 text = self.files[dataset, partition, file].decode("utf-8")
-                rows = list(csv.DictReader(io.StringIO(text)))
+                expected = CONTRACTS[dataset]
+                rows = [
+                    {c: row.get(c, "0") for c in expected}  # by name; missing: a default
+                    for row in csv.DictReader(io.StringIO(text))
+                ]
                 if dataset == "pos/orders":
                     for row in rows:
                         current = self.orders.get(row["order_id"])
@@ -153,7 +163,12 @@ class FakeFilePlatform(Adapter):
             if file not in found:
                 problems.append(f"{dataset}: file {file} is missing")
                 continue
-            held = self.files[dataset, partition, file].decode("utf-8").count("\n") - 1
+            text = self.files[dataset, partition, file].decode("utf-8")
+            columns = text.splitlines()[0].split(",")  # csv writes \r\n line ends
+            expected = CONTRACTS[dataset]
+            problems += [f"{dataset}: {file} missing {c}" for c in expected if c not in columns]
+            problems += [f"{dataset}: {file} unexpected {c}" for c in columns if c not in expected]
+            held = text.count("\n") - 1
             if held != rows:
                 problems.append(f"{dataset}: {file} promised {rows} rows, holds {held}")
         return problems

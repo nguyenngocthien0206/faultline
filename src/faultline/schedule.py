@@ -2,7 +2,7 @@
 
 A schedule is the ordered list of things that happen to the platform: input
 arriving for a day, a run of a partition (or of one half of it), a landing
-file appearing again, held back, arriving late or cut short. Faults transform schedules
+file appearing again, held back, arriving late, cut short or renamed. Faults transform schedules
 (and the input they deliver), so an experiment can be printed, compared and
 tested without starting a platform.
 """
@@ -80,8 +80,30 @@ class TruncateLandingFiles:
     keep: float = 0.8
 
 
+@dataclass(frozen=True)
+class RenameLandingColumn:
+    """In `dataset`'s landing files of `partition`, column `old` is now called `new`.
+
+    Values and types stay; with `move_to_end` the column also moves last. The
+    originals are kept, so a ReleaseLandingFiles in the same sandbox puts the
+    files with the agreed schema back.
+    """
+
+    dataset: str
+    partition: date
+    old: str
+    new: str
+    move_to_end: bool = False
+
+
 Action = (
-    Deliver | Run | CopyLandingFiles | HoldLandingFiles | ReleaseLandingFiles | TruncateLandingFiles
+    Deliver
+    | Run
+    | CopyLandingFiles
+    | HoldLandingFiles
+    | ReleaseLandingFiles
+    | TruncateLandingFiles
+    | RenameLandingColumn
 )
 Schedule = tuple[Action, ...]
 

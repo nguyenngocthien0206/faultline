@@ -6,7 +6,7 @@ from collections.abc import Callable
 from datetime import timedelta
 
 from faultline.datagen.spec import DatasetSpec
-from faultline.faults.landing import DuplicateFile, LateFile, TruncatedFile
+from faultline.faults.landing import ColumnDrift, DuplicateFile, LateFile, TruncatedFile
 from faultline.faults.source import PosOfflineSync
 from faultline.properties.core import NoDataLoss, NoSilentCorruption
 from faultline.runner import Experiment
@@ -87,9 +87,24 @@ def truncated_file(spec: DatasetSpec) -> Experiment:
     )
 
 
+def column_rename(spec: DatasetSpec) -> Experiment:
+    """The last day's payments file arrives with amount_vnd renamed total_amount_vnd."""
+    return Experiment(
+        name="column-rename",
+        description=(
+            "One file of the last day's extract (the payments) arrives with a column renamed, "
+            "amount_vnd to total_amount_vnd. Recovery redelivers it with the agreed schema."
+        ),
+        spec=spec,
+        faults=(ColumnDrift(partition=spec.end_date),),
+        properties=(NoDataLoss(), NoSilentCorruption()),
+    )
+
+
 BUILTIN: dict[str, Callable[[DatasetSpec], Experiment]] = {
     "pos-offline-sync": pos_offline_sync,
     "duplicate-file": duplicate_file,
     "late-file": late_file,
     "truncated-file": truncated_file,
+    "column-rename": column_rename,
 }
