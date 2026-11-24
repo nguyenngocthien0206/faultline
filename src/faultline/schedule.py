@@ -29,6 +29,7 @@ class Run:
 
     partition: date
     stage: Stage | None = None  # None: ingest and load together, as every day
+    failpoint: str | None = None  # die at this named point (adapter.run's failpoint)
 
 
 @dataclass(frozen=True)

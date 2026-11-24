@@ -62,6 +62,7 @@ from dagster import (
 from dagster_dbt import DagsterDbtTranslator, DbtCliResource, DbtProject, dbt_assets
 from pydantic import Field
 
+from coffee_platform.failpoints import failpoint
 from coffee_platform.partitions import daily
 from coffee_platform.pos import (
     LANDING_DATASET,
@@ -109,6 +110,7 @@ def hardened_pos_landing(
     extract = extract_to_landing(context, workspace, lag_seconds=lag_seconds)
     written = write_manifest(clickhouse, workspace, context.partition_key, extract)
     context.log.info(f"manifest: {written}")
+    failpoint(context, "after_landing")  # files and manifest landed, nothing loaded
     for table, rows in extract.rows.items():
         yield MaterializeResult(
             asset_key=AssetKey([PREFIX, f"landing_{table}"]),

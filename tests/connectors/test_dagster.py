@@ -323,3 +323,18 @@ def test_activity_of_an_unused_stack(stub: StubServer) -> None:
     stub.reply(200, _runs())
 
     assert client(stub).activity() == (False, None)
+
+
+def _messages(*messages: str) -> dict[str, object]:
+    events = [{"__typename": "LogMessageEvent", "message": m} for m in messages]
+    events.append({"__typename": "RunFailureEvent", "message": "marked as failed"})
+    return {"data": {"logsForRun": {"__typename": "EventConnection", "events": events}}}
+
+
+def test_run_logged_finds_a_line_in_the_event_log(stub: StubServer) -> None:
+    stub.reply(200, _messages("extracted 3 rows", "faultline failpoint reached: after_landing"))
+    stub.reply(200, _messages("extracted 3 rows"))
+
+    assert client(stub).run_logged("r1", "faultline failpoint reached: after_landing")
+    assert not client(stub).run_logged("r1", "faultline failpoint reached: after_landing")
+    assert stub.requests[0].json()["variables"] == {"runId": "r1"}

@@ -7,7 +7,8 @@ day's POS rows (orders, order lines) to a source. A run has two stages:
             under the run's partition of an in-memory landing zone
     load    load every landing file of that partition (and only that one)
 
-A plain run does both. The mode plays the two reference editions:
+A plain run does both; a run asked to crash "after_landing" stops between
+them (INTERRUPTED). The mode plays the two reference editions:
 
     append  no look back at the source, every file loaded as it comes, order
             lines appended                                    -> naive
@@ -81,6 +82,7 @@ class FakeFilePlatform(Adapter):
                 Capability.CONCURRENT_SANDBOXES,
                 Capability.LANDING_FILES,
                 Capability.RUN_STAGES,
+                Capability.FAILPOINTS,
             }
         )
         return Capabilities(features, (ORDERS, LINES))
@@ -100,6 +102,8 @@ class FakeFilePlatform(Adapter):
     def run(self, request: RunRequest) -> RunResult:
         if request.stage in (None, Stage.INGEST):
             self._ingest(request.partition)
+            if request.failpoint == "after_landing":
+                return RunResult(RunStatus.INTERRUPTED)  # landed, cursor saved, nothing loaded
         problems = []
         if request.stage in (None, Stage.LOAD):
             problems = self._load(request.partition)
