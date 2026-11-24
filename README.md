@@ -6,7 +6,7 @@ faultline injects faults into ingestion and pipelines (duplicate files, late dat
 
 > **Warning:** faultline deliberately corrupts and deletes data. Point it only at disposable test or CI environments. A target must declare `environment: test` and `allow_destructive: true`, or faultline refuses to run.
 
-**Status:** early development. Five experiments, one at the source and four in the landing zone, run end to end against both editions of the bundled reference platform. See [docs/design.md](docs/design.md) for the design.
+**Status:** early development. Six experiments, one at the source, four in the landing zone and one during execution, run end to end against both editions of the bundled reference platform. See [docs/design.md](docs/design.md) for the design.
 
 ## Try it
 
@@ -21,6 +21,7 @@ uv run faultline run duplicate-file                      # a resent extract, abo
 uv run faultline run late-file                           # a file that lands two days late
 uv run faultline run truncated-file                      # a file cut short, still well formed
 uv run faultline run column-rename                       # a file with a column renamed
+uv run faultline run crash-after-landing                 # a run killed between landing and loading
 ```
 
 `pos-offline-sync` takes a store's till offline for two days. When it reconnects, its orders reach the source database with their real, older timestamps, behind the incremental cursor of the ingestion tool. On the reference platform's naive pipeline the result looks like this:
@@ -48,6 +49,8 @@ The hardened edition runs the same tools with established patterns: a lag window
 
 `column-rename` renames one column of the last day's payments file, `amount_vnd` to `total_amount_vnd`. Naive's warehouse reads files by column name, finds `amount_vnd` missing and quietly fills it with zeros: every run green, every payment present, 84 of them worth nothing. The sales report does not move, since it is built from orders, so two official numbers for the same day now disagree by a fifth. The manifest cannot help here, because the producer writes it and may mean the new schema; hardened keeps its own schema contract instead, refuses the day on `missing amount_vnd; unexpected total_amount_vnd`, and loads it once the file comes back with the agreed schema: `DETECTED`. Who owns a schema change, and who has to be told, is exactly what that red run forces into the open.
 
+`crash-after-landing` is the first execution fault: day 2's run is killed, hard (`os._exit`, nothing cleaned up), right after ingestion landed its files and saved its cursor, before anything was loaded. The platform dies at a named failpoint and logs the fact first, so faultline can tell its own crash from a real failure. On naive the whole of day 2 goes missing while days 3 and 4 run green: the cursor lives with the landing files, the data was meant for the warehouse, and the crash left the first ahead of the second. The red run in Dagster says a process died, not that a day of sales is gone, so the verdict is `SILENT_CORRUPTION`. Rerunning the day fixes it, if someone knows to. Hardened passes: its lag window reads the day again on the next run.
+
 ## Development
 
 Requires [uv](https://docs.astral.sh/uv/) and GNU Make. The reference platform (Postgres, dlt, an S3 landing bucket, ClickHouse, dbt and Dagster) also needs Docker, for example Docker Desktop.
@@ -57,7 +60,7 @@ make install            # create .venv and install dependencies
 make check              # lint, format check and the tests that need no Docker
 
 make ref-up             # build and start the reference platform (first build takes a few minutes)
-make test-integration   # run the tests that drive the real platform (about 18 min on 16 parallel workers;
+make test-integration   # run the tests that drive the real platform (about 18 min on 18 parallel workers;
                         #   EDITION=naive|hardened for one half, WORKERS=0 for one process)
 make ref-clean          # delete leftover sandboxes (fl_*) once nothing runs; FORCE=1 to insist
 make ref-down           # stop it and delete its data
