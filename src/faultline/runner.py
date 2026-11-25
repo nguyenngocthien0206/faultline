@@ -69,6 +69,7 @@ from faultline.schedule import (
     RenameLandingColumn,
     Run,
     Schedule,
+    Snapshot,
     TruncateLandingFiles,
     clean_schedule,
 )
@@ -146,19 +147,36 @@ class ExperimentResult:
 Held = dict[tuple[str, date], list[tuple[str, bytes]]]  # (dataset, partition) -> files
 
 
+Marks = dict[str, dict[str, Path]]  # snapshot name -> table -> Parquet file
+
+
 def execute(
-    adapter: Adapter, schedule: Schedule, log: Log, phase: str, held: Held | None = None
+    adapter: Adapter,
+    schedule: Schedule,
+    log: Log,
+    phase: str,
+    held: Held | None = None,
+    *,
+    marks: Marks | None = None,
+    work_dir: Path | None = None,
 ) -> RunLog:
     """Carry out a schedule on one sandbox.
 
     `held` keeps files taken out of the landing zone (held back, or the
     originals of cut files) for a later release; pass the same one to every
     phase of a sandbox so that a heal can put back what the fault removed.
+    `marks` collects the snapshots a Snapshot action takes, under `work_dir`.
     """
     runs: list[tuple[date, RunResult]] = []
     held = {} if held is None else held
+    marks = {} if marks is None else marks
     for action in schedule:
-        if isinstance(action, Deliver):
+        if isinstance(action, Snapshot):
+            if work_dir is None:
+                raise ValueError(f"snapshot {action.name!r} needs a work directory")
+            marks[action.name] = snapshot_all(adapter, work_dir / f"mark_{action.name}")
+            log(f"  [{phase}] snapshot {action.name!r}")
+        elif isinstance(action, Deliver):
             adapter.deliver(action.day)
         elif isinstance(action, Run):
             request = RunRequest(action.partition, action.stage, action.failpoint)
@@ -366,11 +384,21 @@ def _fault_phases(
     fault took away (the full version of a cut file, say).
     """
     held: Held = {}
+    fault_marks: Marks = {}
     with adapter as sandbox:
-        fault_runs = execute(sandbox, plan.schedule, log, "fault", held)
-        at_f = Checkpoint("F", snapshot_all(sandbox, work_dir / "checkpoint_F"), fault_runs)
-        recovery_runs = execute(sandbox, plan.recovery, log, "recovery", held)
-        at_r = Checkpoint("R", snapshot_all(sandbox, work_dir / "checkpoint_R"), recovery_runs)
+        fault_runs = execute(
+            sandbox, plan.schedule, log, "fault", held, marks=fault_marks, work_dir=work_dir
+        )
+        at_f = Checkpoint(
+            "F", snapshot_all(sandbox, work_dir / "checkpoint_F"), fault_runs, fault_marks
+        )
+        recovery_marks: Marks = {"F": at_f.snapshots}
+        recovery_runs = execute(
+            sandbox, plan.recovery, log, "recovery", held, marks=recovery_marks, work_dir=work_dir
+        )
+        at_r = Checkpoint(
+            "R", snapshot_all(sandbox, work_dir / "checkpoint_R"), recovery_runs, recovery_marks
+        )
     return at_f, at_r
 
 

@@ -2,7 +2,8 @@
 
 A schedule is the ordered list of things that happen to the platform: input
 arriving for a day, a run of a partition (or of one half of it), a landing
-file appearing again, held back, arriving late, cut short or renamed. Faults transform schedules
+file appearing again, held back, arriving late, cut short or renamed, and
+the moments worth a snapshot in between. Faults transform schedules
 (and the input they deliver), so an experiment can be printed, compared and
 tested without starting a platform.
 """
@@ -97,6 +98,17 @@ class RenameLandingColumn:
     move_to_end: bool = False
 
 
+@dataclass(frozen=True)
+class Snapshot:
+    """The consumer tables are snapshotted here, under `name`, as a reader would see them.
+
+    For properties about what happens during a phase rather than at its end,
+    such as rows that vanish for a while around a crash.
+    """
+
+    name: str
+
+
 Action = (
     Deliver
     | Run
@@ -105,6 +117,7 @@ Action = (
     | ReleaseLandingFiles
     | TruncateLandingFiles
     | RenameLandingColumn
+    | Snapshot
 )
 Schedule = tuple[Action, ...]
 

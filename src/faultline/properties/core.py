@@ -55,3 +55,43 @@ class NoSilentCorruption(Property):
             if not d.is_empty:
                 evidence.append(d.summary())
         return PropertyResult(self.name, checkpoint.name, not evidence, tuple(evidence))
+
+
+class NoVanishingRows(Property):
+    """A row a reader could see does not disappear while the platform works on it.
+
+    Refreshing a table replaces rows; it never has to take one away first. A
+    refresh in two steps (delete, then insert) that dies between them leaves
+    readers with rows gone that were there a moment before; one that builds the
+    new data aside and swaps it in does not. No baseline is needed, so the
+    check holds on a clean run by construction.
+
+    At F it compares the snapshots named `before` and `after` (taken around
+    the fault, by Snapshot actions); at R, the end of the fault phase with the
+    end of recovery. A row whose values changed has not vanished; one whose
+    key is gone has.
+    """
+
+    name: ClassVar[str] = "no_vanishing_rows"
+
+    def __init__(self, before: str = "before_crash", after: str = "after_crash") -> None:
+        self.before = before
+        self.after = after
+
+    def check(self, ctx: PropertyContext, checkpoint: Checkpoint) -> PropertyResult:
+        if checkpoint.name == "R":
+            first, then = checkpoint.marks["F"], checkpoint.snapshots
+        else:
+            missing = {self.before, self.after} - set(checkpoint.marks)
+            if missing:
+                raise ValueError(
+                    f"no snapshot named {', '.join(sorted(missing))} at {checkpoint.name}"
+                )
+            first, then = checkpoint.marks[self.before], checkpoint.marks[self.after]
+        evidence = []
+        for contract in ctx.contracts:
+            d = diff(first[contract.name], then[contract.name], contract)
+            if vanished := d.counts["missing"]:
+                examples = ", ".join(d.samples["missing"])
+                evidence.append(f"{contract.name}: {vanished:,} keys vanished, e.g. {examples}")
+        return PropertyResult(self.name, checkpoint.name, not evidence, tuple(evidence))

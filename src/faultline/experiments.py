@@ -6,10 +6,10 @@ from collections.abc import Callable
 from datetime import timedelta
 
 from faultline.datagen.spec import DatasetSpec
-from faultline.faults.execution import CrashAfterLanding
+from faultline.faults.execution import CrashAfterLanding, CrashMidWrite
 from faultline.faults.landing import ColumnDrift, DuplicateFile, LateFile, TruncatedFile
 from faultline.faults.source import PosOfflineSync
-from faultline.properties.core import NoDataLoss, NoSilentCorruption
+from faultline.properties.core import NoDataLoss, NoSilentCorruption, NoVanishingRows
 from faultline.runner import Experiment
 
 
@@ -118,6 +118,28 @@ def crash_after_landing(spec: DatasetSpec) -> Experiment:
     )
 
 
+def crash_mid_write(spec: DatasetSpec) -> Experiment:
+    """Day 3's run dies inside the gold refresh, after the delete, before the insert.
+
+    Day 3, not day 2: a refresh only rewrites the keys its new data touches,
+    and day 3 is the first extract to touch an older day (refunds of day 1
+    orders). Crash on a day that only touches itself and the vanished rows
+    are new ones a reader never saw.
+    """
+    if spec.days < 3:
+        raise ValueError("crash-mid-write needs at least 3 days of data")
+    return Experiment(
+        name="crash-mid-write",
+        description=(
+            "The run of day 3 is killed, hard, in the middle of refreshing the gold sales "
+            "table: the old rows of the days it touches are out, the new ones not yet in."
+        ),
+        spec=spec,
+        faults=(CrashMidWrite(partition=spec.start_date + timedelta(days=2)),),
+        properties=(NoDataLoss(), NoSilentCorruption(), NoVanishingRows()),
+    )
+
+
 BUILTIN: dict[str, Callable[[DatasetSpec], Experiment]] = {
     "pos-offline-sync": pos_offline_sync,
     "duplicate-file": duplicate_file,
@@ -125,4 +147,5 @@ BUILTIN: dict[str, Callable[[DatasetSpec], Experiment]] = {
     "truncated-file": truncated_file,
     "column-rename": column_rename,
     "crash-after-landing": crash_after_landing,
+    "crash-mid-write": crash_mid_write,
 }

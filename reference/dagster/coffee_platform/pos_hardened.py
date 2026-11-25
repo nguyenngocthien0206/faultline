@@ -40,7 +40,6 @@ Dagster asset keys (prefix `hardened`), so both live in one code location.
 No `from __future__ import annotations` in Dagster code (see smoke.py).
 """
 
-import json
 from collections.abc import Mapping
 from datetime import timedelta
 from pathlib import Path
@@ -69,6 +68,7 @@ from coffee_platform.pos import (
     POS_TABLES,
     Extract,
     bronze_select,
+    build_with_dbt,
     extract_to_landing,
     landing_files,
 )
@@ -341,8 +341,7 @@ class HardenedTranslator(DagsterDbtTranslator):
 def hardened_pos_dbt(
     context: AssetExecutionContext, dbt_hardened: DbtCliResource, workspace: Workspace
 ):
-    dbt_vars = {"workspace": workspace.name, "dt": context.partition_key}
-    yield from dbt_hardened.cli(["build", "--vars", json.dumps(dbt_vars)], context=context).stream()
+    yield from build_with_dbt(context, dbt_hardened, workspace)
 
 
 # In-process executor, for the same reason as naive's pos_daily.

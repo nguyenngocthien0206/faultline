@@ -7,7 +7,7 @@ import pytest
 from faultline.adapters.base import RunResult, RunStatus, TableContract
 from faultline.datagen.writer import write_landing_file
 from faultline.properties.base import Checkpoint, PropertyContext
-from faultline.properties.core import NoDataLoss, NoSilentCorruption
+from faultline.properties.core import NoDataLoss, NoSilentCorruption, NoVanishingRows
 
 ORDERS = TableContract(
     "silver_orders", key=("order_id",), measures=("total_vnd",), truth_dataset="pos/orders"
@@ -103,3 +103,48 @@ def test_a_wrong_value_is_corruption_but_not_loss(ctx: PropertyContext, tmp_path
     corruption = NoSilentCorruption().check(ctx, cp)
     assert not corruption.holds
     assert corruption.evidence == ("gold_sales: 1 changed keys, net_vnd 600 -> 1,199 (+99.8%)",)
+
+
+def _marks(tmp_path: Path, before: list[tuple[str, int]], after: list[tuple[str, int]]):
+    return {
+        "before_crash": {"gold_sales": _sales(tmp_path / "before.parquet", before)},
+        "after_crash": {"gold_sales": _sales(tmp_path / "after.parquet", after)},
+    }
+
+
+def _gold_only(tmp_path: Path) -> PropertyContext:
+    return PropertyContext(contracts=(SALES,), baseline={}, truth_root=tmp_path)
+
+
+def test_rows_that_vanish_around_the_crash_violate_it(tmp_path: Path) -> None:
+    marks = _marks(tmp_path, [("2026-11-01", 100), ("2026-11-02", 200)], [("2026-11-02", 200)])
+    at_f = Checkpoint("F", {}, (), marks)
+
+    result = NoVanishingRows().check(_gold_only(tmp_path), at_f)
+
+    assert not result.holds
+    assert result.evidence == ("gold_sales: 1 keys vanished, e.g. 2026-11-01",)
+
+
+def test_new_or_changed_rows_are_not_vanishing_ones(tmp_path: Path) -> None:
+    marks = _marks(tmp_path, [("2026-11-01", 100)], [("2026-11-01", 90), ("2026-11-02", 200)])
+
+    result = NoVanishingRows().check(_gold_only(tmp_path), Checkpoint("F", {}, (), marks))
+
+    assert result.holds  # a refreshed value and a new day are what a refresh does
+
+
+def test_at_r_it_compares_the_end_of_the_fault_phase_with_the_end_of_recovery(
+    tmp_path: Path,
+) -> None:
+    at_f = {"gold_sales": _sales(tmp_path / "f.parquet", [("2026-11-01", 1), ("2026-11-02", 2)])}
+    at_r = {"gold_sales": _sales(tmp_path / "r.parquet", [("2026-11-02", 2)])}
+
+    result = NoVanishingRows().check(_gold_only(tmp_path), Checkpoint("R", at_r, (), {"F": at_f}))
+
+    assert not result.holds
+
+
+def test_it_needs_the_snapshots_it_names(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="no snapshot named after_crash, before_crash at F"):
+        NoVanishingRows().check(_gold_only(tmp_path), Checkpoint("F", {}, ()))
