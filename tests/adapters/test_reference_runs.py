@@ -3,7 +3,9 @@
 from datetime import date
 from pathlib import Path
 
-from faultline.adapters.base import Capability, RunRequest, RunStatus
+import pytest
+
+from faultline.adapters.base import AdapterError, Capability, RunRequest, RunStatus
 from faultline.adapters.reference import (
     FAILPOINT_REACHED,
     FAILPOINT_TAG,
@@ -48,6 +50,29 @@ class FakeDagster:
     def wait_for_retry(self, run_id: str) -> str:
         self.retried.append(run_id)
         return f"r{int(run_id[1:]) + 1}"
+
+    def run_errors(self, run_id: str) -> tuple[str, ...]:
+        return (f"{run_id} failed",)
+
+
+class FakeBackfills(FakeDagster):
+    """A backfill whose runs end with `runs` (partition -> (run id, status))."""
+
+    def __init__(self, runs: dict[str, tuple[str, str]]) -> None:
+        super().__init__("SUCCESS", [])
+        self.runs = runs
+        self.backfills: list[dict[str, object]] = []
+
+    def launch_backfill(
+        self, job: str, partitions: list[str], *, run_config: object, tags: dict[str, str]
+    ) -> str:
+        self.backfills.append(
+            {"job": job, "partitions": partitions, "run_config": run_config, "tags": tags}
+        )
+        return "bf1"
+
+    def wait_for_backfill(self, backfill_id: str, *, timeout: float) -> dict[str, tuple[str, str]]:
+        return self.runs
 
 
 def _adapter(dagster: FakeDagster) -> ReferenceAdapter:
@@ -158,3 +183,41 @@ def test_retries_stop_at_the_number_asked_for() -> None:
 
     assert dagster.retried == ["r1"]
     assert result.status is RunStatus.FAILED
+
+
+D1, D3 = date(2026, 11, 1), date(2026, 11, 3)
+
+
+def test_a_backfill_is_dagsters_own_with_this_sandboxs_config_and_tag() -> None:
+    dagster = FakeBackfills({"2026-11-01": ("a", "SUCCESS"), "2026-11-02": ("b", "SUCCESS")})
+    adapter = _adapter(dagster)
+
+    results = adapter.backfill((D1, DAY))
+
+    assert adapter.capabilities().supports(Capability.BACKFILL)
+    (launched,) = dagster.backfills
+    assert launched["job"] == "pos_daily"
+    assert launched["partitions"] == ["2026-11-01", "2026-11-02"]
+    assert launched["run_config"] == adapter.run_config(None)
+    assert launched["tags"] == {"faultline/workspace": "fl_0123abcd"}
+    assert [(day, r.status, r.run_id) for day, r in results] == [
+        (D1, RunStatus.SUCCEEDED, "a"),
+        (DAY, RunStatus.SUCCEEDED, "b"),
+    ]
+
+
+def test_a_failed_backfill_run_is_the_platforms_failure_with_its_errors() -> None:
+    dagster = FakeBackfills({"2026-11-01": ("a", "SUCCESS"), "2026-11-02": ("b", "FAILURE")})
+
+    (_, first), (_, second) = _adapter(dagster).backfill((D1, DAY))
+
+    assert first.succeeded
+    assert second.status is RunStatus.FAILED  # a signal: nothing faultline did
+    assert second.errors == ("b failed",)
+
+
+def test_a_partition_the_backfill_never_ran_is_an_error_not_a_verdict() -> None:
+    dagster = FakeBackfills({"2026-11-01": ("a", "SUCCESS")})
+
+    with pytest.raises(AdapterError, match="backfill bf1 started no run for 2026-11-03"):
+        _adapter(dagster).backfill((D1, D3))

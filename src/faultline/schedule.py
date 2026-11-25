@@ -11,7 +11,7 @@ tested without starting a platform.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 
 from faultline.adapters.base import Stage
 from faultline.datagen.spec import DatasetSpec
@@ -110,9 +110,28 @@ class Snapshot:
     name: str
 
 
+@dataclass(frozen=True)
+class Backfill:
+    """The orchestrator backfills the days `start` to `end`, as one request (adapter.backfill).
+
+    How it runs them (one after the other, side by side) is the orchestrator's
+    business, as it would be for a team loading its history.
+    """
+
+    start: date
+    end: date
+
+    def days(self) -> tuple[date, ...]:
+        count = (self.end - self.start).days + 1
+        if count < 1:
+            raise ValueError(f"backfill from {self.start} to {self.end} covers no day")
+        return tuple(self.start + timedelta(days=n) for n in range(count))
+
+
 Action = (
     Deliver
     | Run
+    | Backfill
     | CopyLandingFiles
     | HoldLandingFiles
     | ReleaseLandingFiles
@@ -129,3 +148,8 @@ def clean_schedule(spec: DatasetSpec) -> Schedule:
     for day in spec.dates():
         actions += [Deliver(day), Run(day)]
     return tuple(actions)
+
+
+def deliveries_only(spec: DatasetSpec) -> Schedule:
+    """Every day's input arrives and nothing is processed yet: the history a backfill loads."""
+    return tuple(Deliver(day) for day in spec.dates())

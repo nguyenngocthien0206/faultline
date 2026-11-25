@@ -91,6 +91,39 @@ MAX_RETRIES_TAG = "dagster/max_retries"
 RETRY_STRATEGY_TAG = "dagster/retry_strategy"
 PARENT_RUN_TAG = "dagster/parent_run_id"
 
+_LAUNCH_BACKFILL = """
+mutation LaunchBackfill($params: LaunchBackfillParams!) {
+  launchPartitionBackfill(backfillParams: $params) {
+    __typename
+    ... on LaunchBackfillSuccess { backfillId }
+    ... on Error { message }
+  }
+}
+"""
+
+_BACKFILL = """
+query Backfill($id: String!) {
+  partitionBackfillOrError(backfillId: $id) {
+    __typename
+    ... on PartitionBackfill { status }
+    ... on Error { message }
+  }
+}
+"""
+
+_BACKFILL_RUNS = """
+query BackfillRuns($tags: [ExecutionTag!]) {
+  runsOrError(filter: {tags: $tags}, limit: 1000) {
+    __typename
+    ... on Runs { results { runId status tags { key value } } }
+    ... on Error { message }
+  }
+}
+"""
+
+BACKFILL_TAG = "dagster/backfill"
+BACKFILL_DONE = ("COMPLETED", "COMPLETED_SUCCESS", "COMPLETED_FAILED", "FAILED", "CANCELED")
+
 ACTIVE_STATUSES = ("QUEUED", "NOT_STARTED", "STARTING", "STARTED", "CANCELING")
 
 _RUN_STATUS = """
@@ -314,6 +347,82 @@ class DagsterClient:
                     f"run {run_id} asked for a retry and none started within {timeout:.0f}s "
                     "(is run_retries enabled on the Dagster instance?)"
                 )
+            sleep(poll_interval)
+
+    def launch_backfill(
+        self,
+        job: str,
+        partitions: list[str],
+        *,
+        run_config: Mapping[str, Any] | None = None,
+        tags: Mapping[str, str] | None = None,
+    ) -> str:
+        """Ask Dagster to backfill `partitions` of `job` in one request; its backfill id.
+
+        Dagster's daemon submits one run per partition and they go through the
+        run queue like any other: side by side, as many as the queue allows.
+        """
+        params = {
+            "selector": {
+                "partitionSetName": f"{job}_partition_set",
+                "repositorySelector": {
+                    "repositoryName": self.repository,
+                    "repositoryLocationName": self.location,
+                },
+            },
+            "partitionNames": partitions,
+            "runConfigData": dict(run_config or {}),
+            "tags": [{"key": k, "value": v} for k, v in (tags or {}).items()],
+        }
+        result = self.execute(_LAUNCH_BACKFILL, {"params": params})["launchPartitionBackfill"]
+        if result["__typename"] != "LaunchBackfillSuccess":
+            raise DagsterError(
+                f"backfill of {job!r} rejected ({result['__typename']}): {result.get('message')}"
+            )
+        return str(result["backfillId"])
+
+    def wait_for_backfill(
+        self,
+        backfill_id: str,
+        *,
+        timeout: float = 1800.0,
+        poll_interval: float = 2.0,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> dict[str, tuple[str, str]]:
+        """Wait until the backfill is over and each of its runs has ended.
+
+        Returns partition -> (run id, status) of the partition's latest run. A
+        poll Dagster does not answer is tried again until the deadline.
+        """
+        deadline = clock() + timeout
+        while True:
+            try:
+                state = self.execute(_BACKFILL, {"id": backfill_id})["partitionBackfillOrError"]
+                found = self.execute(
+                    _BACKFILL_RUNS, {"tags": [{"key": BACKFILL_TAG, "value": backfill_id}]}
+                )["runsOrError"]
+            except DagsterUnavailable:
+                state = found = None
+            if state is not None and found is not None:
+                if state["__typename"] != "PartitionBackfill":
+                    raise DagsterError(f"backfill {backfill_id}: {state.get('message')}")
+                if found["__typename"] != "Runs":
+                    raise DagsterError(f"cannot look up runs: {found.get('message')}")
+                runs: dict[str, tuple[str, str]] = {}
+                for run in found["results"]:  # newest first: keep each partition's latest
+                    tags = {t["key"]: t["value"] for t in run["tags"]}
+                    runs.setdefault(
+                        tags.get("dagster/partition", ""), (run["runId"], run["status"])
+                    )
+                ended = all(status in TERMINAL_STATUSES for _, status in runs.values())
+                if state["status"] in BACKFILL_DONE and ended:
+                    return runs
+                status = state["status"]
+            else:
+                status = "unanswered"
+            if clock() >= deadline:
+                raise RunTimeoutError(f"backfill {backfill_id} still {status} after {timeout:.0f}s")
             sleep(poll_interval)
 
     def activity(self) -> tuple[bool, float | None]:

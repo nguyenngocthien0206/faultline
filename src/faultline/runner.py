@@ -62,6 +62,7 @@ from faultline.outcome import Outcome, classify, has_signal, worst
 from faultline.properties.base import Checkpoint, Property, PropertyContext, PropertyResult
 from faultline.schedule import (
     Action,
+    Backfill,
     CopyLandingFiles,
     Deliver,
     HoldLandingFiles,
@@ -89,6 +90,9 @@ class Experiment:
     faults: tuple[Fault, ...]
     properties: tuple[Property, ...]
     recovery_rounds: int = 1
+    # The fault phase's starting point, before faults rewrite it; the baseline
+    # always runs the steady state (clean_schedule), the right answer.
+    schedule: Callable[[DatasetSpec], Schedule] = clean_schedule
 
 
 @dataclass(frozen=True)
@@ -188,6 +192,11 @@ def execute(
             note = f" ({', '.join(notes)})" if notes else ""
             log(f"  [{phase}] run {action.partition}{note}: {result.status}")
             runs.append((action.partition, result))
+        elif isinstance(action, Backfill):
+            results = adapter.backfill(action.days())
+            for day, result in results:
+                log(f"  [{phase}] backfill {day}: {result.status}")
+            runs += results
         elif isinstance(action, HoldLandingFiles):
             files = hold_landing_files(adapter, action)
             held[action.dataset, action.partition] = files
@@ -371,7 +380,7 @@ def _plan_faults(
         fault.prepare_input(faulted_input)
         descriptions.append(fault.describe())
         log(f"fault: {fault.describe()}")
-    schedule = reduce(lambda s, f: f.apply(s), faults, clean_schedule(experiment.spec))
+    schedule = reduce(lambda s, f: f.apply(s), faults, experiment.schedule(experiment.spec))
     affected = sorted({p for f in faults for p in f.affected_partitions()})
     heal = tuple(a for f in faults for a in f.heal())
     recovery = heal + tuple(Run(p) for _ in range(experiment.recovery_rounds) for p in affected)
@@ -455,13 +464,13 @@ def run_experiment(
 
 
 def _missing_capabilities(
-    faults: tuple[Fault, ...], adapter_factory: AdapterFactory, work_dir: Path
+    needs: tuple[Fault | Property, ...], adapter_factory: AdapterFactory, work_dir: Path
 ) -> list[str]:
-    """What the faults need that the adapter does not declare, checked before anything runs.
+    """What the faults and probes need that the adapter does not declare, before anything runs.
 
     Building an adapter opens nothing, so asking a throwaway one is free.
     """
-    needed = frozenset().union(*(f.requires for f in faults))
+    needed = frozenset().union(*(n.requires for n in needs))
     if not needed:
         return []
     offered = adapter_factory(work_dir / "generated").capabilities().features
@@ -499,7 +508,7 @@ def _run(
     log: Log,
 ) -> ExperimentResult:
     target = base["target"]
-    missing = _missing_capabilities(faults, adapter_factory, work_dir)
+    missing = _missing_capabilities((*faults, *experiment.properties), adapter_factory, work_dir)
     if missing:
         log(f"skipped: the adapter does not offer {', '.join(missing)}")
         return ExperimentResult(

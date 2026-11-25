@@ -39,6 +39,9 @@ class Capability(StrEnum):
     # Ask the orchestrator to retry a run that failed, as its own retry policy
     # would, and report the run once its last attempt has ended.
     RETRIES = "run.retry"
+    # Ask the orchestrator to backfill a range of partitions in one request,
+    # run as it runs backfills, and report every partition's run.
+    BACKFILL = "run.backfill"
 
 
 @dataclass(frozen=True)
@@ -142,6 +145,12 @@ class Adapter(ABC):
 
     def delete_landing_file(self, dataset: str, partition: date, file: str) -> None:
         raise self._lacks(Capability.LANDING_FILES)
+
+    # Optional, with Capability.BACKFILL.
+
+    def backfill(self, partitions: tuple[date, ...]) -> tuple[tuple[date, RunResult], ...]:
+        """Backfill `partitions` in one request; wait for every run; one result per partition."""
+        raise self._lacks(Capability.BACKFILL)
 
     def _lacks(self, capability: Capability) -> AdapterError:
         return AdapterError(f"{type(self).__name__} does not offer {capability}")
