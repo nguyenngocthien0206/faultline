@@ -24,6 +24,7 @@ uv run faultline run column-rename                       # a file with a column 
 uv run faultline run crash-after-landing                 # a run killed between landing and loading
 uv run faultline run crash-mid-write                     # a run killed inside a gold table refresh
 uv run faultline run retry-after-partial-commit          # a crashed run retried by the orchestrator
+uv run faultline run idempotency                         # no fault: an old day is simply run again
 ```
 
 `pos-offline-sync` takes a store's till offline for two days. When it reconnects, its orders reach the source database with their real, older timestamps, behind the incremental cursor of the ingestion tool. On the reference platform's naive pipeline the result looks like this:
@@ -56,6 +57,8 @@ The hardened edition runs the same tools with established patterns: a lag window
 `crash-mid-write` kills day 3's run in the middle of refreshing the gold sales table. Naive refreshes it the way dbt's `delete+insert` strategy does: delete the rows of every day the new data touches, then insert the new ones. Day 3 carries refunds of day 1 orders, so the delete takes out day 1 for three stores, and the crash lands before the insert. faultline snapshots the tables just before and just after the crash, and a new property, `no_vanishing_rows`, names the keys a reader could see a moment earlier and no longer can. Day 4 runs green and never touches day 1, so the rows stay gone: a third of the table's orders, with only faultline's own crash in red. Hardened builds the new rows in a side table and swaps them in with one statement, so a crash before the swap leaves readers with the old numbers: `PASS`. In dbt the choice is one config line plus a partition key (and a model that rebuilds whole days), and the difference only shows on a day when something dies halfway, which is why it is worth deciding on purpose rather than by default.
 
 `retry-after-partial-commit` kills day 2's run right after bronze wrote the day's order lines, before Dagster recorded the step as done, and lets Dagster retry it, as a retry policy would. The write was committed, the record of it was not, so the retry writes it again. On naive, which appends, the 163 lines are there twice: items sold +22%, revenue unchanged to the dong, every run green. Hardened replaces the day's partition, so writing it twice changes nothing: `PASS`. Turning on retries is a one-line setting that makes every crash disappear from the run history; whether that is a good idea depends entirely on whether each step can safely run twice, and this experiment is how a team finds out before the retries do.
+
+`idempotency` breaks nothing at all. The four days run as usual, then day 2 is run again, as an operator does after an incident or a fix, and faultline compares the tables just before and just after. On naive the rerun is green and counts the day twice: net revenue +21.4%, items sold +65.9%. That is the move every runbook reaches for first, and on this pipeline it is a fault of its own. Hardened gives back exactly the same tables. The check is a probe: a property may add actions of its own (here a snapshot, the rerun, a snapshot), and faultline runs them in their own experiment so the answer is not muddied by an earlier fault.
 
 ## Development
 
