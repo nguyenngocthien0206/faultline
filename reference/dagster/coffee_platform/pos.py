@@ -28,7 +28,7 @@ from dagster import (
 from dagster_dbt import DbtCliResource, DbtProject, dbt_assets
 from dlt.sources.sql_database import sql_database
 
-from coffee_platform.failpoints import failpoint
+from coffee_platform.failpoints import REACHED, armed, failpoint
 from coffee_platform.partitions import daily
 from coffee_platform.resources import ClickHouse, Workspace
 
@@ -173,10 +173,33 @@ BRONZE_ASSETS = [_bronze_asset(t) for t in POS_TABLES]
 # ---------------------------------------------------------------- silver, gold
 
 
+DBT_FAILPOINTS = ("gold_mid_write",)  # armed inside dbt's strategy macros
+
+
+def build_with_dbt(context: AssetExecutionContext, dbt: DbtCliResource, workspace: Workspace):
+    """`dbt build` for the run's workspace and day, shared by both editions.
+
+    A run armed with a dbt failpoint passes it to dbt as a var; the macro then
+    raises with the failpoint marker, and seeing it, the run dies here, hard.
+    A dbt failure without the marker is a genuine one and is raised as such.
+    """
+    dbt_vars = {"workspace": workspace.name, "dt": context.partition_key}
+    name = armed(context)
+    if name in DBT_FAILPOINTS:
+        dbt_vars["failpoint"] = name
+    invocation = dbt.cli(["build", "--vars", json.dumps(dbt_vars)], context=context)
+    try:
+        yield from invocation.stream()
+    except Exception as exc:
+        # dagster-dbt's error carries the messages dbt logged, the marker among them
+        if name in DBT_FAILPOINTS and REACHED + name in str(exc):
+            failpoint(context, name)
+        raise
+
+
 @dbt_assets(manifest=DBT_PROJECT.manifest_path, partitions_def=daily)
 def pos_dbt(context: AssetExecutionContext, dbt: DbtCliResource, workspace: Workspace):
-    dbt_vars = {"workspace": workspace.name, "dt": context.partition_key}
-    yield from dbt.cli(["build", "--vars", json.dumps(dbt_vars)], context=context).stream()
+    yield from build_with_dbt(context, dbt, workspace)
 
 
 # In-process executor: the steps run one after another anyway, and the default
