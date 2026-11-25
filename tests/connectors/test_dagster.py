@@ -368,3 +368,88 @@ def test_a_retry_that_never_starts_is_an_error_not_a_hang(stub: StubServer) -> N
 
     with pytest.raises(RunTimeoutError, match="asked for a retry and none started within 120s"):
         client(stub).wait_for_retry("r1", sleep=lambda _: None, clock=lambda: next(ticks))
+
+
+def _backfill(status: str) -> dict[str, object]:
+    return {
+        "data": {"partitionBackfillOrError": {"__typename": "PartitionBackfill", "status": status}}
+    }
+
+
+def _run_of(run_id: str, partition: str, status: str) -> dict[str, object]:
+    return {
+        "runId": run_id,
+        "status": status,
+        "tags": [{"key": "dagster/partition", "value": partition}],
+    }
+
+
+def _launched_backfill(typename: str, **fields: str) -> dict[str, object]:
+    return {"data": {"launchPartitionBackfill": {"__typename": typename, **fields}}}
+
+
+def test_a_backfill_is_launched_on_the_jobs_partition_set_with_config_and_tags(
+    stub: StubServer,
+) -> None:
+    stub.reply(200, _launched_backfill("LaunchBackfillSuccess", backfillId="bf1"))
+
+    backfill_id = client(stub).launch_backfill(
+        "pos_daily",
+        ["2026-11-01", "2026-11-02"],
+        run_config={"resources": {}},
+        tags={"faultline/workspace": "fl_0123abcd"},
+    )
+
+    assert backfill_id == "bf1"
+    params = stub.requests[0].json()["variables"]["params"]
+    assert params["selector"]["partitionSetName"] == "pos_daily_partition_set"
+    assert params["selector"]["repositorySelector"]["repositoryLocationName"] == "coffee_platform"
+    assert params["partitionNames"] == ["2026-11-01", "2026-11-02"]
+    assert params["runConfigData"] == {"resources": {}}
+    assert params["tags"] == [{"key": "faultline/workspace", "value": "fl_0123abcd"}]
+
+
+def test_a_rejected_backfill_raises_with_its_message(stub: StubServer) -> None:
+    stub.reply(200, _launched_backfill("PartitionSetNotFoundError", message="no partition set"))
+
+    with pytest.raises(DagsterError, match=r"PartitionSetNotFoundError.*no partition set"):
+        client(stub).launch_backfill("pos_daily", ["2026-11-01"])
+
+
+def test_waiting_for_a_backfill_lasts_until_it_and_every_run_have_ended(stub: StubServer) -> None:
+    stub.reply(200, _backfill("REQUESTED"))
+    stub.reply(200, _runs(_run_of("a", "2026-11-01", "STARTED")))
+    stub.reply(200, _backfill("COMPLETED_FAILED"))
+    stub.reply(
+        200, _runs(_run_of("b", "2026-11-02", "FAILURE"), _run_of("a", "2026-11-01", "STARTED"))
+    )
+    stub.reply(200, _backfill("COMPLETED_FAILED"))
+    stub.reply(
+        200,
+        _runs(
+            _run_of("c", "2026-11-01", "SUCCESS"),  # newest first: a later run of the same day
+            _run_of("b", "2026-11-02", "FAILURE"),
+            _run_of("a", "2026-11-01", "FAILURE"),
+        ),
+    )
+    sleeps: list[float] = []
+
+    runs = client(stub).wait_for_backfill("bf1", poll_interval=2.0, sleep=sleeps.append)
+
+    assert runs == {"2026-11-01": ("c", "SUCCESS"), "2026-11-02": ("b", "FAILURE")}
+    assert sleeps == [2.0, 2.0]
+    assert stub.requests[1].json()["variables"] == {
+        "tags": [{"key": "dagster/backfill", "value": "bf1"}]
+    }
+
+
+def test_a_backfill_that_never_ends_times_out(stub: StubServer) -> None:
+    for _ in range(2):
+        stub.reply(200, _backfill("REQUESTED"))
+        stub.reply(200, _runs())
+    ticks = iter([0.0, 5.0, 11.0])
+
+    with pytest.raises(RunTimeoutError, match="backfill bf1 still REQUESTED after 10s"):
+        client(stub).wait_for_backfill(
+            "bf1", timeout=10, sleep=lambda _: None, clock=lambda: next(ticks)
+        )

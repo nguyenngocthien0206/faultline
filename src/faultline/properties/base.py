@@ -18,7 +18,7 @@ from datetime import date
 from pathlib import Path
 from typing import ClassVar
 
-from faultline.adapters.base import RunResult, TableContract
+from faultline.adapters.base import Capability, RunResult, TableContract
 from faultline.schedule import Schedule
 
 
@@ -51,6 +51,8 @@ class PropertyResult:
 
 class Property(ABC):
     name: ClassVar[str]
+    # What its probe needs from the adapter; the experiment is SKIPPED without it.
+    requires: ClassVar[frozenset[Capability]] = frozenset()
 
     @abstractmethod
     def check(self, ctx: PropertyContext, checkpoint: Checkpoint) -> PropertyResult: ...

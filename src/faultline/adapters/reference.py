@@ -75,6 +75,11 @@ def target_name(edition: Edition | str, lag_days: int | None = None) -> str:
     return name if lag_days is None else f"{name}(lag={lag_days}d)"
 
 
+# Which landing partition a row came in (naive silver keeps it): true either way,
+# but a history load brings every row in on its first day, so it is left out of
+# comparisons. Hardened keeps it out of silver altogether.
+LINEAGE = ("extracted_on",)
+
 CONSUMER_TABLES: tuple[TableContract, ...] = (
     TableContract(
         "silver_orders",
@@ -86,12 +91,14 @@ CONSUMER_TABLES: tuple[TableContract, ...] = (
         "silver_order_items",
         key=("order_id", "line_no"),
         measures=("qty", "unit_price_vnd"),
+        ignore=LINEAGE,
         truth_dataset="pos/order_items",
     ),
     TableContract(
         "silver_payments",
         key=("payment_id",),
         measures=("amount_vnd",),
+        ignore=LINEAGE,
         truth_dataset="pos/payments",
     ),
     TableContract(
@@ -238,6 +245,7 @@ class ReferenceAdapter(Adapter):
                 Capability.RUN_STAGES,
                 Capability.FAILPOINTS,
                 Capability.RETRIES,
+                Capability.BACKFILL,
             }
         )
         return Capabilities(features=features, tables=CONSUMER_TABLES)
@@ -279,6 +287,29 @@ class ReferenceAdapter(Adapter):
             retry_id = self.dagster.wait_for_retry(str(attempts[-1].run_id))
             attempts.append(self._attempt(retry_id, None))
         return settle(attempts)
+
+    def backfill(self, partitions: tuple[date, ...]) -> tuple[tuple[date, RunResult], ...]:
+        """Dagster's own backfill of the daily job, with this sandbox's config and tag."""
+        backfill_id = self.dagster.launch_backfill(
+            self.job_for(None),
+            [p.isoformat() for p in partitions],
+            run_config=self.run_config(None),
+            tags={"faultline/workspace": self.workspace},
+        )
+        runs = self.dagster.wait_for_backfill(
+            backfill_id, timeout=self.config.run_timeout_seconds * len(partitions)
+        )
+        results = []
+        for partition in partitions:
+            if partition.isoformat() not in runs:
+                raise AdapterError(f"backfill {backfill_id} started no run for {partition}")
+            run_id, status = runs[partition.isoformat()]
+            if status == "SUCCESS":
+                results.append((partition, RunResult(RunStatus.SUCCEEDED, run_id=run_id)))
+            else:
+                errors = self.dagster.run_errors(run_id)
+                results.append((partition, RunResult(RunStatus.FAILED, errors, run_id=run_id)))
+        return tuple(results)
 
     def _attempt(self, run_id: str, failpoint: str | None) -> RunResult:
         outcome = self.dagster.wait_for_run(run_id, timeout=self.config.run_timeout_seconds)

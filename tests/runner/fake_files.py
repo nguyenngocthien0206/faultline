@@ -14,7 +14,9 @@ crash "after_landing" stops between ingest and load, one asked to crash at
 asked to crash at "gold_mid_write" stops inside the gold refresh (all
 INTERRUPTED). A run that may be retried is, as Dagster's daemon would: from
 the failed step on, that is the load again, never the ingest, and with no
-failpoint (a retry inherits the tag; the platform skips it). The mode plays
+failpoint (a retry inherits the tag; the platform skips it). A backfill runs
+its partitions as Dagster does, side by side: every partition's extract
+starts from the same cursor, before any of them is loaded. The mode plays
 the two reference editions:
 
     append  no look back at the source, every file loaded as it comes, order
@@ -97,6 +99,7 @@ class FakeFilePlatform(Adapter):
                 Capability.RUN_STAGES,
                 Capability.FAILPOINTS,
                 Capability.RETRIES,
+                Capability.BACKFILL,
             }
         )
         return Capabilities(features, (ORDERS, LINES, GOLD))
@@ -122,6 +125,21 @@ class FakeFilePlatform(Adapter):
         failed = [a for a in attempts if a.status is RunStatus.FAILED]
         status = RunStatus.FAILED if failed else attempts[-1].status
         return RunResult(status, metadata={"attempts": str(len(attempts))})
+
+    def backfill(self, partitions: tuple[date, ...]) -> tuple[tuple[date, RunResult], ...]:
+        start, moved = self.cursor, []
+        for partition in partitions:  # side by side: nobody sees another's cursor yet
+            self.cursor = start
+            self._ingest(partition)
+            moved.append(self.cursor)
+        self.cursor = max((c for c in moved if c is not None), default=start)
+        results = []
+        for partition in partitions:
+            problems, touched = self._load(partition)
+            self._refresh_gold(touched, crash=False)
+            status = RunStatus.FAILED if problems else RunStatus.SUCCEEDED
+            results.append((partition, RunResult(status, errors=tuple(problems))))
+        return tuple(results)
 
     def _attempt(self, request: RunRequest) -> RunResult:
         if request.stage in (None, Stage.INGEST):
