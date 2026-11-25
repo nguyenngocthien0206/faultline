@@ -358,6 +358,7 @@ class _FaultPlan:
     schedule: Schedule
     recovery: tuple[Action, ...]
     descriptions: tuple[str, ...]
+    probe: Schedule = ()  # the properties' own actions, after the schedule
 
 
 def _plan_faults(
@@ -374,7 +375,8 @@ def _plan_faults(
     affected = sorted({p for f in faults for p in f.affected_partitions()})
     heal = tuple(a for f in faults for a in f.heal())
     recovery = heal + tuple(Run(p) for _ in range(experiment.recovery_rounds) for p in affected)
-    return _FaultPlan(faulted_input, schedule, recovery, tuple(descriptions))
+    probe = tuple(a for prop in experiment.properties for a in prop.probe())
+    return _FaultPlan(faulted_input, schedule, recovery, tuple(descriptions), probe)
 
 
 def _fault_phases(
@@ -391,10 +393,14 @@ def _fault_phases(
         fault_runs = execute(
             sandbox, plan.schedule, log, "fault", held, marks=fault_marks, work_dir=work_dir
         )
+        if plan.probe:  # its runs count as the fault phase's: a probe run that fails is a signal
+            fault_runs += execute(
+                sandbox, plan.probe, log, "probe", held, marks=fault_marks, work_dir=work_dir
+            )
         at_f = Checkpoint(
             "F", snapshot_all(sandbox, work_dir / "checkpoint_F"), fault_runs, fault_marks
         )
-        recovery_marks: Marks = {"F": at_f.snapshots}
+        recovery_marks: Marks = {**fault_marks, "F": at_f.snapshots}
         recovery_runs = execute(
             sandbox, plan.recovery, log, "recovery", held, marks=recovery_marks, work_dir=work_dir
         )
