@@ -75,6 +75,11 @@ def target_name(edition: Edition | str, lag_days: int | None = None) -> str:
     return name if lag_days is None else f"{name}(lag={lag_days}d)"
 
 
+# Which landing partition a row came in (naive silver keeps it): true either way,
+# but a history load brings every row in on its first day, so it is left out of
+# comparisons. Hardened keeps it out of silver altogether.
+LINEAGE = ("extracted_on",)
+
 CONSUMER_TABLES: tuple[TableContract, ...] = (
     TableContract(
         "silver_orders",
@@ -86,12 +91,14 @@ CONSUMER_TABLES: tuple[TableContract, ...] = (
         "silver_order_items",
         key=("order_id", "line_no"),
         measures=("qty", "unit_price_vnd"),
+        ignore=LINEAGE,
         truth_dataset="pos/order_items",
     ),
     TableContract(
         "silver_payments",
         key=("payment_id",),
         measures=("amount_vnd",),
+        ignore=LINEAGE,
         truth_dataset="pos/payments",
     ),
     TableContract(
