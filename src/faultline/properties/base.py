@@ -8,7 +8,7 @@ and says whether its promise held there, with evidence a human can read.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import ClassVar
@@ -21,6 +21,9 @@ class Checkpoint:
     name: str  # "F": end of the fault phase, "R": after recovery
     snapshots: dict[str, Path]
     runs: tuple[tuple[date, RunResult], ...]  # the runs of the phase that led here
+    # Snapshots taken on the way here, by name (Snapshot actions in the phase's
+    # schedule); R also carries F's, as "F", for properties about what changed.
+    marks: dict[str, dict[str, Path]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
