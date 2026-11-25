@@ -33,5 +33,12 @@ run_launcher:
   module: dagster.core.launcher
   class: DefaultRunLauncher
 
+# The daemon retries a failed run only when the run asks for it with the tag
+# dagster/max_retries (faultline does, for the retry experiment): every other
+# run fails once and stays failed, as before.
+run_retries:
+  enabled: true
+  max_retries: 0
+
 telemetry:
   enabled: false

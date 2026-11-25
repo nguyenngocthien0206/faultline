@@ -311,6 +311,8 @@ def _bronze_asset(table: str):
         client.command(
             f"ALTER TABLE {target} REPLACE PARTITION tuple(toDate('{dt}')) FROM {staging}"
         )
+        if table == "order_items":  # swapped in, not yet recorded as done
+            failpoint(context, "after_bronze_write")
         client.command(f"DROP TABLE {staging}")
         return MaterializeResult(metadata={"files": files, "rows": rows})
 
