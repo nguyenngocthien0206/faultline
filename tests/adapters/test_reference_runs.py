@@ -19,10 +19,14 @@ DAY = date(2026, 11, 2)
 
 
 class FakeDagster:
-    def __init__(self, status: str, log: list[str]) -> None:
-        self.status = status
-        self.log = log
+    """Run r1 ends with `status`; each of `retries` (status, log) is the next attempt."""
+
+    def __init__(
+        self, status: str, log: list[str], retries: tuple[tuple[str, list[str]], ...] = ()
+    ) -> None:
+        self.attempts = [(status, log), *retries]
         self.launched: list[dict[str, str]] = []
+        self.retried: list[str] = []
 
     def launch_run(
         self, job: str, *, partition: str, run_config: object, tags: dict[str, str]
@@ -30,12 +34,20 @@ class FakeDagster:
         self.launched.append(tags)
         return "r1"
 
+    def _attempt(self, run_id: str) -> tuple[str, list[str]]:
+        return self.attempts[int(run_id[1:]) - 1]
+
     def wait_for_run(self, run_id: str, *, timeout: float) -> RunOutcome:
-        errors = () if self.status == "SUCCESS" else ("marked as failed from outside",)
-        return RunOutcome(run_id=run_id, status=self.status, errors=errors)
+        status, _ = self._attempt(run_id)
+        errors = () if status == "SUCCESS" else (f"{run_id} failed",)
+        return RunOutcome(run_id=run_id, status=status, errors=errors)
 
     def run_logged(self, run_id: str, text: str) -> bool:
-        return any(text in line for line in self.log)
+        return any(text in line for line in self._attempt(run_id)[1])
+
+    def wait_for_retry(self, run_id: str) -> str:
+        self.retried.append(run_id)
+        return f"r{int(run_id[1:]) + 1}"
 
 
 def _adapter(dagster: FakeDagster) -> ReferenceAdapter:
@@ -79,3 +91,70 @@ def test_a_failed_run_without_a_failpoint_is_never_called_interrupted() -> None:
     dagster = FakeDagster("FAILURE", [FAILPOINT_REACHED + "after_landing"])
 
     assert _adapter(dagster).run(RunRequest(DAY)).status is RunStatus.FAILED
+
+
+CRASHED = ("FAILURE", [FAILPOINT_REACHED + "after_bronze_write"])
+
+
+def test_retries_are_offered_and_asked_for_by_the_run_alone() -> None:
+    dagster = FakeDagster("SUCCESS", [])
+    adapter = _adapter(dagster)
+
+    adapter.run(RunRequest(DAY, retries=1))
+    adapter.run(RunRequest(DAY))
+
+    assert adapter.capabilities().supports(Capability.RETRIES)
+    assert dagster.launched[0]["dagster/max_retries"] == "1"
+    assert dagster.launched[0]["dagster/retry_strategy"] == "FROM_FAILURE"
+    assert "dagster/max_retries" not in dagster.launched[1]  # the instance retries nothing
+
+
+def test_a_crash_then_a_green_retry_is_a_green_run() -> None:
+    dagster = FakeDagster(*CRASHED, retries=(("SUCCESS", []),))
+
+    result = _adapter(dagster).run(RunRequest(DAY, failpoint="after_bronze_write", retries=1))
+
+    assert result.status is RunStatus.SUCCEEDED
+    assert result.run_id == "r2"
+    assert result.metadata == {
+        "attempts": "2",
+        "statuses": "INTERRUPTED,SUCCEEDED",
+        "root_run_id": "r1",
+    }
+
+
+def test_a_green_first_attempt_waits_for_no_retry() -> None:
+    dagster = FakeDagster("SUCCESS", [])
+
+    result = _adapter(dagster).run(RunRequest(DAY, retries=1))
+
+    assert result.status is RunStatus.SUCCEEDED
+    assert dagster.retried == []
+    assert result.metadata == {}
+
+
+def test_a_failure_of_the_platforms_own_stays_a_signal_after_a_green_retry() -> None:
+    dagster = FakeDagster("FAILURE", ["connection refused"], retries=(("SUCCESS", []),))
+
+    result = _adapter(dagster).run(RunRequest(DAY, retries=1))
+
+    assert result.status is RunStatus.FAILED  # a failure alert fired on the first attempt
+    assert result.errors == ("r1 failed",)
+
+
+def test_a_failed_retry_is_a_failed_run() -> None:
+    dagster = FakeDagster(*CRASHED, retries=(("FAILURE", ["disk full"]),))
+
+    result = _adapter(dagster).run(RunRequest(DAY, failpoint="after_bronze_write", retries=1))
+
+    assert result.status is RunStatus.FAILED
+    assert result.errors == ("r2 failed",)
+
+
+def test_retries_stop_at_the_number_asked_for() -> None:
+    dagster = FakeDagster(*CRASHED, retries=(("FAILURE", []), ("SUCCESS", [])))
+
+    result = _adapter(dagster).run(RunRequest(DAY, failpoint="after_bronze_write", retries=1))
+
+    assert dagster.retried == ["r1"]
+    assert result.status is RunStatus.FAILED

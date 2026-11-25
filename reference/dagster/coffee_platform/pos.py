@@ -162,6 +162,8 @@ def _bronze_asset(table: str):
         )
         rows = int(client.command(f"SELECT count() FROM {data_fn}"))
         client.command(f"INSERT INTO {target} {select}")
+        if table == "order_items":  # written, not yet recorded as done
+            failpoint(context, "after_bronze_write")
         return MaterializeResult(metadata={"files": files, "rows": rows})
 
     return _bronze

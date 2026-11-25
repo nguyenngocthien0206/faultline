@@ -6,7 +6,7 @@ from collections.abc import Callable
 from datetime import timedelta
 
 from faultline.datagen.spec import DatasetSpec
-from faultline.faults.execution import CrashAfterLanding, CrashMidWrite
+from faultline.faults.execution import CrashAfterLanding, CrashMidWrite, RetryAfterPartialCommit
 from faultline.faults.landing import ColumnDrift, DuplicateFile, LateFile, TruncatedFile
 from faultline.faults.source import PosOfflineSync
 from faultline.properties.core import NoDataLoss, NoSilentCorruption, NoVanishingRows
@@ -140,6 +140,23 @@ def crash_mid_write(spec: DatasetSpec) -> Experiment:
     )
 
 
+def retry_after_partial_commit(spec: DatasetSpec) -> Experiment:
+    """Day 2's run dies after writing bronze; the orchestrator retries it from that step."""
+    if spec.days < 3:
+        raise ValueError("retry-after-partial-commit needs at least 3 days of data")
+    return Experiment(
+        name="retry-after-partial-commit",
+        description=(
+            "The run of day 2 is killed, hard, right after bronze wrote the day's order lines "
+            "and before Dagster recorded the step as done. Dagster retries the run from the "
+            "failed step, as its retry policy says."
+        ),
+        spec=spec,
+        faults=(RetryAfterPartialCommit(partition=spec.start_date + timedelta(days=1)),),
+        properties=(NoDataLoss(), NoSilentCorruption()),
+    )
+
+
 BUILTIN: dict[str, Callable[[DatasetSpec], Experiment]] = {
     "pos-offline-sync": pos_offline_sync,
     "duplicate-file": duplicate_file,
@@ -148,4 +165,5 @@ BUILTIN: dict[str, Callable[[DatasetSpec], Experiment]] = {
     "column-rename": column_rename,
     "crash-after-landing": crash_after_landing,
     "crash-mid-write": crash_mid_write,
+    "retry-after-partial-commit": retry_after_partial_commit,
 }

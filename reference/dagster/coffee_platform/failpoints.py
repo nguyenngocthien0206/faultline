@@ -11,6 +11,10 @@ Just before dying the run logs one line, which is how faultline tells its own
 crash from a genuine failure: a run that failed without that line failed for
 a reason of its own.
 
+A retry of a crashed run inherits its tags, the failpoint among them, and
+would die at the same place again, every time: a failpoint only fires on the
+first attempt, never in a re-execution (a run with a parent).
+
 Failpoints inside dbt (gold_mid_write) live in dbt macros (reference/dbt/
 macros/failpoint_mid_write.sql): dbt runs in a subprocess, so the macro raises
 with the same marker and the dbt asset dies here once it sees it.
@@ -27,13 +31,15 @@ REACHED = "faultline failpoint reached: "
 
 
 def armed(context: AssetExecutionContext) -> str | None:
-    """The failpoint this run was asked to die at, if any."""
+    """The failpoint this run was asked to die at, if any; never in a retry."""
+    if context.run.parent_run_id is not None:
+        return None
     return context.run.tags.get(FAILPOINT_TAG)
 
 
 def failpoint(context: AssetExecutionContext, name: str) -> None:
     """Die here, hard, if this run was asked to; otherwise do nothing."""
-    if context.run.tags.get(FAILPOINT_TAG) != name:
+    if armed(context) != name:
         return
     context.log.error(REACHED + name)
     os._exit(1)

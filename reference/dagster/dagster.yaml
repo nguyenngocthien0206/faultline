@@ -11,15 +11,34 @@ storage:
       password:
         env: DAGSTER_PG_PASSWORD
 
-# Runs start as soon as they are launched (no queue) and execute inside the
-# code server container, so no Docker socket is needed.
+# Launched runs wait in a queue and the daemon starts at most
+# max_concurrent_runs at a time. Without it, two dozen sandboxes launching at
+# once made the code server spawn two dozen run workers at once (about 13 s of
+# imports each), its answer to a launch took over Dagster's 60 s gRPC timeout,
+# and the run was marked failed before it began. The stack completes about
+# seven runs a minute from eight concurrent runs on, so the cap costs no
+# throughput. The daemon launches queued runs on four threads: one at a time,
+# each launch waiting for its run worker to spawn, it kept only about seven of
+# the twelve slots busy and runs waited up to eight minutes in the queue.
+# Runs execute inside the code server container, so no Docker socket is needed.
 run_coordinator:
   module: dagster.core.run_coordinator
-  class: DefaultRunCoordinator
+  class: QueuedRunCoordinator
+  config:
+    max_concurrent_runs: 12
+    dequeue_use_threads: true
+    dequeue_num_workers: 4
 
 run_launcher:
   module: dagster.core.launcher
   class: DefaultRunLauncher
+
+# The daemon retries a failed run only when the run asks for it with the tag
+# dagster/max_retries (faultline does, for the retry experiment): every other
+# run fails once and stays failed, as before.
+run_retries:
+  enabled: true
+  max_retries: 0
 
 telemetry:
   enabled: false

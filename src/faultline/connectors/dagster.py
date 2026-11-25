@@ -86,6 +86,11 @@ query LatestRun($statuses: [RunStatus!]) {
 }
 """
 
+# Tags Dagster's run retries speak: a run asks for them, a retry names its parent.
+MAX_RETRIES_TAG = "dagster/max_retries"
+RETRY_STRATEGY_TAG = "dagster/retry_strategy"
+PARENT_RUN_TAG = "dagster/parent_run_id"
+
 ACTIVE_STATUSES = ("QUEUED", "NOT_STARTED", "STARTING", "STARTED", "CANCELING")
 
 _RUN_STATUS = """
@@ -251,8 +256,22 @@ class DagsterClient:
     def _find_launched(
         self, launch_id: str, *, sleep: Callable[[float], None], tries: int = 10
     ) -> str | None:
-        """The run a launch started, if it did; None if no run carries the launch tag."""
-        variables = {"tags": [{"key": LAUNCH_TAG, "value": launch_id}]}
+        """The run a launch started, if it did; None if no run carries the launch tag.
+
+        A retry inherits the launch tag too, but it only exists once the run it
+        retries has failed, long after its launch was answered or looked up.
+        """
+        return self.find_run({LAUNCH_TAG: launch_id}, sleep=sleep, tries=tries)
+
+    def find_run(
+        self,
+        tags: Mapping[str, str],
+        *,
+        sleep: Callable[[float], None] = time.sleep,
+        tries: int = 10,
+    ) -> str | None:
+        """The latest run carrying every one of `tags`, or None."""
+        variables = {"tags": [{"key": k, "value": v} for k, v in tags.items()]}
         for attempt in range(1, tries + 1):
             try:
                 result = self.execute(_FIND_RUN, variables)["runsOrError"]
@@ -266,6 +285,36 @@ class DagsterClient:
             found = result["results"]
             return str(found[0]["runId"]) if found else None
         return None  # pragma: no cover - the loop always returns or raises
+
+    def wait_for_retry(
+        self,
+        run_id: str,
+        *,
+        timeout: float = 120.0,
+        poll_interval: float = 2.0,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> str:
+        """The run the daemon launched to retry `run_id`, once it exists.
+
+        Dagster's daemon notices a failed run that asked for retries and
+        launches a re-execution tagged with its parent: measured 4 to 12 s on
+        an idle stack, so the default leaves room for a busy one.
+        """
+        deadline = clock() + timeout
+        while True:
+            try:
+                retry = self.find_run({PARENT_RUN_TAG: run_id}, sleep=sleep, tries=1)
+            except DagsterUnavailable:
+                retry = None
+            if retry is not None:
+                return retry
+            if clock() >= deadline:
+                raise RunTimeoutError(
+                    f"run {run_id} asked for a retry and none started within {timeout:.0f}s "
+                    "(is run_retries enabled on the Dagster instance?)"
+                )
+            sleep(poll_interval)
 
     def activity(self) -> tuple[bool, float | None]:
         """Whether any run is in progress, and when the latest run last changed (epoch s)."""

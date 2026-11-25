@@ -179,10 +179,12 @@ def execute(
         elif isinstance(action, Deliver):
             adapter.deliver(action.day)
         elif isinstance(action, Run):
-            request = RunRequest(action.partition, action.stage, action.failpoint)
+            request = RunRequest(action.partition, action.stage, action.failpoint, action.retries)
             result = adapter.run(request)
             notes = [str(action.stage)] if action.stage else []
             notes += [f"crash {action.failpoint}"] if action.failpoint else []
+            attempts = int(result.metadata.get("attempts", "1"))
+            notes += [f"{attempts} attempts"] if attempts > 1 else []
             note = f" ({', '.join(notes)})" if notes else ""
             log(f"  [{phase}] run {action.partition}{note}: {result.status}")
             runs.append((action.partition, result))

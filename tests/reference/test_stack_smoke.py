@@ -9,11 +9,14 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
-from reference_stack import Stack
+from reference_stack import Stack, reference_config
 
 pytestmark = pytest.mark.integration
 
 PARTITION = "2026-11-01"
+# As long as faultline waits for a run: the wait includes the time a run spends
+# in Dagster's queue, which under a full suite is minutes, not seconds.
+RUN_TIMEOUT = reference_config().run_timeout_seconds
 
 
 def _run_config(workspace: str) -> dict[str, object]:
@@ -38,7 +41,7 @@ def test_a_run_moves_rows_from_postgres_through_s3_into_clickhouse(
     run_id = stack.dagster.launch_run(
         "smoke_job", partition=PARTITION, run_config=_run_config(workspace)
     )
-    outcome = stack.dagster.wait_for_run(run_id, timeout=300)
+    outcome = stack.dagster.wait_for_run(run_id, timeout=RUN_TIMEOUT)
 
     assert outcome.succeeded, outcome.errors
     loaded = stack.clickhouse.query(f"SELECT count() AS n FROM {workspace}.smoke_ping")
@@ -55,7 +58,7 @@ def test_a_failing_run_reports_failure_with_its_error(stack: Stack, workspace: s
     run_id = stack.dagster.launch_run(
         "smoke_job", partition=PARTITION, run_config=_run_config(workspace)
     )
-    outcome = stack.dagster.wait_for_run(run_id, timeout=300)
+    outcome = stack.dagster.wait_for_run(run_id, timeout=RUN_TIMEOUT)
 
     assert outcome.status == "FAILURE"
     assert any("smoke_ping" in e for e in outcome.errors), outcome.errors
