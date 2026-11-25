@@ -34,13 +34,24 @@ mean the new schema. And ClickHouse would not complain either: it reads a
 file through the target table's structure, matching columns by name, so a
 renamed column is dropped and the expected one silently filled with zeros.
 
+One extract at a time. dlt's cursor and working files belong to the pipeline,
+not to a partition, so two extracts of one workspace at once (a backfill runs
+its partitions side by side) read the same cursor and trample each other's
+files and state: a run fails, or a day lands twice. Each extract holds a
+Postgres advisory lock named after the workspace, on the source database it
+reads, for as long as it extracts and writes its manifest. Loads and dbt
+still run side by side. The lock is a session lock, so a run that dies
+releases it with its connection.
+
 Same ClickHouse table names as naive (a workspace runs one edition), different
 Dagster asset keys (prefix `hardened`), so both live in one code location.
 
 No `from __future__ import annotations` in Dagster code (see smoke.py).
 """
 
-from collections.abc import Mapping
+import os
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -60,6 +71,8 @@ from dagster import (
 )
 from dagster_dbt import DagsterDbtTranslator, DbtCliResource, DbtProject, dbt_assets
 from pydantic import Field
+from sqlalchemy import create_engine, text
+from sqlalchemy.pool import NullPool
 
 from coffee_platform.failpoints import failpoint
 from coffee_platform.partitions import daily
@@ -93,6 +106,21 @@ class ExtractConfig(Config):
     )
 
 
+@contextmanager
+def one_extract_at_a_time(context: AssetExecutionContext, workspace: Workspace) -> Iterator[None]:
+    """Hold the workspace's extract lock on the source database while the body runs."""
+    engine = create_engine(os.environ["SOURCES__SQL_DATABASE__CREDENTIALS"], poolclass=NullPool)
+    key = f"coffee_platform extract {workspace.name}"
+    with engine.connect() as connection:
+        connection.execute(text("SELECT pg_advisory_lock(hashtext(:key))"), {"key": key})
+        context.log.info("extract lock held")
+        try:
+            yield
+        finally:
+            connection.execute(text("SELECT pg_advisory_unlock(hashtext(:key))"), {"key": key})
+    engine.dispose()
+
+
 @multi_asset(
     name="hardened_pos_landing",
     specs=[AssetSpec([PREFIX, f"landing_{t}"], group_name="hardened_landing") for t in POS_TABLES],
@@ -107,8 +135,9 @@ def hardened_pos_landing(
     """dlt with a lag window of `lag_days`, as Parquet under dt=<partition>."""
     lag_seconds = timedelta(days=config.lag_days).total_seconds() or None
     context.log.info(f"lag window: {config.lag_days} days")
-    extract = extract_to_landing(context, workspace, lag_seconds=lag_seconds)
-    written = write_manifest(clickhouse, workspace, context.partition_key, extract)
+    with one_extract_at_a_time(context, workspace):  # the cursor is the pipeline's
+        extract = extract_to_landing(context, workspace, lag_seconds=lag_seconds)
+        written = write_manifest(clickhouse, workspace, context.partition_key, extract)
     context.log.info(f"manifest: {written}")
     failpoint(context, "after_landing")  # files and manifest landed, nothing loaded
     for table, rows in extract.rows.items():
