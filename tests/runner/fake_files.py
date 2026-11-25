@@ -10,8 +10,12 @@ day's POS rows (orders, order lines) to a source. A run has two stages:
 After loading, a run refreshes a gold table, sales per order day and store,
 for the keys its files touched. A plain run does all of it; a run asked to
 crash "after_landing" stops between ingest and load, one asked to crash at
-"gold_mid_write" stops inside the gold refresh (both INTERRUPTED). The mode
-plays the two reference editions:
+"after_bronze_write" stops once the files are loaded, before gold, and one
+asked to crash at "gold_mid_write" stops inside the gold refresh (all
+INTERRUPTED). A run that may be retried is, as Dagster's daemon would: from
+the failed step on, that is the load again, never the ingest, and with no
+failpoint (a retry inherits the tag; the platform skips it). The mode plays
+the two reference editions:
 
     append  no look back at the source, every file loaded as it comes, order
             lines appended                                    -> naive
@@ -92,6 +96,7 @@ class FakeFilePlatform(Adapter):
                 Capability.LANDING_FILES,
                 Capability.RUN_STAGES,
                 Capability.FAILPOINTS,
+                Capability.RETRIES,
             }
         )
         return Capabilities(features, (ORDERS, LINES, GOLD))
@@ -109,6 +114,16 @@ class FakeFilePlatform(Adapter):
             self.source[dataset][day] = rows
 
     def run(self, request: RunRequest) -> RunResult:
+        attempts = [self._attempt(request)]
+        while not attempts[-1].succeeded and len(attempts) <= request.retries:
+            attempts.append(self._attempt(RunRequest(request.partition, Stage.LOAD)))
+        if len(attempts) == 1:
+            return attempts[0]
+        failed = [a for a in attempts if a.status is RunStatus.FAILED]
+        status = RunStatus.FAILED if failed else attempts[-1].status
+        return RunResult(status, metadata={"attempts": str(len(attempts))})
+
+    def _attempt(self, request: RunRequest) -> RunResult:
         if request.stage in (None, Stage.INGEST):
             self._ingest(request.partition)
             if request.failpoint == "after_landing":
@@ -116,6 +131,8 @@ class FakeFilePlatform(Adapter):
         problems = []
         if request.stage in (None, Stage.LOAD):
             problems, touched = self._load(request.partition)
+            if request.failpoint == "after_bronze_write":
+                return RunResult(RunStatus.INTERRUPTED)  # loaded, not recorded as done
             if not self._refresh_gold(touched, request.failpoint == "gold_mid_write"):
                 return RunResult(RunStatus.INTERRUPTED)  # died inside the gold refresh
         if problems:
