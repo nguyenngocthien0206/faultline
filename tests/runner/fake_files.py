@@ -7,8 +7,11 @@ day's POS rows (orders, order lines) to a source. A run has two stages:
             under the run's partition of an in-memory landing zone
     load    load every landing file of that partition (and only that one)
 
-A plain run does both; a run asked to crash "after_landing" stops between
-them (INTERRUPTED). The mode plays the two reference editions:
+After loading, a run refreshes a gold table, sales per order day and store,
+for the keys its files touched. A plain run does all of it; a run asked to
+crash "after_landing" stops between ingest and load, one asked to crash at
+"gold_mid_write" stops inside the gold refresh (both INTERRUPTED). The mode
+plays the two reference editions:
 
     append  no look back at the source, every file loaded as it comes, order
             lines appended                                    -> naive
@@ -18,6 +21,10 @@ them (INTERRUPTED). The mode plays the two reference editions:
             fewer rows than promised) and the schema contract (missing or
             unexpected column): that dataset is not loaded and the run
             fails                                             -> hardened
+
+and they refresh gold as the editions do: append deletes the touched keys,
+then inserts them again (dbt's delete+insert: a crash in between leaves them
+gone); keyed builds the new rows aside and swaps them in, in one step.
 
 Both read files by column name, as ClickHouse does: in append mode a column
 the file lacks is silently filled with 0.
@@ -56,6 +63,7 @@ LINES = TableContract(
     measures=("qty",),
     truth_dataset="pos/order_items",
 )
+GOLD = TableContract("gold_daily_sales", key=("order_date", "store_id"), measures=("total_vnd",))
 DATASETS = {"pos/orders": "orders", "pos/order_items": "order_items"}
 CONTRACTS = {"pos/orders": ORDER_COLUMNS, "pos/order_items": ORDER_ITEM_COLUMNS}
 LAG = timedelta(days=3)
@@ -72,6 +80,7 @@ class FakeFilePlatform(Adapter):
         self.manifest: dict[tuple[str, date], dict[str, int]] = {}  # promised rows per file
         self.orders: dict[str, dict[str, str]] = {}
         self.lines: list[dict[str, str]] = []
+        self.gold: dict[tuple[str, str], int] = {}  # (order_date, store_id) -> total_vnd
 
     def capabilities(self) -> Capabilities:
         features = frozenset(
@@ -85,7 +94,7 @@ class FakeFilePlatform(Adapter):
                 Capability.FAILPOINTS,
             }
         )
-        return Capabilities(features, (ORDERS, LINES))
+        return Capabilities(features, (ORDERS, LINES, GOLD))
 
     def setup(self) -> None: ...
 
@@ -106,7 +115,9 @@ class FakeFilePlatform(Adapter):
                 return RunResult(RunStatus.INTERRUPTED)  # landed, cursor saved, nothing loaded
         problems = []
         if request.stage in (None, Stage.LOAD):
-            problems = self._load(request.partition)
+            problems, touched = self._load(request.partition)
+            if not self._refresh_gold(touched, request.failpoint == "gold_mid_write"):
+                return RunResult(RunStatus.INTERRUPTED)  # died inside the gold refresh
         if problems:
             return RunResult(RunStatus.FAILED, errors=tuple(problems))
         return RunResult(RunStatus.SUCCEEDED)
@@ -132,8 +143,10 @@ class FakeFilePlatform(Adapter):
         if delivered:
             self.cursor = max(delivered)
 
-    def _load(self, partition: date) -> list[str]:
+    def _load(self, partition: date) -> tuple[list[str], set[tuple[str, str]]]:
+        """Load the partition's files; return the problems and the gold keys touched."""
         problems: list[str] = []
+        touched: set[tuple[str, str]] = set()
         for dataset in DATASETS:
             found = self.landing_files(dataset, partition)
             if self.mode == "keyed":
@@ -150,6 +163,7 @@ class FakeFilePlatform(Adapter):
                 ]
                 if dataset == "pos/orders":
                     for row in rows:
+                        touched.add(_gold_key(row))
                         current = self.orders.get(row["order_id"])
                         if current is None or row["updated_at"] >= current["updated_at"]:
                             self.orders[row["order_id"]] = row
@@ -158,7 +172,25 @@ class FakeFilePlatform(Adapter):
         if self.mode == "keyed":
             latest = {(r["order_id"], r["line_no"]): r for r in self.lines}
             self.lines = list(latest.values())
-        return problems
+        return problems, touched
+
+    def _refresh_gold(self, touched: set[tuple[str, str]], crash: bool) -> bool:
+        """Refresh the touched gold keys from the orders; False if the run died doing it."""
+        fresh: dict[tuple[str, str], int] = dict.fromkeys(touched, 0)
+        for order in self.orders.values():
+            if (key := _gold_key(order)) in fresh:
+                fresh[key] += int(order["total_vnd"])
+        if self.mode == "keyed":
+            if crash:
+                return False  # built aside, never swapped in: gold is as it was
+            self.gold.update(fresh)
+            return True
+        for key in touched:  # delete ...
+            self.gold.pop(key, None)
+        if crash:
+            return False  # ... and die before the insert
+        self.gold.update(fresh)
+        return True
 
     def _reconcile(self, dataset: str, partition: date, found: list[str]) -> list[str]:
         promised = self.manifest.get((dataset, partition), {})
@@ -178,7 +210,11 @@ class FakeFilePlatform(Adapter):
         return problems
 
     def snapshot(self, table: str, dest: Path) -> Path:
-        if table == "silver_orders":
+        if table == "gold_daily_sales":
+            header = ("order_date", "store_id", "total_vnd")
+            rows = [(*key, total) for key, total in self.gold.items()]
+            select = "order_date, store_id, total_vnd::BIGINT AS total_vnd"
+        elif table == "silver_orders":
             header = ("order_id", "total_vnd")
             rows = [(r["order_id"], r["total_vnd"]) for r in self.orders.values()]
             select = "order_id, total_vnd::BIGINT AS total_vnd"
@@ -210,3 +246,7 @@ class FakeFilePlatform(Adapter):
 
     def delete_landing_file(self, dataset: str, partition: date, file: str) -> None:
         del self.files[dataset, partition, file]
+
+
+def _gold_key(order: dict[str, str]) -> tuple[str, str]:
+    return order["ordered_at"][:10], order["store_id"]
