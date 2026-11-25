@@ -338,3 +338,33 @@ def test_run_logged_finds_a_line_in_the_event_log(stub: StubServer) -> None:
     assert client(stub).run_logged("r1", "faultline failpoint reached: after_landing")
     assert not client(stub).run_logged("r1", "faultline failpoint reached: after_landing")
     assert stub.requests[0].json()["variables"] == {"runId": "r1"}
+
+
+def test_find_run_looks_runs_up_by_every_tag(stub: StubServer) -> None:
+    stub.reply(200, _runs({"runId": "r2"}))
+    stub.reply(200, _runs())
+
+    assert client(stub).find_run({"dagster/parent_run_id": "r1"}) == "r2"
+    assert client(stub).find_run({"dagster/parent_run_id": "r9"}) is None
+    assert stub.requests[0].json()["variables"] == {
+        "tags": [{"key": "dagster/parent_run_id", "value": "r1"}]
+    }
+
+
+def test_waiting_for_a_retry_polls_until_the_daemon_launched_it(stub: StubServer) -> None:
+    stub.reply(200, _runs())
+    stub.reply(200, _runs())
+    stub.reply(200, _runs({"runId": "r2"}))
+    sleeps: list[float] = []
+
+    assert client(stub).wait_for_retry("r1", poll_interval=2.0, sleep=sleeps.append) == "r2"
+    assert sleeps == [2.0, 2.0]
+
+
+def test_a_retry_that_never_starts_is_an_error_not_a_hang(stub: StubServer) -> None:
+    for _ in range(3):
+        stub.reply(200, _runs())
+    ticks = iter([0.0, 50.0, 130.0])
+
+    with pytest.raises(RunTimeoutError, match="asked for a retry and none started within 120s"):
+        client(stub).wait_for_retry("r1", sleep=lambda _: None, clock=lambda: next(ticks))

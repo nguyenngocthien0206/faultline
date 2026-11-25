@@ -36,6 +36,9 @@ class Capability(StrEnum):
     # Make a run die, hard, at a named point (a failpoint), and tell that
     # crash from a failure of the platform's own: RunStatus.INTERRUPTED.
     FAILPOINTS = "interrupt.failpoint"
+    # Ask the orchestrator to retry a run that failed, as its own retry policy
+    # would, and report the run once its last attempt has ended.
+    RETRIES = "run.retry"
 
 
 @dataclass(frozen=True)
@@ -81,6 +84,7 @@ class RunRequest:
     partition: date
     stage: Stage | None = None  # None: the whole partition, both halves
     failpoint: str | None = None  # die there (Capability.FAILPOINTS); None: run normally
+    retries: int = 0  # times the orchestrator may retry a failed run (Capability.RETRIES)
 
 
 @dataclass(frozen=True)

@@ -31,7 +31,11 @@ from faultline.adapters.base import (
     TableContract,
 )
 from faultline.connectors.clickhouse import ClickHouseClient
-from faultline.connectors.dagster import DagsterClient
+from faultline.connectors.dagster import (
+    MAX_RETRIES_TAG,
+    RETRY_STRATEGY_TAG,
+    DagsterClient,
+)
 from faultline.connectors.postgres import SourceDatabase
 from faultline.connectors.s3 import LandingBucket
 from faultline.connectors.workspace import new_workspace_name, validate_workspace_name
@@ -233,6 +237,7 @@ class ReferenceAdapter(Adapter):
                 Capability.LANDING_FILES,
                 Capability.RUN_STAGES,
                 Capability.FAILPOINTS,
+                Capability.RETRIES,
             }
         )
         return Capabilities(features=features, tables=CONSUMER_TABLES)
@@ -249,21 +254,37 @@ class ReferenceAdapter(Adapter):
         apply_day(self.source, self.workspace, self.generated_root, day)
 
     def run(self, request: RunRequest) -> RunResult:
+        """Launch the run, wait for it and, if it asked for retries, for each retry.
+
+        Retries are Dagster's own (the daemon re-executes a failed run from the
+        failed step), asked for by this run alone: the instance retries nothing
+        by default. A retry inherits the failpoint tag, and the platform's
+        failpoints never fire in a retry, so only the first attempt can be
+        faultline's crash.
+        """
         tags = {"faultline/workspace": self.workspace}
         if request.failpoint:
             tags[FAILPOINT_TAG] = request.failpoint
+        if request.retries:
+            tags[MAX_RETRIES_TAG] = str(request.retries)
+            tags[RETRY_STRATEGY_TAG] = "FROM_FAILURE"
         run_id = self.dagster.launch_run(
             self.job_for(request.stage),
             partition=request.partition.isoformat(),
             run_config=self.run_config(request.stage),
             tags=tags,
         )
+        attempts = [self._attempt(run_id, request.failpoint)]
+        while not attempts[-1].succeeded and len(attempts) <= request.retries:
+            retry_id = self.dagster.wait_for_retry(str(attempts[-1].run_id))
+            attempts.append(self._attempt(retry_id, None))
+        return settle(attempts)
+
+    def _attempt(self, run_id: str, failpoint: str | None) -> RunResult:
         outcome = self.dagster.wait_for_run(run_id, timeout=self.config.run_timeout_seconds)
         if outcome.succeeded:
             return RunResult(RunStatus.SUCCEEDED, run_id=run_id)
-        if request.failpoint and self.dagster.run_logged(
-            run_id, FAILPOINT_REACHED + request.failpoint
-        ):
+        if failpoint and self.dagster.run_logged(run_id, FAILPOINT_REACHED + failpoint):
             # faultline's own crash: the platform logged the failpoint, then died
             return RunResult(RunStatus.INTERRUPTED, errors=outcome.errors, run_id=run_id)
         return RunResult(RunStatus.FAILED, errors=outcome.errors, run_id=run_id)
@@ -396,3 +417,26 @@ def clean_reference_stack(
     for name in report.warehouse:
         clickhouse.drop_workspace(name)
     return report
+
+
+def settle(attempts: list[RunResult]) -> RunResult:
+    """One result for a run and its retries.
+
+    The last attempt's status, unless an attempt failed on its own: a failure
+    the platform raised is a signal (a failure alert fires on it) even if a
+    retry then went green. faultline's crash (INTERRUPTED) followed by a green
+    retry is a green run.
+    """
+    if len(attempts) == 1:
+        return attempts[0]
+    failed = [a for a in attempts if a.status is RunStatus.FAILED]
+    return RunResult(
+        RunStatus.FAILED if failed else attempts[-1].status,
+        errors=tuple(e for a in failed for e in a.errors),
+        run_id=attempts[-1].run_id,
+        metadata={
+            "attempts": str(len(attempts)),
+            "statuses": ",".join(a.status for a in attempts),
+            "root_run_id": str(attempts[0].run_id),
+        },
+    )
