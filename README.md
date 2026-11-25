@@ -25,6 +25,7 @@ uv run faultline run crash-after-landing                 # a run killed between 
 uv run faultline run crash-mid-write                     # a run killed inside a gold table refresh
 uv run faultline run retry-after-partial-commit          # a crashed run retried by the orchestrator
 uv run faultline run idempotency                         # no fault: an old day is simply run again
+uv run faultline run backfill                            # no fault: the whole history in one backfill
 ```
 
 `pos-offline-sync` takes a store's till offline for two days. When it reconnects, its orders reach the source database with their real, older timestamps, behind the incremental cursor of the ingestion tool. On the reference platform's naive pipeline the result looks like this:
@@ -59,6 +60,8 @@ The hardened edition runs the same tools with established patterns: a lag window
 `retry-after-partial-commit` kills day 2's run right after bronze wrote the day's order lines, before Dagster recorded the step as done, and lets Dagster retry it, as a retry policy would. The write was committed, the record of it was not, so the retry writes it again. On naive, which appends, the 163 lines are there twice: items sold +22%, revenue unchanged to the dong, every run green. Hardened replaces the day's partition, so writing it twice changes nothing: `PASS`. Turning on retries is a one-line setting that makes every crash disappear from the run history; whether that is a good idea depends entirely on whether each step can safely run twice, and this experiment is how a team finds out before the retries do.
 
 `idempotency` breaks nothing at all. The four days run as usual, then day 2 is run again, as an operator does after an incident or a fix, and faultline compares the tables just before and just after. On naive the rerun is green and counts the day twice: net revenue +21.4%, items sold +65.9%. That is the move every runbook reaches for first, and on this pipeline it is a fault of its own. Hardened gives back exactly the same tables. The check is a probe: a property may add actions of its own (here a snapshot, the rerun, a snapshot), and faultline runs them in their own experiment so the answer is not muddied by an earlier fault.
+
+`backfill` breaks nothing either. All four days reach the source first, then Dagster backfills them in one request, as a team loading its history would, and the tables must equal those of running the days one by one. Dagster runs a backfill's days side by side, and naive's four extracts share one dlt cursor and one set of working files: runs fail on each other's files, and the history lands once, twice or three times depending on who started first. It is the first `BROKEN` of the scorecard (a run failed, nothing heals it), and on the one try where every run was green the numbers were still off. Hardened was wrong too until its extracts took turns: a lock on the source database per pipeline, while loads and dbt still run side by side. The bug was never in the daily runs, so no daily test would have found it.
 
 ## Development
 
