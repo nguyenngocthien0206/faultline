@@ -9,7 +9,12 @@ from faultline.datagen.spec import DatasetSpec
 from faultline.faults.execution import CrashAfterLanding, CrashMidWrite, RetryAfterPartialCommit
 from faultline.faults.landing import ColumnDrift, DuplicateFile, LateFile, TruncatedFile
 from faultline.faults.source import PosOfflineSync
-from faultline.properties.core import NoDataLoss, NoSilentCorruption, NoVanishingRows
+from faultline.properties.core import (
+    Idempotency,
+    NoDataLoss,
+    NoSilentCorruption,
+    NoVanishingRows,
+)
 from faultline.runner import Experiment
 
 
@@ -157,6 +162,23 @@ def retry_after_partial_commit(spec: DatasetSpec) -> Experiment:
     )
 
 
+def idempotency(spec: DatasetSpec) -> Experiment:
+    """No fault: every day runs clean, then day 2 is run again, as an operator would."""
+    if spec.days < 3:
+        raise ValueError("idempotency needs at least 3 days of data")
+    return Experiment(
+        name="idempotency",
+        description=(
+            "Nothing breaks. Every day runs as usual, then day 2, long processed, is run "
+            "again, as an operator does after an incident or a fix. A reader should see "
+            "no difference."
+        ),
+        spec=spec,
+        faults=(),
+        properties=(Idempotency(rerun=spec.start_date + timedelta(days=1)), NoSilentCorruption()),
+    )
+
+
 BUILTIN: dict[str, Callable[[DatasetSpec], Experiment]] = {
     "pos-offline-sync": pos_offline_sync,
     "duplicate-file": duplicate_file,
@@ -166,4 +188,5 @@ BUILTIN: dict[str, Callable[[DatasetSpec], Experiment]] = {
     "crash-after-landing": crash_after_landing,
     "crash-mid-write": crash_mid_write,
     "retry-after-partial-commit": retry_after_partial_commit,
+    "idempotency": idempotency,
 }

@@ -1,12 +1,14 @@
-"""The first properties: nothing lost, nothing silently different."""
+"""The core properties: nothing lost, nothing silently different, nothing done twice."""
 
 from __future__ import annotations
 
+from datetime import date
 from typing import ClassVar
 
 from faultline.oracle.diff import diff
 from faultline.oracle.invariants import complete_keys
 from faultline.properties.base import Checkpoint, Property, PropertyContext, PropertyResult
+from faultline.schedule import Run, Schedule, Snapshot
 
 
 class NoDataLoss(Property):
@@ -94,4 +96,41 @@ class NoVanishingRows(Property):
             if vanished := d.counts["missing"]:
                 examples = ", ".join(d.samples["missing"])
                 evidence.append(f"{contract.name}: {vanished:,} keys vanished, e.g. {examples}")
+        return PropertyResult(self.name, checkpoint.name, not evidence, tuple(evidence))
+
+
+class Idempotency(Property):
+    """Running an already processed day again changes nothing a reader can see.
+
+    The operator's everyday move (after an incident, a fix, or just to be sure)
+    must be safe. The probe reruns `rerun`, an old day, once every day has been
+    processed, with a snapshot on either side; any difference between the two
+    (a row missing, extra, duplicated or changed) breaks the promise. Rerunning
+    the last day is the easy case, which is why the probe picks an older one.
+
+    The probe runs in the fault phase's sandbox, so R sees the same snapshots
+    and gives the same answer: the state after the rerun is the state readers
+    keep.
+    """
+
+    name: ClassVar[str] = "idempotency"
+    BEFORE: ClassVar[str] = "before_rerun"
+    AFTER: ClassVar[str] = "after_rerun"
+
+    def __init__(self, rerun: date) -> None:
+        self.rerun = rerun
+
+    def probe(self) -> Schedule:
+        return (Snapshot(self.BEFORE), Run(self.rerun), Snapshot(self.AFTER))
+
+    def check(self, ctx: PropertyContext, checkpoint: Checkpoint) -> PropertyResult:
+        missing = {self.BEFORE, self.AFTER} - set(checkpoint.marks)
+        if missing:
+            raise ValueError(f"no snapshot named {', '.join(sorted(missing))} at {checkpoint.name}")
+        before, after = checkpoint.marks[self.BEFORE], checkpoint.marks[self.AFTER]
+        evidence = []
+        for contract in ctx.contracts:
+            d = diff(before[contract.name], after[contract.name], contract)
+            if not d.is_empty:
+                evidence.append(f"rerun of {self.rerun}: {d.summary()}")
         return PropertyResult(self.name, checkpoint.name, not evidence, tuple(evidence))
