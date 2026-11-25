@@ -5,10 +5,11 @@ from __future__ import annotations
 from datetime import date
 from typing import ClassVar
 
+from faultline.adapters.base import Capability
 from faultline.oracle.diff import diff
 from faultline.oracle.invariants import complete_keys
 from faultline.properties.base import Checkpoint, Property, PropertyContext, PropertyResult
-from faultline.schedule import Run, Schedule, Snapshot
+from faultline.schedule import Backfill, Run, Schedule, Snapshot
 
 
 class NoDataLoss(Property):
@@ -133,4 +134,34 @@ class Idempotency(Property):
             d = diff(before[contract.name], after[contract.name], contract)
             if not d.is_empty:
                 evidence.append(f"rerun of {self.rerun}: {d.summary()}")
+        return PropertyResult(self.name, checkpoint.name, not evidence, tuple(evidence))
+
+
+class BackfillEquivalence(Property):
+    """Loading a range of days in one backfill gives what running them day by day gives.
+
+    A team loading its history, or rebuilding after an incident, backfills
+    instead of replaying every day. The probe asks the orchestrator for one
+    backfill of `start` to `end`, run however it runs backfills (Dagster: one
+    run per day, side by side); the tables afterwards must equal the baseline,
+    which ran the same days one at a time. Meant for an experiment that only
+    delivers the days (`deliveries_only`), so the backfill is the first load.
+    """
+
+    name: ClassVar[str] = "backfill_equivalence"
+    requires: ClassVar[frozenset[Capability]] = frozenset({Capability.BACKFILL})
+
+    def __init__(self, start: date, end: date) -> None:
+        self.start = start
+        self.end = end
+
+    def probe(self) -> Schedule:
+        return (Backfill(self.start, self.end),)
+
+    def check(self, ctx: PropertyContext, checkpoint: Checkpoint) -> PropertyResult:
+        evidence = []
+        for contract in ctx.contracts:
+            d = diff(ctx.baseline[contract.name], checkpoint.snapshots[contract.name], contract)
+            if not d.is_empty:
+                evidence.append(f"backfill {self.start}..{self.end}: {d.summary()}")
         return PropertyResult(self.name, checkpoint.name, not evidence, tuple(evidence))

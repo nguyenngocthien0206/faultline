@@ -10,12 +10,14 @@ from faultline.faults.execution import CrashAfterLanding, CrashMidWrite, RetryAf
 from faultline.faults.landing import ColumnDrift, DuplicateFile, LateFile, TruncatedFile
 from faultline.faults.source import PosOfflineSync
 from faultline.properties.core import (
+    BackfillEquivalence,
     Idempotency,
     NoDataLoss,
     NoSilentCorruption,
     NoVanishingRows,
 )
 from faultline.runner import Experiment
+from faultline.schedule import deliveries_only
 
 
 def pos_offline_sync(spec: DatasetSpec) -> Experiment:
@@ -179,6 +181,24 @@ def idempotency(spec: DatasetSpec) -> Experiment:
     )
 
 
+def backfill(spec: DatasetSpec) -> Experiment:
+    """No fault: every day is delivered first, then the whole range is backfilled at once."""
+    if spec.days < 2:
+        raise ValueError("backfill needs at least 2 days of data")
+    return Experiment(
+        name="backfill",
+        description=(
+            "Nothing breaks. Every day reaches the source before anything runs, then the "
+            "orchestrator backfills them all in one request, as a team loading its history "
+            "would. The tables must equal those of running the days one by one."
+        ),
+        spec=spec,
+        faults=(),
+        properties=(BackfillEquivalence(spec.start_date, spec.end_date), NoDataLoss()),
+        schedule=deliveries_only,
+    )
+
+
 BUILTIN: dict[str, Callable[[DatasetSpec], Experiment]] = {
     "pos-offline-sync": pos_offline_sync,
     "duplicate-file": duplicate_file,
@@ -189,4 +209,5 @@ BUILTIN: dict[str, Callable[[DatasetSpec], Experiment]] = {
     "crash-mid-write": crash_mid_write,
     "retry-after-partial-commit": retry_after_partial_commit,
     "idempotency": idempotency,
+    "backfill": backfill,
 }

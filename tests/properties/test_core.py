@@ -4,11 +4,17 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from faultline.adapters.base import RunResult, RunStatus, TableContract
+from faultline.adapters.base import Capability, RunResult, RunStatus, TableContract
 from faultline.datagen.writer import write_landing_file
 from faultline.properties.base import Checkpoint, PropertyContext
-from faultline.properties.core import Idempotency, NoDataLoss, NoSilentCorruption, NoVanishingRows
-from faultline.schedule import Run, Snapshot
+from faultline.properties.core import (
+    BackfillEquivalence,
+    Idempotency,
+    NoDataLoss,
+    NoSilentCorruption,
+    NoVanishingRows,
+)
+from faultline.schedule import Backfill, Run, Snapshot
 
 ORDERS = TableContract(
     "silver_orders", key=("order_id",), measures=("total_vnd",), truth_dataset="pos/orders"
@@ -204,3 +210,40 @@ def test_any_difference_after_the_rerun_breaks_it(
 def test_idempotency_needs_the_snapshots_of_its_probe(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="no snapshot named after_rerun, before_rerun at F"):
         Idempotency(date(2026, 11, 2)).check(_gold_only(tmp_path), Checkpoint("F", {}, ()))
+
+
+def _against(tmp_path: Path, baseline: list[tuple[str, int]], actual: list[tuple[str, int]]):
+    ctx = PropertyContext(
+        contracts=(SALES,),
+        baseline={"gold_sales": _sales(tmp_path / "baseline.parquet", baseline)},
+        truth_root=tmp_path,
+    )
+    return ctx, Checkpoint("F", {"gold_sales": _sales(tmp_path / "f.parquet", actual)}, ())
+
+
+def test_backfill_equivalence_probes_with_one_backfill_and_needs_the_capability() -> None:
+    prop = BackfillEquivalence(date(2026, 11, 1), date(2026, 11, 4))
+
+    assert prop.probe() == (Backfill(date(2026, 11, 1), date(2026, 11, 4)),)
+    assert prop.requires == {Capability.BACKFILL}
+
+
+def test_a_backfill_that_gives_the_daily_answer_is_equivalent(tmp_path: Path) -> None:
+    rows = [("2026-11-01", 100), ("2026-11-02", 200)]
+    ctx, at_f = _against(tmp_path, rows, rows)
+
+    assert BackfillEquivalence(date(2026, 11, 1), date(2026, 11, 2)).check(ctx, at_f).holds
+
+
+def test_any_difference_from_the_daily_answer_breaks_equivalence(tmp_path: Path) -> None:
+    ctx, at_f = _against(
+        tmp_path,
+        [("2026-11-01", 100), ("2026-11-02", 200)],
+        [("2026-11-01", 100), ("2026-11-01", 100), ("2026-11-02", 200)],
+    )
+
+    result = BackfillEquivalence(date(2026, 11, 1), date(2026, 11, 2)).check(ctx, at_f)
+
+    assert not result.holds
+    (line,) = result.evidence
+    assert line.startswith("backfill 2026-11-01..2026-11-02: gold_sales: 1 duplicated keys")
