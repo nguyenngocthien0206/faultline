@@ -3,7 +3,9 @@
 It answers the question a data team actually has ("what does our platform
 survive, and where does it go wrong without anyone noticing?") in one table,
 with one line of evidence for every cell that is not a PASS. Markdown for
-people and pull requests, JSON for CI.
+people and pull requests, JSON for CI. A cell of an experiment that measures
+convergence also says how many rounds of recovery it took: `PASS (1)`, or
+`SILENT_CORRUPTION (>3)` when three were not enough.
 
 Checked against a file of expected verdicts (scorecard/expected.yaml) it is a
 regression test for the platform: a cell that moves is a change in how the
@@ -49,6 +51,25 @@ class Scorecard:
         record = self.cells.get((experiment, target))
         return None if record is None else str(record["outcome"])
 
+    def rounds(self, experiment: str, target: str) -> str | None:
+        """How many rounds recovery took, `>N` when N were not enough; None if not measured."""
+        record = self.cells.get((experiment, target))
+        if record is None or not record.get("recovery"):
+            return None
+        if not any(p["name"] == "convergence" for p in record["properties"]):
+            return None
+        recovery = record["recovery"]
+        if recovery["converged"]:
+            return str(len(recovery["rounds"]))
+        return f">{len(recovery['rounds'])}"
+
+    def cell(self, experiment: str, target: str) -> str:
+        outcome = self.outcome(experiment, target)
+        if outcome is None:
+            return "-"
+        rounds = self.rounds(experiment, target)
+        return outcome if rounds is None else f"{outcome} ({rounds})"
+
     def totals(self, target: str) -> str:
         counts = Counter(o for e in self.experiments if (o := self.outcome(e, target)) is not None)
         order = [*(str(o) for o in Outcome), *sorted(counts)]
@@ -62,8 +83,14 @@ class Scorecard:
             "|---|" + "---|" * len(self.targets),
         ]
         for e in self.experiments:
-            cells = [self.outcome(e, t) or "-" for t in self.targets]
+            cells = [self.cell(e, t) for t in self.targets]
             lines.append(f"| {e} | " + " | ".join(cells) + " |")
+        if any(self.rounds(e, t) for e in self.experiments for t in self.targets):
+            lines += [
+                "",
+                "(n): rounds of recovery until the outputs matched the baseline; "
+                "(>n): not within n.",
+            ]
         lines += ["", *(f"- {t}: {self.totals(t)}" for t in self.targets)]
         evidence = [
             f"- {e} on {t} ({record['outcome']}): {line}"
@@ -81,6 +108,12 @@ class Scorecard:
             "targets": list(self.targets),
             "matrix": {e: {t: self.outcome(e, t) for t in self.targets} for e in self.experiments},
             "totals": {t: self.totals(t) for t in self.targets},
+            "rounds": {
+                f"{e}__{t}": rounds
+                for e in self.experiments
+                for t in self.targets
+                if (rounds := self.rounds(e, t)) is not None
+            },
             "evidence": {
                 f"{e}__{t}": line
                 for (e, t), record in sorted(self.cells.items())

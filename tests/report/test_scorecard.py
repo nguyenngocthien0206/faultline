@@ -4,8 +4,9 @@ import json
 from pathlib import Path
 
 import pytest
-from report_helpers import MATRIX
+from report_helpers import MATRIX, converging
 
+from faultline.outcome import Outcome
 from faultline.report.results import result_record
 from faultline.report.scorecard import (
     ExpectationError,
@@ -156,3 +157,33 @@ def test_columns_follow_the_runs_order_and_any_other_target_comes_after() -> Non
         "naive",
         "hardened",
     )
+
+
+def test_a_cell_that_measured_convergence_shows_the_rounds_it_took() -> None:
+    card = _card(
+        [
+            converging("late-file", "naive", Outcome.SILENT_CORRUPTION, 12, 24, 36),
+            converging("late-file", "hardened", Outcome.PASS, 0),
+            converging("crash-mid-write", "naive", Outcome.SILENT_CORRUPTION, 5, 0),
+            MATRIX[2],  # no convergence measured: the verdict alone
+        ]
+    )
+    text = card.to_markdown()
+
+    assert "| late-file | SILENT_CORRUPTION (>3) | PASS (1) |" in text
+    assert "| crash-mid-write | SILENT_CORRUPTION (2) | - |" in text
+    assert "| truncated-file | SILENT_CORRUPTION | - |" in text
+    assert "(n): rounds of recovery until the outputs matched the baseline" in text
+    assert card.outcome("late-file", "naive") == "SILENT_CORRUPTION"  # what --expect compares
+    assert card.to_json()["rounds"] == {
+        "crash-mid-write__naive": "2",
+        "late-file__naive": ">3",
+        "late-file__hardened": "1",
+    }
+
+
+def test_without_convergence_the_scorecard_has_no_rounds() -> None:
+    card = _card()
+
+    assert "(n): rounds" not in card.to_markdown()
+    assert card.to_json()["rounds"] == {}

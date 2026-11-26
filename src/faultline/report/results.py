@@ -4,8 +4,9 @@
     .faultline/results/<run_id>/run.json    what the run was asked to do
 
 A result file holds everything a scorecard or a CI gate needs (the verdict,
-every property at F and R with its evidence, every run, the dataset, how long
-it took) and points to the snapshots that explain it. Reading results back
+every property at F and R with its evidence, every run, the rounds recovery
+took, the dataset, how long it took) and points to the snapshots that explain
+it. Reading results back
 gives plain dicts: the scorecard needs the data, not the objects that made it.
 """
 
@@ -19,7 +20,7 @@ from typing import Any
 
 from faultline import __version__
 from faultline.datagen.spec import DatasetSpec
-from faultline.properties.base import PropertyResult
+from faultline.properties.base import PropertyResult, Recovery
 from faultline.runner import ExperimentResult
 
 RESULTS_DIR = Path(".faultline/results")
@@ -38,6 +39,25 @@ def result_file(folder: Path, experiment: str, target: str) -> Path:
 
 def _checkpoint(result: PropertyResult) -> dict[str, Any]:
     return {"holds": result.holds, "evidence": list(result.evidence)}
+
+
+def _recovery(recovery: Recovery | None) -> dict[str, Any] | None:
+    if recovery is None:
+        return None
+    return {
+        "max_rounds": recovery.max_rounds,
+        "converged": recovery.converged,
+        "summary": recovery.summary(),
+        "rounds": [
+            {
+                "runs": r.runs,
+                "keys_off": r.keys_off,
+                "rows_off": r.rows_off,
+                "differences": list(r.differences),
+            }
+            for r in recovery.rounds
+        ],
+    }
 
 
 def result_record(
@@ -74,6 +94,7 @@ def result_record(
             ]
             for phase, runs in result.runs.items()
         },
+        "recovery": _recovery(result.recovery),
         "problems": list(result.problems),
         "dataset": dataset.to_dict() if dataset else None,
         "seconds": None if seconds is None else round(seconds, 1),

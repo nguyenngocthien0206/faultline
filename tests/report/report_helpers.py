@@ -1,12 +1,13 @@
 """Hand-made experiment results, shared by the report tests."""
 
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
 from faultline.adapters.base import RunResult, RunStatus
 from faultline.datagen import DatasetSpec
 from faultline.outcome import Outcome
-from faultline.properties.base import PropertyResult
+from faultline.properties.base import PropertyResult, Recovery, Round
 from faultline.runner import ExperimentResult, PropertyVerdict
 
 TINY = DatasetSpec.from_profile("tiny")
@@ -45,3 +46,17 @@ MATRIX = [
     result("truncated-file", "hardened", Outcome.DETECTED, ("lines: 85 missing keys",)),
     result("backfill", "naive", Outcome.ERROR, problems=("steady state not established",)),
 ]
+
+
+def converging(experiment: str, target: str, outcome: Outcome, *rounds: int) -> ExperimentResult:
+    """A result that measured convergence: `rounds` are the keys off after each round."""
+    plain = result(experiment, target, outcome)
+    holds = bool(rounds) and rounds[-1] == 0
+    prop = PropertyVerdict(
+        "convergence",
+        PropertyResult("convergence", "F", True),
+        PropertyResult("convergence", "R", holds, () if holds else ("not converged",)),
+        Outcome.PASS if holds else outcome,
+    )
+    recovery = Recovery(3, tuple(Round(runs=1, keys_off=k, rows_off=k) for k in rounds))
+    return replace(plain, properties=(*plain.properties, prop), recovery=recovery)
