@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 from reference_stack import Stack, experiment, reference_target
+from shared_baseline import Baselines
 
 from faultline.adapters.reference import Edition
 from faultline.datagen import DatasetSpec
@@ -27,17 +28,22 @@ pytestmark = pytest.mark.integration
 TINY = DatasetSpec.from_profile("tiny")
 
 
-def _run(edition: Edition, work_dir: Path) -> ExperimentResult:
-    result = run_experiment(experiment("idempotency"), reference_target(edition), work_dir)
+def _run(edition: Edition, work_dir: Path, baselines: Baselines | None = None) -> ExperimentResult:
+    result = run_experiment(
+        experiment("idempotency"),
+        reference_target(edition),
+        work_dir,
+        baseline=baselines(edition) if baselines else None,
+    )
     print(result.render())
     return result
 
 
 class TestNaive:
     def test_a_rerun_counts_the_day_twice_and_nothing_says_so(
-        self, stack: Stack, tmp_path: Path
+        self, stack: Stack, baselines: Baselines, tmp_path: Path
     ) -> None:
-        result = _run(Edition.NAIVE, tmp_path)
+        result = _run(Edition.NAIVE, tmp_path, baselines)
 
         assert result.outcome is Outcome.SILENT_CORRUPTION, result.render()
         assert all(r.succeeded for _, r in result.runs["fault phase"])
@@ -50,10 +56,13 @@ class TestNaive:
 
 @pytest.mark.hardened
 class TestHardened:
-    def test_a_rerun_changes_nothing(self, stack: Stack, tmp_path: Path) -> None:
-        result = _run(Edition.HARDENED, tmp_path)
+    def test_a_rerun_changes_nothing(
+        self, stack: Stack, baselines: Baselines, tmp_path: Path
+    ) -> None:
+        result = _run(Edition.HARDENED, tmp_path, baselines)
 
         assert result.outcome is Outcome.PASS, result.render()
+        assert "baseline (reused)" in result.runs  # the session's shared clean run
         for prop in result.properties:
             assert prop.at_f.holds, prop.at_f.evidence
             assert prop.at_r.holds, prop.at_r.evidence

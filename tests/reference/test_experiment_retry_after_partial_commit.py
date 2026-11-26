@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 from reference_stack import Stack, experiment, reference_target
+from shared_baseline import Baselines
 
 from faultline.adapters.base import RunResult
 from faultline.adapters.reference import Edition
@@ -33,9 +34,12 @@ TINY = DatasetSpec.from_profile("tiny")
 CRASHED = date(2026, 11, 2)
 
 
-def _run(edition: Edition, work_dir: Path) -> ExperimentResult:
+def _run(edition: Edition, work_dir: Path, baselines: Baselines | None = None) -> ExperimentResult:
     result = run_experiment(
-        experiment("retry-after-partial-commit"), reference_target(edition), work_dir
+        experiment("retry-after-partial-commit"),
+        reference_target(edition),
+        work_dir,
+        baseline=baselines(edition) if baselines else None,
     )
     print(result.render())
     return result
@@ -48,9 +52,9 @@ def _crashed_run(result: ExperimentResult) -> RunResult:
 
 class TestNaive:
     def test_the_retry_writes_the_day_twice_and_nothing_says_so(
-        self, stack: Stack, tmp_path: Path
+        self, stack: Stack, baselines: Baselines, tmp_path: Path
     ) -> None:
-        result = _run(Edition.NAIVE, tmp_path)
+        result = _run(Edition.NAIVE, tmp_path, baselines)
 
         assert result.outcome is Outcome.SILENT_CORRUPTION, result.render()
         run = _crashed_run(result)
@@ -65,8 +69,10 @@ class TestNaive:
 
 @pytest.mark.hardened
 class TestHardened:
-    def test_writing_the_day_again_changes_nothing(self, stack: Stack, tmp_path: Path) -> None:
-        result = _run(Edition.HARDENED, tmp_path)
+    def test_writing_the_day_again_changes_nothing(
+        self, stack: Stack, baselines: Baselines, tmp_path: Path
+    ) -> None:
+        result = _run(Edition.HARDENED, tmp_path, baselines)
 
         assert result.outcome is Outcome.PASS, result.render()
         run = _crashed_run(result)

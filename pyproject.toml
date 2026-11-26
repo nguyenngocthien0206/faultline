@@ -39,6 +39,7 @@ reference = [
 [dependency-groups]
 dev = [
     "boto3>=1.40",
+    "filelock>=3.16",
     "psycopg[binary]>=3.3.8",
     "pyarrow>=18",
     "pytest>=9.2.0",
