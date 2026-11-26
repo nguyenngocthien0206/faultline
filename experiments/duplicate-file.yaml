@@ -8,4 +8,4 @@ faults:
   - type: duplicate_file
     original_day: 2
     redelivered_on: 3
-properties: [no_data_loss, no_silent_corruption]
+properties: [no_data_loss, no_silent_corruption, convergence]

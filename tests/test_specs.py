@@ -62,6 +62,10 @@ def test_every_experiment_in_the_repository_loads() -> None:
         assert experiment.name == name
         assert experiment.spec == TINY
         assert "  " not in experiment.description  # folded into one line
+        # Every experiment with a fault counts the rounds its recovery takes, up to three.
+        measured = any(p.name == "convergence" for p in experiment.properties)
+        assert measured == bool(experiment.faults), name
+        assert experiment.recovery_rounds == 3
 
 
 def test_days_are_counted_in_the_dataset_so_a_longer_profile_keeps_their_meaning() -> None:
@@ -141,7 +145,7 @@ def test_last_and_first_days() -> None:
             "faults: [{type: meteor_strike}]\nproperties: [no_data_loss]\n",
             "unknown fault type 'meteor_strike'",
         ),
-        ("properties: [convergence]\n", "unknown property type 'convergence'"),
+        ("properties: [convergence]\nmax_runs: 3\n", "max_runs: Extra inputs"),
         (
             "faults: [{type: truncated_file, partition: 2, keep: 0.5, speed: 3}]\n"
             "properties: [no_data_loss]\n",
