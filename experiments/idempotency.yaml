@@ -1,0 +1,13 @@
+name: idempotency
+description: >
+  Nothing breaks. Every day runs as usual, then day 2, long processed, is run
+  again, as an operator does after an incident or a fix. A reader should see no
+  difference.
+dataset:
+  profile: tiny
+faults: []
+properties:
+  # An old day: rerunning the last one is the easy case.
+  - type: idempotency
+    rerun: 2
+  - no_silent_corruption

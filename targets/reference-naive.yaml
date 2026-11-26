@@ -1,0 +1,8 @@
+# The naive edition of the reference platform (docker compose, `make ref-up`).
+name: reference-naive
+adapter: reference
+environment: test          # required: faultline only runs against a test environment
+allow_destructive: true    # required: it deletes and rewrites data by design
+options:
+  edition: naive
+  env_file: ../reference/.env   # relative to this file

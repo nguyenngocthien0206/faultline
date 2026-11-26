@@ -1,15 +1,17 @@
 from datetime import date
+from pathlib import Path
 
 import pytest
 
 from faultline.adapters.base import Capability
 from faultline.datagen import DatasetSpec
-from faultline.experiments import BUILTIN, duplicate_file
 from faultline.faults.base import FaultSetupError, InjectionPoint
 from faultline.faults.landing import POS_DATASETS, DuplicateFile
 from faultline.schedule import CopyLandingFiles, Deliver, Run, clean_schedule
+from faultline.spec import SpecError, load_experiment
 
 TINY = DatasetSpec.from_profile("tiny")
+EXPERIMENTS = Path(__file__).resolve().parents[2] / "experiments"
 D1, D2, D3, D4 = (date(2026, 11, d) for d in (1, 2, 3, 4))
 
 
@@ -71,10 +73,10 @@ def test_an_empty_dataset_list_is_refused() -> None:
 
 
 def test_the_built_in_experiment_resends_day_two_under_day_three() -> None:
-    experiment = BUILTIN["duplicate-file"](TINY)
+    experiment = load_experiment(EXPERIMENTS / "duplicate-file.yaml")
 
     (fault,) = experiment.faults
     assert isinstance(fault, DuplicateFile)
     assert (fault.original_day, fault.redelivered_on) == (D2, D3)
-    with pytest.raises(ValueError, match="at least 3 days"):
-        duplicate_file(DatasetSpec.from_profile("tiny", days=2))
+    with pytest.raises(SpecError, match="day 3 is outside a 2-day dataset"):
+        load_experiment(EXPERIMENTS / "duplicate-file.yaml", dataset={"days": 2})

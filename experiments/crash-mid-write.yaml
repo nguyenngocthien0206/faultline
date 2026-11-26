@@ -1,0 +1,14 @@
+name: crash-mid-write
+description: >
+  The run of day 3 is killed, hard, in the middle of refreshing the gold sales
+  table: the old rows of the days it touches are out, the new ones not yet in.
+dataset:
+  profile: tiny
+faults:
+  # Day 3, not day 2: a refresh only rewrites the keys its new data touches,
+  # and day 3 is the first extract to touch an older day (refunds of day 1
+  # orders). Crash on a day that only touches itself and the vanished rows are
+  # new ones no reader ever saw.
+  - type: crash_mid_write
+    partition: 3
+properties: [no_data_loss, no_silent_corruption, no_vanishing_rows]

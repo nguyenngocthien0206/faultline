@@ -8,8 +8,7 @@ from reference_stack import Stack, reference_config
 
 from faultline.adapters.base import RunRequest, RunStatus, Stage
 from faultline.adapters.reference import ReferenceAdapter, clean_reference_stack
-from faultline.connectors.s3 import LandingBucket
-from faultline.connectors.workspace import new_workspace_name
+from faultline.connectors.workspace import UnmarkedWorkspaceError, new_workspace_name
 from faultline.datagen import DatasetSpec
 from faultline.runner import generate_truth
 
@@ -58,28 +57,41 @@ def test_ingest_lands_the_files_and_load_builds_the_tables(stack: Stack, tmp_pat
 
 def test_clean_removes_a_leftover_sandbox_everywhere_and_nothing_else(stack: Stack) -> None:
     config = reference_config()
-    bucket = LandingBucket(
-        config.s3_url, access_key=config.s3_access_key, secret_key=config.s3_secret_key
-    )
-    leftover, alive = new_workspace_name(), new_workspace_name()
+    bucket = stack.landing
+    leftover, alive, foreign = new_workspace_name(), new_workspace_name(), new_workspace_name()
     for name in (leftover, alive):
         stack.source.create_workspace(name)
-        stack.clickhouse.command(f"CREATE DATABASE {name}")
+        stack.clickhouse.create_workspace(name)
+        bucket.mark_workspace(name)
         bucket.put(f"{name}/pos/orders/dt=2026-11-01/x.parquet", b"left behind")
+    # fl_-named like a sandbox, never marked as one: someone else's, never faultline's to drop
+    stack.source.execute(f"CREATE SCHEMA {foreign}")
+    stack.clickhouse.command(f"CREATE DATABASE {foreign}")
+    bucket.put(f"{foreign}/pos/orders/dt=2026-11-01/x.parquet", b"not ours")
     try:
         # force: the rest of the suite runs alongside, so the stack is never quiet;
         # only: never touch the other tests' live sandboxes.
-        report = clean_reference_stack(config, force=True, only={leftover})
+        report = clean_reference_stack(config, force=True, only={leftover, foreign})
 
         assert (report.landing, report.source, report.warehouse) == ((leftover,),) * 3
+        assert report.unmarked == (foreign,)
         assert leftover not in bucket.list_workspaces()
         assert leftover not in stack.source.list_workspaces()
         assert leftover not in stack.clickhouse.list_workspaces()
-        for names in (bucket.list_workspaces(), stack.source.list_workspaces()):
+        for names in (
+            bucket.list_workspaces(),
+            stack.source.list_workspaces(),
+            stack.clickhouse.list_workspaces(),
+        ):
             assert alive in names
-        assert alive in stack.clickhouse.list_workspaces()
+            assert foreign in names
+        with pytest.raises(UnmarkedWorkspaceError):
+            stack.source.drop_workspace(foreign)
     finally:
         clean_reference_stack(config, force=True, only={alive})
+        stack.source.execute(f"DROP SCHEMA IF EXISTS {foreign} CASCADE")
+        stack.clickhouse.command(f"DROP DATABASE IF EXISTS {foreign}")
+        bucket.delete(f"{foreign}/pos/orders/dt=2026-11-01/x.parquet")
 
 
 def test_a_run_crashed_at_a_failpoint_is_interrupted_with_its_files_landed(

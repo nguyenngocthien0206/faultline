@@ -4,21 +4,22 @@ from datetime import date
 from pathlib import Path
 
 import pytest
-from fake_files import FakeFilePlatform
+from fake_files import files_target
 
 from faultline.datagen import DatasetSpec
-from faultline.experiments import late_file
 from faultline.outcome import Outcome
 from faultline.runner import run_experiment
+from faultline.spec import load_experiment
 
 TINY = DatasetSpec.from_profile("tiny")
-EXPERIMENT = late_file(TINY)  # order lines of day 2 land just before day 4 runs
+EXPERIMENTS = Path(__file__).resolve().parents[2] / "experiments"
+EXPERIMENT = load_experiment(
+    EXPERIMENTS / "late-file.yaml"
+)  # order lines of day 2 land just before day 4 runs
 
 
 def _run(mode: str, work_dir: Path):
-    return run_experiment(
-        EXPERIMENT, lambda root: FakeFilePlatform(root, mode), work_dir, target=f"files-{mode}"
-    )
+    return run_experiment(EXPERIMENT, files_target(mode), work_dir)
 
 
 @pytest.mark.parametrize(

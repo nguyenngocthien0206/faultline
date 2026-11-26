@@ -27,13 +27,6 @@ class ProfileName(StrEnum):
     large = "large"
 
 
-class TargetName(StrEnum):
-    """Editions of the reference platform (temporary, until targets come from YAML)."""
-
-    naive = "naive"
-    hardened = "hardened"
-
-
 def _print_version(value: bool) -> None:
     if value:
         typer.echo(f"faultline {__version__}")
@@ -120,58 +113,61 @@ def generate(
 
 @app.command()
 def run(
-    name: Annotated[str, typer.Argument(help="Built-in experiment, e.g. pos-offline-sync.")],
-    profile: Annotated[ProfileName, typer.Option(help="Dataset volume profile.")] = (
-        ProfileName.tiny
-    ),
+    experiment: Annotated[
+        str, typer.Argument(help="Experiment spec: a name in experiments/, or a path.")
+    ],
     target: Annotated[
-        TargetName, typer.Option(help="Edition of the reference platform to test.")
-    ] = TargetName.naive,
-    lag_days: Annotated[
-        int | None,
+        list[str] | None,
         typer.Option(
-            min=0,
-            help="Hardened only: the lag window, in days (default: the platform's own).",
+            "--target",
+            help="Target spec: a name in targets/, or a path. Repeat to run on several.",
         ),
     ] = None,
-    stack_env: Annotated[
-        Path, typer.Option(help="Env file of the reference stack (created by `make ref-up`).")
-    ] = Path("reference/.env"),
+    profile: Annotated[
+        ProfileName | None, typer.Option(help="Dataset volume profile (default: the spec's).")
+    ] = None,
     work_dir: Annotated[
         Path, typer.Option(help="Parent folder for this run's data and snapshots.")
     ] = Path(".faultline/runs"),
 ) -> None:
-    """Run a built-in experiment against the local reference stack and print the verdict."""
-    from faultline.adapters.reference import ReferenceAdapter, config_from_env_file, target_name
-    from faultline.datagen import DatasetSpec
-    from faultline.experiments import BUILTIN
+    """Run an experiment on one or more targets and print each verdict.
+
+    Targets must declare `environment: test` and `allow_destructive: true`;
+    nothing overrides that. The default target is reference-naive.
+    """
     from faultline.outcome import Outcome
     from faultline.runner import run_experiment
-
-    if name not in BUILTIN:
-        available = ", ".join(sorted(BUILTIN))
-        typer.echo(f"Error: unknown experiment {name!r}; available: {available}", err=True)
-        raise typer.Exit(code=2)
-    if lag_days is not None and target is not TargetName.hardened:
-        typer.echo("Error: --lag-days applies to --target hardened only", err=True)
-        raise typer.Exit(code=2)
-    if not stack_env.exists():
-        typer.echo(f"Error: {stack_env} not found; start the stack with `make ref-up`", err=True)
-        raise typer.Exit(code=2)
-
-    experiment = BUILTIN[name](DatasetSpec.from_profile(profile.value))
-    config = config_from_env_file(stack_env)
-    run_dir = work_dir / f"{datetime.now():%Y%m%d-%H%M%S}-{name}-{target}"
-    result = run_experiment(
-        experiment,
-        lambda root: ReferenceAdapter(config, root, edition=target.value, lag_days=lag_days),
-        run_dir,
-        target=target_name(target.value, lag_days),
-        log=typer.echo,
+    from faultline.safety import UnsafeTargetError
+    from faultline.spec import (
+        EXPERIMENTS_DIR,
+        TARGETS_DIR,
+        SpecError,
+        find_spec,
+        load_experiment,
+        load_target,
     )
-    typer.echo("")
-    typer.echo(result.render())
-    if result.outcome is Outcome.ERROR:
+
+    try:
+        spec = load_experiment(
+            find_spec(experiment, EXPERIMENTS_DIR, "experiment"),
+            dataset={"profile": profile.value if profile else None},
+        )
+        targets = [
+            load_target(find_spec(name, TARGETS_DIR, "target")).build()
+            for name in (target or ["reference-naive"])
+        ]
+    except (SpecError, UnsafeTargetError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
+    errors = 0
+    for chosen in targets:
+        run_dir = work_dir / f"{datetime.now():%Y%m%d-%H%M%S}-{spec.name}-{chosen.name}"
+        result = run_experiment(spec, chosen, run_dir, log=typer.echo)
+        typer.echo("")
+        typer.echo(result.render())
+        errors += result.outcome is Outcome.ERROR
+    if errors:
         raise typer.Exit(code=1)
 
 
@@ -208,3 +204,5 @@ def clean(
         f"{len(report.landing)} landing prefixes, {len(report.source)} source schemas, "
         f"{len(report.warehouse)} warehouse databases"
     )
+    if report.unmarked:
+        typer.echo(f"Left alone, not marked as faultline sandboxes: {', '.join(report.unmarked)}")

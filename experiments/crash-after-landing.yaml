@@ -1,0 +1,10 @@
+name: crash-after-landing
+description: >
+  The run of day 2 is killed, hard, between ingestion and loading: the files and
+  the ingestion cursor are saved, the warehouse has nothing of the day.
+dataset:
+  profile: tiny
+faults:
+  - type: crash_after_landing
+    partition: 2
+properties: [no_data_loss, no_silent_corruption]

@@ -18,12 +18,11 @@ from datetime import date
 from pathlib import Path
 
 import pytest
-from reference_stack import Stack, reference_config
+from reference_stack import Stack, experiment, reference_target
 
 from faultline.adapters.base import RunStatus
-from faultline.adapters.reference import Edition, ReferenceAdapter, target_name
+from faultline.adapters.reference import Edition
 from faultline.datagen import DatasetSpec
-from faultline.experiments import crash_after_landing
 from faultline.outcome import Outcome
 from faultline.runner import ExperimentResult, run_experiment
 
@@ -34,13 +33,7 @@ CRASHED = date(2026, 11, 2)
 
 
 def _run(edition: Edition, work_dir: Path) -> ExperimentResult:
-    config = reference_config()
-    result = run_experiment(
-        crash_after_landing(TINY),
-        lambda root: ReferenceAdapter(config, root, edition=edition),
-        work_dir,
-        target=target_name(edition),
-    )
+    result = run_experiment(experiment("crash-after-landing"), reference_target(edition), work_dir)
     print(result.render())
     return result
 

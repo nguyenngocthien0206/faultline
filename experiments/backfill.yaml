@@ -1,0 +1,14 @@
+name: backfill
+description: >
+  Nothing breaks. Every day reaches the source before anything runs, then the
+  orchestrator backfills them all in one request, as a team loading its history
+  would. The tables must equal those of running the days one by one.
+dataset:
+  profile: tiny
+schedule: deliveries_only   # the baseline still runs every day as usual
+faults: []
+properties:
+  - type: backfill_equivalence
+    start: 1
+    end: last
+  - no_data_loss

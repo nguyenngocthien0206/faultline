@@ -58,6 +58,7 @@ from faultline.adapters.base import (
     TableContract,
 )
 from faultline.datagen.pos import ORDER_COLUMNS, ORDER_ITEM_COLUMNS
+from faultline.safety import Target
 from faultline.sources.pos import day_files
 
 ORDERS = TableContract(
@@ -285,3 +286,13 @@ class FakeFilePlatform(Adapter):
 
 def _gold_key(order: dict[str, str]) -> tuple[str, str]:
     return order["ordered_at"][:10], order["store_id"]
+
+
+def files_target(mode: str) -> Target:
+    """The toy platform as a target: a test environment, open to destruction, as declared."""
+    return Target(
+        name=f"files-{mode}",
+        environment="test",
+        allow_destructive=True,
+        sandbox=lambda root: FakeFilePlatform(root, mode),
+    )

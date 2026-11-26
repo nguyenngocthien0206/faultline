@@ -1,0 +1,8 @@
+# The hardened edition of the reference platform, with its own lag window (3 days).
+name: reference-hardened
+adapter: reference
+environment: test
+allow_destructive: true
+options:
+  edition: hardened
+  env_file: ../reference/.env

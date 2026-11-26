@@ -15,7 +15,12 @@ import urllib.request
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from faultline.connectors.workspace import is_workspace_name, validate_workspace_name
+from faultline.connectors.workspace import (
+    SANDBOX_MARK,
+    UnmarkedWorkspaceError,
+    is_workspace_name,
+    validate_workspace_name,
+)
 
 
 class ClickHouseError(Exception):
@@ -99,6 +104,32 @@ class ClickHouseClient:
         rows = self.query("SELECT name FROM system.databases")
         return sorted(r["name"] for r in rows if is_workspace_name(r["name"]))
 
+    def create_workspace(self, name: str) -> None:
+        """Create a workspace's database, marked as faultline's own (the platform reuses it)."""
+        self.command(
+            f"CREATE DATABASE IF NOT EXISTS {validate_workspace_name(name)} "
+            f"COMMENT '{SANDBOX_MARK}'"
+        )
+
+    def mark(self, name: str) -> str | None:
+        """The comment on a workspace's database, or None when there is no such database."""
+        rows = self.query(
+            f"SELECT comment FROM system.databases WHERE name = '{validate_workspace_name(name)}'"
+        )
+        return str(rows[0]["comment"]) if rows else None
+
+    def is_marked(self, name: str) -> bool:
+        return self.mark(name) == SANDBOX_MARK
+
     def drop_workspace(self, name: str) -> None:
-        """Drop the database of a faultline workspace. Refuses any other name."""
-        self.command(f"DROP DATABASE IF EXISTS {validate_workspace_name(name)}")
+        """Drop the database of a faultline workspace.
+
+        Refuses any other name, and a database with the name but not the mark.
+        """
+        validated = validate_workspace_name(name)
+        mark = self.mark(validated)
+        if mark is None:
+            return
+        if mark != SANDBOX_MARK:
+            raise UnmarkedWorkspaceError(f"refusing to drop database {validated}: not marked")
+        self.command(f"DROP DATABASE IF EXISTS {validated}")

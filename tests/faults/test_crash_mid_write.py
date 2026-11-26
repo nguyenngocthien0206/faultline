@@ -1,16 +1,18 @@
 from datetime import date
+from pathlib import Path
 
 import pytest
 
 from faultline.adapters.base import Capability
 from faultline.datagen import DatasetSpec
-from faultline.experiments import BUILTIN, crash_mid_write
 from faultline.faults.base import FaultSetupError, InjectionPoint
 from faultline.faults.execution import CrashMidWrite
 from faultline.properties.core import NoVanishingRows
 from faultline.schedule import Deliver, Run, Snapshot, clean_schedule
+from faultline.spec import SpecError, load_experiment
 
 TINY = DatasetSpec.from_profile("tiny")
+EXPERIMENTS = Path(__file__).resolve().parents[2] / "experiments"
 D2, D3, D4 = date(2026, 11, 2), date(2026, 11, 3), date(2026, 11, 4)
 
 
@@ -47,11 +49,11 @@ def test_the_day_must_be_in_the_schedule() -> None:
 
 
 def test_the_built_in_experiment_crashes_day_three_and_watches_for_vanishing_rows() -> None:
-    experiment = BUILTIN["crash-mid-write"](TINY)
+    experiment = load_experiment(EXPERIMENTS / "crash-mid-write.yaml")
     (fault,) = experiment.faults
 
     assert isinstance(fault, CrashMidWrite)
     assert fault.partition == D3  # the first extract that touches an older day
     assert any(isinstance(p, NoVanishingRows) for p in experiment.properties)
-    with pytest.raises(ValueError, match="at least 3 days"):
-        crash_mid_write(DatasetSpec.from_profile("tiny", days=2))
+    with pytest.raises(SpecError, match="day 3 is outside a 2-day dataset"):
+        load_experiment(EXPERIMENTS / "crash-mid-write.yaml", dataset={"days": 2})

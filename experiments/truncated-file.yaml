@@ -1,0 +1,14 @@
+name: truncated-file
+description: >
+  One file of the last day's extract (the order lines) lands short: cut on a row
+  boundary, so it parses and nothing in it is invalid. Recovery redelivers it in
+  full.
+dataset:
+  profile: tiny
+faults:
+  # The last day on purpose: cut an earlier one and the next run's lag window
+  # reads its rows again from the source, which scores the source, not the
+  # load manifest.
+  - type: truncated_file
+    partition: last
+properties: [no_data_loss, no_silent_corruption]

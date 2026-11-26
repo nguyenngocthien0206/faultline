@@ -16,7 +16,7 @@ With Docker running:
 make install
 make ref-up                                              # Postgres, dlt, S3, ClickHouse, dbt, Dagster
 uv run faultline run pos-offline-sync                    # naive edition, about 5 minutes on a laptop
-uv run faultline run pos-offline-sync --target hardened  # hardened edition
+uv run faultline run pos-offline-sync --target reference-hardened  # hardened edition
 uv run faultline run duplicate-file                      # a resent extract, about 4 minutes
 uv run faultline run late-file                           # a file that lands two days late
 uv run faultline run truncated-file                      # a file cut short, still well formed
@@ -26,7 +26,10 @@ uv run faultline run crash-mid-write                     # a run killed inside a
 uv run faultline run retry-after-partial-commit          # a crashed run retried by the orchestrator
 uv run faultline run idempotency                         # no fault: an old day is simply run again
 uv run faultline run backfill                            # no fault: the whole history in one backfill
+uv run faultline run late-file --target reference-naive --target reference-hardened
 ```
+
+Every experiment is a YAML file in `experiments/` and every platform a target in `targets/`, so adding a scenario is a reviewed pull request rather than new code. Days in a spec are counted within the dataset (`partition: 2`, `end: last`), so a longer profile keeps their meaning, and anything a spec gets wrong (an unknown fault, a misspelt parameter, day 9 of a four-day dataset) is an error that names the file and the field. A target must declare `environment: test` and `allow_destructive: true`; the runner checks that again before every action, and the reference adapter only ever drops a sandbox it marked as its own.
 
 `pos-offline-sync` takes a store's till offline for two days. When it reconnects, its orders reach the source database with their real, older timestamps, behind the incremental cursor of the ingestion tool. On the reference platform's naive pipeline the result looks like this:
 
@@ -43,7 +46,7 @@ Evidence at F:
 
 Every run was green, so no alert fired and nobody would have been paged, yet two days of one store's sales are gone. Rerunning the days, the usual fix, does not bring them back and double counts the other stores instead (net revenue +35.5% at checkpoint R). That is the gap faultline measures. At checkpoint F, the usual data quality checks (unique keys, no nulls, valid values) all pass: nothing in the tables is malformed, rows are simply absent. The platform failed, not the data. Snapshots of every checkpoint stay in `.faultline/runs/` for inspection.
 
-The hardened edition runs the same tools with established patterns: a lag window in the extractor, idempotent bronze loads, one row per key in silver, and gold built from final states. Same fault, same runs, verdict `PASS` at both checkpoints. Its lag window is a promise with a limit, and faultline can measure that too: with `--lag-days 1`, shorter than the two-day outage, hardened loses exactly the oldest day (22 orders) and the verdict is `SILENT_CORRUPTION` again. Choosing that window is a business decision (how late may a till sync and still count?) that now comes with a number attached.
+The hardened edition runs the same tools with established patterns: a lag window in the extractor, idempotent bronze loads, one row per key in silver, and gold built from final states. Same fault, same runs, verdict `PASS` at both checkpoints. Its lag window is a promise with a limit, and faultline can measure that too: with a one-day window (`--target reference-hardened-lag1`), shorter than the two-day outage, hardened loses exactly the oldest day (22 orders) and the verdict is `SILENT_CORRUPTION` again. Choosing that window is a business decision (how late may a till sync and still count?) that now comes with a number attached.
 
 `duplicate-file` works one layer down, in the landing zone: day 2's extract lands a second time under day 3, byte for byte, as a retried upload would leave it. On naive, orders still look clean (one row per order), so a uniqueness check on them passes, while 163 order lines and 106 payments are there twice and gold reports 21.4% more revenue; rerunning day 3 takes it to +67.7%. Hardened passes without a ledger of loaded files, because every table has a key and silver keeps one row per key. When the data has no natural key (an append-only points ledger, say), that is no longer enough, and the experiment is where a team would find out.
 

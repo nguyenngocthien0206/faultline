@@ -1,0 +1,11 @@
+name: duplicate-file
+description: >
+  The files of one day's extract land again a day later under new names, as a
+  retried upload or a supplier resending yesterday's files would.
+dataset:
+  profile: tiny
+faults:
+  - type: duplicate_file
+    original_day: 2
+    redelivered_on: 3
+properties: [no_data_loss, no_silent_corruption]

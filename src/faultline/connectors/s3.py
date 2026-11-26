@@ -10,7 +10,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from faultline.connectors.workspace import is_workspace_name, validate_workspace_name
+from faultline.connectors.workspace import (
+    SANDBOX_MARK,
+    UnmarkedWorkspaceError,
+    is_workspace_name,
+    validate_workspace_name,
+)
 
 
 def _boto3() -> Any:
@@ -21,6 +26,9 @@ def _boto3() -> Any:
             "the S3 connector needs boto3: pip install 'faultline[reference]'"
         ) from exc
     return boto3
+
+
+MARK_FILE = ".faultline-workspace"  # at the root of a workspace's prefix
 
 
 class LandingBucket:
@@ -87,9 +95,25 @@ class LandingBucket:
             prefixes |= {p["Prefix"].rstrip("/") for p in page.get("CommonPrefixes", [])}
         return sorted(p for p in prefixes if is_workspace_name(p))
 
+    def mark_workspace(self, workspace: str) -> None:
+        """Mark a workspace prefix as faultline's own: one small object at its root."""
+        self.put(self.mark_key(workspace), f"{SANDBOX_MARK}\n".encode())
+
+    @staticmethod
+    def mark_key(workspace: str) -> str:
+        return f"{validate_workspace_name(workspace)}/{MARK_FILE}"
+
+    def is_marked(self, workspace: str) -> bool:
+        return self.mark_key(workspace) in self.list(f"{validate_workspace_name(workspace)}/")
+
     def delete_workspace(self, workspace: str) -> int:
-        """Delete every key under `<workspace>/`. Returns how many were deleted."""
+        """Delete every key under `<workspace>/`. Returns how many were deleted.
+
+        Refuses a prefix with the name but not the mark (an empty one is fine).
+        """
         keys = self.list(f"{validate_workspace_name(workspace)}/")
+        if keys and self.mark_key(workspace) not in keys:
+            raise UnmarkedWorkspaceError(f"refusing to delete prefix {workspace}/: not marked")
         for start in range(0, len(keys), 1000):  # the API's limit per request
             batch = [{"Key": k} for k in keys[start : start + 1000]]
             self.client.delete_objects(Bucket=self.bucket, Delete={"Objects": batch})

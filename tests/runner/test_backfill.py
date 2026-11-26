@@ -4,17 +4,18 @@ from datetime import date
 from pathlib import Path
 
 import pytest
-from fake_files import FakeFilePlatform
-from fake_platform import FakeCursorPlatform
+from fake_files import FakeFilePlatform, files_target
+from fake_platform import cursor_target
 
 from faultline.datagen import DatasetSpec
-from faultline.experiments import BUILTIN, backfill
 from faultline.outcome import Outcome
 from faultline.properties.core import BackfillEquivalence
 from faultline.runner import execute, generate_truth, run_experiment
 from faultline.schedule import Backfill, Deliver, deliveries_only
+from faultline.spec import load_experiment
 
 TINY = DatasetSpec.from_profile("tiny")
+EXPERIMENTS = Path(__file__).resolve().parents[2] / "experiments"
 D1, D2, D4 = date(2026, 11, 1), date(2026, 11, 2), date(2026, 11, 4)
 
 
@@ -41,15 +42,13 @@ def test_the_runner_logs_and_records_every_partition_of_a_backfill(tmp_path: Pat
 
 
 def test_the_built_in_experiment_delivers_first_then_backfills_the_whole_range() -> None:
-    experiment = BUILTIN["backfill"](TINY)
+    experiment = load_experiment(EXPERIMENTS / "backfill.yaml")
 
     assert experiment.faults == ()
     assert experiment.schedule(TINY) == deliveries_only(TINY)
     (prop, *_) = experiment.properties
     assert isinstance(prop, BackfillEquivalence)
     assert prop.probe() == (Backfill(D1, D4),)
-    with pytest.raises(ValueError, match="at least 2 days"):
-        backfill(DatasetSpec.from_profile("tiny", days=1))
 
 
 @pytest.mark.parametrize(
@@ -57,7 +56,7 @@ def test_the_built_in_experiment_delivers_first_then_backfills_the_whole_range()
 )
 def test_one_backfill_two_platforms(mode: str, expected: Outcome, tmp_path: Path) -> None:
     result = run_experiment(
-        backfill(TINY), lambda root: FakeFilePlatform(root, mode), tmp_path, target=f"files-{mode}"
+        load_experiment(EXPERIMENTS / "backfill.yaml"), files_target(mode), tmp_path
     )
 
     assert result.outcome is expected, result.render()
@@ -66,7 +65,9 @@ def test_one_backfill_two_platforms(mode: str, expected: Outcome, tmp_path: Path
 def test_side_by_side_extracts_from_one_cursor_load_the_history_once_each(
     tmp_path: Path,
 ) -> None:
-    result = run_experiment(backfill(TINY), lambda root: FakeFilePlatform(root, "append"), tmp_path)
+    result = run_experiment(
+        load_experiment(EXPERIMENTS / "backfill.yaml"), files_target("append"), tmp_path
+    )
 
     equivalence = next(p for p in result.properties if p.name == "backfill_equivalence")
     assert not equivalence.at_f.holds
@@ -78,7 +79,9 @@ def test_side_by_side_extracts_from_one_cursor_load_the_history_once_each(
 
 
 def test_an_adapter_without_backfills_is_skipped_before_anything_runs(tmp_path: Path) -> None:
-    result = run_experiment(backfill(TINY), lambda root: FakeCursorPlatform(root, "lag"), tmp_path)
+    result = run_experiment(
+        load_experiment(EXPERIMENTS / "backfill.yaml"), cursor_target("lag"), tmp_path
+    )
 
     assert result.outcome is Outcome.SKIPPED
     assert result.problems == ("the adapter does not offer run.backfill",)

@@ -1,10 +1,10 @@
 from datetime import date
+from pathlib import Path
 
 import pytest
 
 from faultline.adapters.base import Capability, Stage
 from faultline.datagen import DatasetSpec
-from faultline.experiments import BUILTIN
 from faultline.faults.base import FaultSetupError, InjectionPoint
 from faultline.faults.landing import TruncatedFile
 from faultline.schedule import (
@@ -14,8 +14,10 @@ from faultline.schedule import (
     TruncateLandingFiles,
     clean_schedule,
 )
+from faultline.spec import load_experiment
 
 TINY = DatasetSpec.from_profile("tiny")
+EXPERIMENTS = Path(__file__).resolve().parents[2] / "experiments"
 D3, D4 = date(2026, 11, 3), date(2026, 11, 4)
 LINES = "pos/order_items"
 
@@ -66,7 +68,7 @@ def test_an_empty_dataset_list_is_refused() -> None:
 
 
 def test_the_built_in_experiment_cuts_the_last_day() -> None:
-    (fault,) = BUILTIN["truncated-file"](TINY).faults
+    (fault,) = load_experiment(EXPERIMENTS / "truncated-file.yaml").faults
 
     assert isinstance(fault, TruncatedFile)
     assert (fault.partition, fault.keep, fault.datasets) == (TINY.end_date, 0.8, (LINES,))

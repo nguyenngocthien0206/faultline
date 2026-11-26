@@ -4,7 +4,7 @@ from datetime import date
 from pathlib import Path
 
 import pytest
-from fake_files import FakeFilePlatform
+from fake_files import files_target
 
 from faultline.datagen import DatasetSpec
 from faultline.faults.landing import DuplicateFile
@@ -29,9 +29,7 @@ EXPERIMENT = Experiment(
 
 
 def _run(mode: str, work_dir: Path):
-    return run_experiment(
-        EXPERIMENT, lambda root: FakeFilePlatform(root, mode), work_dir, target=f"files-{mode}"
-    )
+    return run_experiment(EXPERIMENT, files_target(mode), work_dir)
 
 
 @pytest.mark.parametrize(

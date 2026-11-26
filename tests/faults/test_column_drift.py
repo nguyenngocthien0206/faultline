@@ -1,10 +1,10 @@
 from datetime import date
+from pathlib import Path
 
 import pytest
 
 from faultline.adapters.base import Capability, Stage
 from faultline.datagen import DatasetSpec
-from faultline.experiments import BUILTIN
 from faultline.faults.base import FaultSetupError, InjectionPoint
 from faultline.faults.landing import ColumnDrift
 from faultline.schedule import (
@@ -14,8 +14,10 @@ from faultline.schedule import (
     Run,
     clean_schedule,
 )
+from faultline.spec import load_experiment
 
 TINY = DatasetSpec.from_profile("tiny")
+EXPERIMENTS = Path(__file__).resolve().parents[2] / "experiments"
 D3, D4 = date(2026, 11, 3), date(2026, 11, 4)
 PAYMENTS = "pos/payments"
 
@@ -71,7 +73,7 @@ def test_the_day_must_be_in_the_schedule() -> None:
 
 
 def test_the_built_in_experiment_renames_the_last_days_payment_amounts() -> None:
-    (fault,) = BUILTIN["column-rename"](TINY).faults
+    (fault,) = load_experiment(EXPERIMENTS / "column-rename.yaml").faults
 
     assert isinstance(fault, ColumnDrift)
     assert (fault.partition, fault.dataset, fault.old, fault.new, fault.move_to_end) == (

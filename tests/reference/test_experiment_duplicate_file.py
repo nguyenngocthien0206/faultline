@@ -20,12 +20,11 @@ from datetime import date
 from pathlib import Path
 
 import pytest
-from reference_stack import Stack, reference_config
+from reference_stack import Stack, experiment, reference_target
 
 from faultline.adapters.base import RunStatus
-from faultline.adapters.reference import Edition, ReferenceAdapter, target_name
+from faultline.adapters.reference import Edition
 from faultline.datagen import DatasetSpec
-from faultline.experiments import duplicate_file
 from faultline.outcome import Outcome
 from faultline.runner import ExperimentResult, run_experiment
 
@@ -35,13 +34,7 @@ TINY = DatasetSpec.from_profile("tiny")
 
 
 def _run(edition: Edition, work_dir: Path) -> ExperimentResult:
-    config = reference_config()
-    result = run_experiment(
-        duplicate_file(TINY),
-        lambda root: ReferenceAdapter(config, root, edition=edition),
-        work_dir,
-        target=target_name(edition),
-    )
+    result = run_experiment(experiment("duplicate-file"), reference_target(edition), work_dir)
     print(result.render())
     return result
 

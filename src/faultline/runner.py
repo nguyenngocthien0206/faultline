@@ -24,6 +24,11 @@ say) makes the experiment SKIPPED before anything is generated or run.
 Sandboxes are always torn down. Snapshots stay in the work directory, so a
 verdict can be inspected after the fact.
 
+The experiment runs on a Target (faultline.safety), and the runner checks it
+before anything else, again before entering each sandbox and before every
+action it carries out: the second layer of the safety guard. An unsafe target
+is refused with UnsafeTargetError, never turned into a verdict.
+
 Steps 1 and 2 are `run_baseline`. Its result can be passed to several
 experiments on the same dataset and target, so the clean run is paid for once.
 A baseline from another dataset or another target is refused: comparing a
@@ -60,6 +65,7 @@ from faultline.oracle.invariants import complete_keys, unique_keys
 from faultline.oracle.snapshot import snapshot_all
 from faultline.outcome import Outcome, classify, has_signal, worst
 from faultline.properties.base import Checkpoint, Property, PropertyContext, PropertyResult
+from faultline.safety import AdapterFactory, Target
 from faultline.schedule import (
     Action,
     Backfill,
@@ -75,7 +81,7 @@ from faultline.schedule import (
     clean_schedule,
 )
 
-AdapterFactory = Callable[[Path], Adapter]  # input root -> a fresh sandbox
+Guard = Callable[[], None]  # raises when the target may no longer be broken
 Log = Callable[[str], None]
 RunLog = tuple[tuple[date, RunResult], ...]
 A = TypeVar("A")
@@ -161,10 +167,13 @@ def execute(
     phase: str,
     held: Held | None = None,
     *,
+    guard: Guard | None = None,
     marks: Marks | None = None,
     work_dir: Path | None = None,
 ) -> RunLog:
-    """Carry out a schedule on one sandbox.
+    """Carry out a schedule on one sandbox, checking `guard` before every action.
+
+    run_experiment and run_baseline always pass the target's check as `guard`.
 
     `held` keeps files taken out of the landing zone (held back, or the
     originals of cut files) for a later release; pass the same one to every
@@ -175,6 +184,8 @@ def execute(
     held = {} if held is None else held
     marks = {} if marks is None else marks
     for action in schedule:
+        if guard is not None:
+            guard()
         if isinstance(action, Snapshot):
             if work_dir is None:
                 raise ValueError(f"snapshot {action.name!r} needs a work directory")
@@ -315,7 +326,7 @@ class Baseline:
     contracts: tuple[TableContract, ...]
     runs: RunLog
     problems: tuple[str, ...] = ()
-    target: str = "platform"
+    target: str = "platform"  # the target's name
 
     @property
     def established(self) -> bool:
@@ -332,31 +343,28 @@ def generate_truth(spec: DatasetSpec, work_dir: Path, log: Log = lambda _: None)
 
 
 def _clean_run(
-    spec: DatasetSpec, truth: Path, adapter: Adapter, work_dir: Path, target: str, log: Log
+    spec: DatasetSpec, truth: Path, adapter: Adapter, work_dir: Path, target: Target, log: Log
 ) -> Baseline:
     log("baseline: clean run")
+    target.check()
     with adapter as clean:
-        runs = execute(clean, clean_schedule(spec), log, "baseline")
+        runs = execute(clean, clean_schedule(spec), log, "baseline", guard=target.check)
         snapshots = snapshot_all(clean, work_dir / "baseline")
         contracts = clean.capabilities().tables
         invariants = steady_state_problems(clean, snapshots, truth)
     failed = [f"baseline run {d} failed: {r.errors}" for d, r in runs if not r.succeeded]
     problems = (*failed, *invariants)
-    return Baseline(spec, truth, snapshots, contracts, runs, tuple(problems), target)
+    return Baseline(spec, truth, snapshots, contracts, runs, tuple(problems), target.name)
 
 
 def run_baseline(
-    spec: DatasetSpec,
-    adapter_factory: AdapterFactory,
-    work_dir: Path,
-    *,
-    target: str = "platform",
-    log: Log = lambda _: None,
+    spec: DatasetSpec, target: Target, work_dir: Path, *, log: Log = lambda _: None
 ) -> Baseline:
     """Generate the dataset and run it cleanly in a fresh sandbox (steps 1 and 2)."""
+    target.check()
     work_dir = Path(work_dir)
     truth = generate_truth(spec, work_dir, log)
-    return _clean_run(spec, truth, adapter_factory(truth), work_dir, target, log)
+    return _clean_run(spec, truth, target.sandbox(truth), work_dir, target, log)
 
 
 @dataclass(frozen=True)
@@ -389,7 +397,7 @@ def _plan_faults(
 
 
 def _fault_phases(
-    plan: _FaultPlan, adapter: Adapter, work_dir: Path, log: Log
+    plan: _FaultPlan, adapter: Adapter, work_dir: Path, target: Target, log: Log
 ) -> tuple[Checkpoint, Checkpoint]:
     """Steps 3 and 4 in one sandbox: the faulted schedule, then the recovery.
 
@@ -398,20 +406,43 @@ def _fault_phases(
     """
     held: Held = {}
     fault_marks: Marks = {}
+    guard = target.check
+    guard()
     with adapter as sandbox:
         fault_runs = execute(
-            sandbox, plan.schedule, log, "fault", held, marks=fault_marks, work_dir=work_dir
+            sandbox,
+            plan.schedule,
+            log,
+            "fault",
+            held,
+            guard=guard,
+            marks=fault_marks,
+            work_dir=work_dir,
         )
         if plan.probe:  # its runs count as the fault phase's: a probe run that fails is a signal
             fault_runs += execute(
-                sandbox, plan.probe, log, "probe", held, marks=fault_marks, work_dir=work_dir
+                sandbox,
+                plan.probe,
+                log,
+                "probe",
+                held,
+                guard=guard,
+                marks=fault_marks,
+                work_dir=work_dir,
             )
         at_f = Checkpoint(
             "F", snapshot_all(sandbox, work_dir / "checkpoint_F"), fault_runs, fault_marks
         )
         recovery_marks: Marks = {**fault_marks, "F": at_f.snapshots}
         recovery_runs = execute(
-            sandbox, plan.recovery, log, "recovery", held, marks=recovery_marks, work_dir=work_dir
+            sandbox,
+            plan.recovery,
+            log,
+            "recovery",
+            held,
+            guard=guard,
+            marks=recovery_marks,
+            work_dir=work_dir,
         )
         at_r = Checkpoint(
             "R", snapshot_all(sandbox, work_dir / "checkpoint_R"), recovery_runs, recovery_marks
@@ -443,20 +474,23 @@ def _synchronized(log: Log) -> Log:
 
 def run_experiment(
     experiment: Experiment,
-    adapter_factory: AdapterFactory,
+    target: Target,
     work_dir: Path,
     *,
-    target: str = "platform",
     baseline: Baseline | None = None,
     log: Log = lambda _: None,
 ) -> ExperimentResult:
-    """Run one experiment. Pass `baseline` to reuse a clean run of the same dataset."""
+    """Run one experiment on `target`. Pass `baseline` to reuse a clean run of the same dataset.
+
+    Raises UnsafeTargetError, before anything runs, when the target fails the guard.
+    """
+    target.check()
     work_dir = Path(work_dir)
     log = _synchronized(log)
     faults = tuple(copy.deepcopy(f) for f in experiment.faults)  # keep the experiment reusable
-    base = {"experiment": experiment.name, "target": target, "work_dir": work_dir}
+    base = {"experiment": experiment.name, "target": target.name, "work_dir": work_dir}
     try:
-        return _run(experiment, faults, adapter_factory, work_dir, base, baseline, log)
+        return _run(experiment, faults, target, work_dir, base, baseline, log)
     except Exception as exc:  # a harness failure is never a verdict about the platform
         log(traceback.format_exc())
         problem = f"{type(exc).__name__}: {exc}"
@@ -501,14 +535,13 @@ def _not_established(
 def _run(
     experiment: Experiment,
     faults: tuple[Fault, ...],
-    adapter_factory: AdapterFactory,
+    target: Target,
     work_dir: Path,
     base: dict,
     baseline: Baseline | None,
     log: Log,
 ) -> ExperimentResult:
-    target = base["target"]
-    missing = _missing_capabilities((*faults, *experiment.properties), adapter_factory, work_dir)
+    missing = _missing_capabilities((*faults, *experiment.properties), target.sandbox, work_dir)
     if missing:
         log(f"skipped: the adapter does not offer {', '.join(missing)}")
         return ExperimentResult(
@@ -518,33 +551,33 @@ def _run(
             problems=(f"the adapter does not offer {', '.join(missing)}",),
         )
     if baseline is not None:
-        _check_reusable(baseline, experiment.spec, target)
+        _check_reusable(baseline, experiment.spec, target.name)
         log("baseline: reused")
         phase = "baseline (reused)"
         if not baseline.established:
             log("steady state not established")
             return _not_established(base, {phase: baseline.runs}, baseline)
         plan = _plan_faults(experiment, faults, baseline.truth_root, work_dir, log)
-        at_f, at_r = _fault_phases(plan, adapter_factory(plan.input_root), work_dir, log)
+        at_f, at_r = _fault_phases(plan, target.sandbox(plan.input_root), work_dir, target, log)
     else:
         phase = "baseline"
         truth = generate_truth(experiment.spec, work_dir, log)
         plan = _plan_faults(experiment, faults, truth, work_dir, log)
         # Building an adapter opens nothing (setup happens on entering it), so
         # both are built up front and the capability is read before any run.
-        clean, sandbox = adapter_factory(truth), adapter_factory(plan.input_root)
+        clean, sandbox = target.sandbox(truth), target.sandbox(plan.input_root)
         if clean.capabilities().supports(Capability.CONCURRENT_SANDBOXES):
             log("baseline and fault phase run side by side")
             baseline, (at_f, at_r) = _side_by_side(
                 lambda: _clean_run(experiment.spec, truth, clean, work_dir, target, log),
-                lambda: _fault_phases(plan, sandbox, work_dir, log),
+                lambda: _fault_phases(plan, sandbox, work_dir, target, log),
             )
         else:
             baseline = _clean_run(experiment.spec, truth, clean, work_dir, target, log)
             if not baseline.established:
                 log("steady state not established")
                 return _not_established(base, {phase: baseline.runs}, baseline, plan.descriptions)
-            at_f, at_r = _fault_phases(plan, sandbox, work_dir, log)
+            at_f, at_r = _fault_phases(plan, sandbox, work_dir, target, log)
 
     runs = {phase: baseline.runs, "fault phase": at_f.runs, "recovery": at_r.runs}
     if not baseline.established:  # side by side: found out after the fault phase ran

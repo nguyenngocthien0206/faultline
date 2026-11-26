@@ -65,16 +65,6 @@ FAILPOINT_TAG = "faultline/failpoint"
 FAILPOINT_REACHED = "faultline failpoint reached: "
 
 
-def target_name(edition: Edition | str, lag_days: int | None = None) -> str:
-    """How a result names the platform it ran on, e.g. reference-hardened(lag=1d).
-
-    faultline does not know the platform's default lag, so the name shows the
-    lag only when faultline set one.
-    """
-    name = f"reference-{Edition(edition)}"
-    return name if lag_days is None else f"{name}(lag={lag_days}d)"
-
-
 # Which landing partition a row came in (naive silver keeps it): true either way,
 # but a history load brings every row in on its first day, so it is left out of
 # comparisons. Hardened keeps it out of silver altogether.
@@ -214,10 +204,6 @@ class ReferenceAdapter(Adapter):
     def job_for(self, stage: Stage | None) -> str:
         return JOBS[self.edition, stage]
 
-    @property
-    def target(self) -> str:
-        return target_name(self.edition, self.lag_days)
-
     def run_config(self, stage: Stage | None = None) -> dict[str, object]:
         """Dagster run config: the sandbox to work in and, if set, the lag window.
 
@@ -254,8 +240,12 @@ class ReferenceAdapter(Adapter):
         load_error = self.dagster.location_error()
         if load_error:
             raise AdapterError(f"Dagster code location failed to load: {load_error}")
+        # Mark the sandbox everywhere before anything lands in it: teardown and
+        # `faultline clean` only ever drop what carries the mark (guard layer 3).
         self.source.create_workspace(self.workspace)
         self._created = True
+        self.clickhouse.create_workspace(self.workspace)
+        self.landing.mark_workspace(self.workspace)
         create_tables(self.source, self.workspace)
 
     def deliver(self, day: date) -> None:
@@ -380,6 +370,7 @@ class CleanReport:
     landing: tuple[str, ...] = ()  # S3 prefixes deleted
     source: tuple[str, ...] = ()  # Postgres schemas dropped
     warehouse: tuple[str, ...] = ()  # ClickHouse databases dropped
+    unmarked: tuple[str, ...] = ()  # fl_* names without faultline's mark, left alone
 
     @property
     def workspaces(self) -> set[str]:
@@ -409,11 +400,13 @@ def clean_reference_stack(
     only: set[str] | None = None,
     now: float | None = None,
 ) -> CleanReport:
-    """Delete leftover sandboxes (fl_* only) from the landing bucket, source and warehouse.
+    """Delete leftover sandboxes from the landing bucket, source and warehouse.
 
-    A sandbox normally cleans up after itself; this is for the ones a crash,
-    an interrupted test or an older faultline left behind. Refuses while the
-    stack is in use unless `force`; `only` limits it to the given workspaces.
+    A sandbox normally cleans up after itself; this is for the ones a crash or
+    an interrupted test left behind. Only fl_* names that carry faultline's
+    mark are deleted; an unmarked one is reported and left alone. Refuses
+    while the stack is in use unless `force`; `only` limits it to the given
+    workspaces.
     """
 
     if not force:
@@ -436,11 +429,18 @@ def clean_reference_stack(
         config.clickhouse_url, user=config.clickhouse_user, password=config.clickhouse_password
     )
     with SourceDatabase(config.source_dsn) as source:
-        report = CleanReport(
-            landing=chosen(landing.list_workspaces()),
-            source=chosen(source.list_workspaces()),
-            warehouse=chosen(clickhouse.list_workspaces()),
-        )
+        found = {
+            "landing": (chosen(landing.list_workspaces()), landing.is_marked),
+            "source": (chosen(source.list_workspaces()), source.is_marked),
+            "warehouse": (chosen(clickhouse.list_workspaces()), clickhouse.is_marked),
+        }
+        marked = {
+            store: tuple(name for name in names if is_marked(name))
+            for store, (names, is_marked) in found.items()
+        }
+        every = {name for names, _ in found.values() for name in names}
+        kept = every - {name for names in marked.values() for name in names}
+        report = CleanReport(**marked, unmarked=tuple(sorted(kept)))
         for name in report.landing:
             landing.delete_workspace(name)
         for name in report.source:

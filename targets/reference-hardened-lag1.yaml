@@ -1,0 +1,10 @@
+# Hardened with a lag window of one day: shorter than the two-day outage of
+# pos-offline-sync, to measure where the platform's lateness promise ends.
+name: reference-hardened-lag1
+adapter: reference
+environment: test
+allow_destructive: true
+options:
+  edition: hardened
+  lag_days: 1
+  env_file: ../reference/.env
