@@ -4,6 +4,8 @@ Output is plain ASCII on purpose: the default Windows console code page cannot
 print Vietnamese, and a crash while printing a summary helps nobody.
 """
 
+import threading
+import time
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -111,11 +113,20 @@ def generate(
     typer.echo(f"Wrote {report.files:,} files to {out} in {report.elapsed_seconds:.1f}s")
 
 
+class ReportFormat(StrEnum):
+    md = "md"
+    json = "json"
+
+
 @app.command()
 def run(
     experiment: Annotated[
-        str, typer.Argument(help="Experiment spec: a name in experiments/, or a path.")
-    ],
+        str | None,
+        typer.Argument(help="Experiment spec: a name in experiments/, or a path."),
+    ] = None,
+    all_experiments: Annotated[
+        bool, typer.Option("--all", help="Every experiment in experiments/.")
+    ] = False,
     target: Annotated[
         list[str] | None,
         typer.Option(
@@ -126,17 +137,28 @@ def run(
     profile: Annotated[
         ProfileName | None, typer.Option(help="Dataset volume profile (default: the spec's).")
     ] = None,
+    parallel: Annotated[
+        int, typer.Option(min=1, help="With --all: experiments running at the same time.")
+    ] = 8,
     work_dir: Annotated[
         Path, typer.Option(help="Parent folder for this run's data and snapshots.")
     ] = Path(".faultline/runs"),
+    results_dir: Annotated[
+        Path, typer.Option(help="Parent folder for this run's result files.")
+    ] = Path(".faultline/results"),
 ) -> None:
-    """Run an experiment on one or more targets and print each verdict.
+    """Run an experiment (or --all of them) on one or more targets and print the verdicts.
 
     Targets must declare `environment: test` and `allow_destructive: true`;
-    nothing overrides that. The default target is reference-naive.
+    nothing overrides that. The default target is reference-naive. Every
+    result is saved as JSON under the results folder, for `faultline report`.
+    With --all, each target's clean run is shared by every experiment and the
+    experiments run side by side; the scorecard is printed at the end.
     """
     from faultline.outcome import Outcome
-    from faultline.runner import run_experiment
+    from faultline.report.results import load_results, new_run_id, save_result, save_run
+    from faultline.report.scorecard import Scorecard
+    from faultline.runner import pair_name, run_all, run_experiment
     from faultline.safety import UnsafeTargetError
     from faultline.spec import (
         EXPERIMENTS_DIR,
@@ -147,11 +169,18 @@ def run(
         load_target,
     )
 
+    if all_experiments == (experiment is not None):
+        typer.echo("Error: give one experiment, or --all", err=True)
+        raise typer.Exit(code=2)
+    dataset = {"profile": profile.value if profile else None}
     try:
-        spec = load_experiment(
-            find_spec(experiment, EXPERIMENTS_DIR, "experiment"),
-            dataset={"profile": profile.value if profile else None},
-        )
+        if all_experiments:
+            paths = sorted(EXPERIMENTS_DIR.glob("*.yaml"))
+            if not paths:
+                raise SpecError(f"no experiments in {EXPERIMENTS_DIR}/ (run from the repository)")
+        else:
+            paths = [find_spec(str(experiment), EXPERIMENTS_DIR, "experiment")]
+        experiments = [load_experiment(path, dataset=dataset) for path in paths]
         targets = [
             load_target(find_spec(name, TARGETS_DIR, "target")).build()
             for name in (target or ["reference-naive"])
@@ -160,15 +189,117 @@ def run(
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
 
+    run_id = new_run_id()
+    results, runs = results_dir / run_id, work_dir / run_id
     errors = 0
-    for chosen in targets:
-        run_dir = work_dir / f"{datetime.now():%Y%m%d-%H%M%S}-{spec.name}-{chosen.name}"
-        result = run_experiment(spec, chosen, run_dir, log=typer.echo)
+    names = [t.name for t in targets]
+    save_run(results, experiments=[e.name for e in experiments], targets=names)
+    if all_experiments:
+        lock = threading.Lock()
+        logs = results / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+
+        def log_for(name: str):  # type: ignore[no-untyped-def]
+            path = logs / f"{name}.log"
+
+            def write(line: str) -> None:
+                with path.open("a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+
+            return write
+
+        def on_result(result, seconds: float) -> None:  # type: ignore[no-untyped-def]
+            spec = next(e.spec for e in experiments if e.name == result.experiment)
+            save_result(result, results, dataset=spec, seconds=seconds)
+            with lock:
+                minutes, rest = divmod(int(seconds), 60)
+                typer.echo(
+                    f"{result.experiment} on {result.target}: {result.outcome} "
+                    f"({minutes}m{rest:02d}s)"
+                )
+
+        n = len(experiments) * len(targets)
+        typer.echo(f"run {run_id}: {len(experiments)} experiments x {len(targets)} targets ({n})")
+        typer.echo(f"logs in {logs}")
+        done = run_all(
+            experiments, targets, runs, parallel=parallel, log_for=log_for, on_result=on_result
+        )
+        errors = sum(r.outcome is Outcome.ERROR for r in done)
         typer.echo("")
-        typer.echo(result.render())
-        errors += result.outcome is Outcome.ERROR
+        card = Scorecard.from_records(run_id, load_results(results), targets=names)
+        typer.echo(card.to_markdown())
+    else:
+        (spec,) = experiments
+        for chosen in targets:
+            started = time.monotonic()
+            result = run_experiment(
+                spec, chosen, runs / pair_name(spec.name, chosen.name), log=typer.echo
+            )
+            saved = save_result(
+                result, results, dataset=spec.spec, seconds=time.monotonic() - started
+            )
+            typer.echo("")
+            typer.echo(result.render())
+            typer.echo(f"Result:     {saved}")
+            errors += result.outcome is Outcome.ERROR
+    typer.echo(f"Results:    {results} (faultline report {run_id})")
     if errors:
         raise typer.Exit(code=1)
+
+
+@app.command()
+def report(
+    run_id: Annotated[
+        str | None, typer.Argument(help="A run in the results folder (default: the latest).")
+    ] = None,
+    output: Annotated[ReportFormat, typer.Option("--format", help="md or json.")] = (
+        ReportFormat.md
+    ),
+    expect: Annotated[
+        Path | None,
+        typer.Option(help="Expected verdicts (scorecard/expected.yaml); exit 1 on a mismatch."),
+    ] = None,
+    results_dir: Annotated[
+        Path, typer.Option(help="Parent folder of the runs' result files.")
+    ] = Path(".faultline/results"),
+) -> None:
+    """Print a run's scorecard, and check it against expected verdicts."""
+    import json
+
+    from faultline.report.results import latest_run, load_results, load_run
+    from faultline.report.scorecard import ExpectationError, Scorecard, check, load_expected
+
+    folder = results_dir / run_id if run_id else latest_run(results_dir)
+    records = load_results(folder) if folder is not None and folder.is_dir() else []
+    if not records:
+        where = folder if folder is not None else results_dir
+        typer.echo(f"Error: no results in {where}; run `faultline run` first", err=True)
+        raise typer.Exit(code=2)
+    assert folder is not None  # records came from it
+    run_info = load_run(folder) or {}
+    card = Scorecard.from_records(folder.name, records, targets=run_info.get("targets", ()))
+    if output is ReportFormat.json:
+        typer.echo(json.dumps(card.to_json(), indent=2))
+    else:
+        typer.echo(card.to_markdown(), nl=False)
+    if expect is None:
+        return
+    try:
+        outcome = check(card, load_expected(expect))
+    except ExpectationError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    for line in outcome.unexpected:
+        typer.echo(f"note: {line}", err=True)
+    if not outcome.passed:
+        typer.echo(f"Not as expected ({expect}):", err=True)
+        for line in outcome.mismatches:
+            typer.echo(f"  - {line}", err=True)
+        raise typer.Exit(code=1)
+    covered = len(card.cells) - len(outcome.unexpected)
+    typer.echo(
+        f"As expected: {covered} of {len(card.cells)} cells checked against {expect}", err=True
+    )
 
 
 @app.command()
