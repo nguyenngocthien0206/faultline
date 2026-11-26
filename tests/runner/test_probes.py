@@ -4,13 +4,14 @@ from datetime import date
 from pathlib import Path
 from typing import ClassVar
 
-from fake_files import FakeFilePlatform
+from fake_files import FakeFilePlatform, files_target
 
 from faultline.adapters.base import RunRequest, RunResult, RunStatus
 from faultline.datagen import DatasetSpec
 from faultline.outcome import Outcome
 from faultline.properties.base import Checkpoint, Property, PropertyContext, PropertyResult
 from faultline.runner import Experiment, run_experiment
+from faultline.safety import Target
 from faultline.schedule import Run, Schedule, Snapshot
 
 TINY = DatasetSpec.from_profile("tiny")
@@ -57,7 +58,7 @@ def test_a_probe_runs_after_the_schedule_and_both_checkpoints_see_it(tmp_path: P
 
     result = run_experiment(
         _experiment(SawProbe()),
-        lambda root: FakeFilePlatform(root, "keyed"),
+        files_target("keyed"),
         tmp_path,
         log=lines.append,
     )
@@ -72,6 +73,8 @@ def test_a_probe_runs_after_the_schedule_and_both_checkpoints_see_it(tmp_path: P
 
 
 def test_a_probe_run_that_fails_is_a_signal(tmp_path: Path) -> None:
-    result = run_experiment(_experiment(SawProbe(holds=False)), FailsReruns, tmp_path)
+    target = Target("fails-reruns", environment="test", allow_destructive=True, sandbox=FailsReruns)
+
+    result = run_experiment(_experiment(SawProbe(holds=False)), target, tmp_path)
 
     assert result.outcome is Outcome.BROKEN, result.render()  # loud, and never healed

@@ -1,0 +1,11 @@
+name: late-file
+description: >
+  One file of a day's extract (the order lines) arrives after that day was
+  loaded, under its own partition, two days late.
+dataset:
+  profile: tiny
+faults:
+  - type: late_file
+    partition: 2
+    lands_before: 4    # right before day 4's run
+properties: [no_data_loss, no_silent_corruption]

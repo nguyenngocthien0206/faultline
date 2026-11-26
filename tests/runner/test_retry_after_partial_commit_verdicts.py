@@ -3,24 +3,26 @@
 from pathlib import Path
 
 import pytest
-from fake_files import FakeFilePlatform
+from fake_files import files_target
 
 from faultline.adapters.base import RunStatus
 from faultline.datagen import DatasetSpec
-from faultline.experiments import retry_after_partial_commit
 from faultline.outcome import Outcome
 from faultline.runner import ExperimentResult, run_experiment
+from faultline.spec import load_experiment
 
 TINY = DatasetSpec.from_profile("tiny")
-EXPERIMENT = retry_after_partial_commit(TINY)  # day 2 dies after loading, then is retried
+EXPERIMENTS = Path(__file__).resolve().parents[2] / "experiments"
+EXPERIMENT = load_experiment(
+    EXPERIMENTS / "retry-after-partial-commit.yaml"
+)  # day 2 dies after loading, then is retried
 
 
 def _run(mode: str, work_dir: Path, lines: list[str]) -> ExperimentResult:
     return run_experiment(
         EXPERIMENT,
-        lambda root: FakeFilePlatform(root, mode),
+        files_target(mode),
         work_dir,
-        target=f"files-{mode}",
         log=lines.append,
     )
 

@@ -1,15 +1,17 @@
 from datetime import date
+from pathlib import Path
 
 import pytest
 
 from faultline.adapters.base import Capability
 from faultline.datagen import DatasetSpec
-from faultline.experiments import BUILTIN, crash_after_landing
 from faultline.faults.base import FaultSetupError, InjectionPoint
 from faultline.faults.execution import CrashAfterLanding
 from faultline.schedule import Deliver, Run, clean_schedule
+from faultline.spec import SpecError, load_experiment
 
 TINY = DatasetSpec.from_profile("tiny")
+EXPERIMENTS = Path(__file__).resolve().parents[2] / "experiments"
 D1, D2, D3 = date(2026, 11, 1), date(2026, 11, 2), date(2026, 11, 3)
 
 
@@ -44,9 +46,9 @@ def test_the_day_must_be_in_the_schedule() -> None:
 
 
 def test_the_built_in_experiment_crashes_day_two() -> None:
-    (fault,) = BUILTIN["crash-after-landing"](TINY).faults
+    (fault,) = load_experiment(EXPERIMENTS / "crash-after-landing.yaml").faults
 
     assert isinstance(fault, CrashAfterLanding)
     assert fault.partition == D2
-    with pytest.raises(ValueError, match="at least 3 days"):
-        crash_after_landing(DatasetSpec.from_profile("tiny", days=2))
+    with pytest.raises(SpecError, match="day 2 is outside a 1-day dataset"):
+        load_experiment(EXPERIMENTS / "crash-after-landing.yaml", dataset={"days": 1})

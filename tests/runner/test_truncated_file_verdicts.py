@@ -3,22 +3,23 @@
 from pathlib import Path
 
 import pytest
-from fake_files import FakeFilePlatform
+from fake_files import files_target
 
 from faultline.adapters.base import RunStatus
 from faultline.datagen import DatasetSpec
-from faultline.experiments import truncated_file
 from faultline.outcome import Outcome
 from faultline.runner import run_experiment
+from faultline.spec import load_experiment
 
 TINY = DatasetSpec.from_profile("tiny")
-EXPERIMENT = truncated_file(TINY)  # the last day's order lines cut to 80%
+EXPERIMENTS = Path(__file__).resolve().parents[2] / "experiments"
+EXPERIMENT = load_experiment(
+    EXPERIMENTS / "truncated-file.yaml"
+)  # the last day's order lines cut to 80%
 
 
 def _run(mode: str, work_dir: Path):
-    return run_experiment(
-        EXPERIMENT, lambda root: FakeFilePlatform(root, mode), work_dir, target=f"files-{mode}"
-    )
+    return run_experiment(EXPERIMENT, files_target(mode), work_dir)
 
 
 @pytest.mark.parametrize(

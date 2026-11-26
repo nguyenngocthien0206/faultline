@@ -14,7 +14,6 @@ from faultline.adapters.reference import (
     Edition,
     ReferenceAdapter,
     ReferenceStackConfig,
-    target_name,
 )
 
 DAY = date(2026, 11, 2)
@@ -34,7 +33,6 @@ def test_naive_is_the_default_edition() -> None:
 
     assert adapter.edition is Edition.NAIVE
     assert adapter.job == "pos_daily"
-    assert adapter.target == "reference-naive"
     assert adapter.run_config() == {"resources": {"workspace": {"config": {"name": "fl_0123abcd"}}}}
 
 
@@ -42,15 +40,13 @@ def test_hardened_runs_its_own_job_with_the_platform_default_lag() -> None:
     adapter = _adapter(edition="hardened")
 
     assert adapter.job == "pos_daily_hardened"
-    assert adapter.target == "reference-hardened"
     assert "ops" not in adapter.run_config()  # the platform's own default applies
 
 
-def test_a_lag_set_by_faultline_goes_into_every_run_and_into_the_target_name() -> None:
+def test_a_lag_set_by_faultline_goes_into_every_run() -> None:
     adapter = _adapter(edition=Edition.HARDENED, lag_days=1)
 
     assert adapter.run_config()["ops"] == {HARDENED_EXTRACT_OP: {"config": {"lag_days": 1}}}
-    assert adapter.target == "reference-hardened(lag=1d)"
 
 
 def test_naive_has_no_lag_window_to_set() -> None:
@@ -66,11 +62,6 @@ def test_a_negative_lag_is_refused() -> None:
 def test_an_unknown_edition_is_refused() -> None:
     with pytest.raises(ValueError, match="bulletproof"):
         _adapter(edition="bulletproof")
-
-
-def test_target_names() -> None:
-    assert target_name("naive") == "reference-naive"
-    assert target_name(Edition.HARDENED, 0) == "reference-hardened(lag=0d)"
 
 
 def test_sandboxes_are_isolated_enough_to_run_side_by_side() -> None:

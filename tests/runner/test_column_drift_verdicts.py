@@ -3,7 +3,7 @@
 from pathlib import Path
 
 import pytest
-from fake_files import FakeFilePlatform
+from fake_files import files_target
 
 from faultline.adapters.base import RunStatus
 from faultline.datagen import DatasetSpec
@@ -34,12 +34,7 @@ def _experiment(move_to_end: bool) -> Experiment:
 
 
 def _run(mode: str, move_to_end: bool, work_dir: Path):
-    return run_experiment(
-        _experiment(move_to_end),
-        lambda root: FakeFilePlatform(root, mode),
-        work_dir,
-        target=f"files-{mode}",
-    )
+    return run_experiment(_experiment(move_to_end), files_target(mode), work_dir)
 
 
 @pytest.mark.parametrize("move_to_end", [False, True])

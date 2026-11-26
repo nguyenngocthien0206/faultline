@@ -21,6 +21,7 @@ import csv
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import duckdb
 
@@ -33,6 +34,7 @@ from faultline.adapters.base import (
     RunStatus,
     TableContract,
 )
+from faultline.safety import Target
 from faultline.sources.pos import day_files
 
 ORDERS = TableContract(
@@ -134,3 +136,13 @@ class FakeCursorPlatform(Adapter):
 
 def _ts(row: dict[str, str]) -> datetime:
     return datetime.fromisoformat(row["updated_at"])
+
+
+def cursor_target(mode: str, **options: Any) -> Target:
+    """The cursor platform as a target: a test environment, open to destruction, as declared."""
+    return Target(
+        name=f"fake-{mode}",
+        environment="test",
+        allow_destructive=True,
+        sandbox=lambda root: FakeCursorPlatform(root, mode, **options),
+    )

@@ -6,6 +6,9 @@ from typer.testing import CliRunner
 from faultline import __version__
 from faultline.adapters.reference import CleanReport, StackBusyError
 from faultline.cli import app
+from faultline.datagen import DatasetSpec
+from faultline.outcome import Outcome
+from faultline.runner import ExperimentResult
 
 runner = CliRunner()
 
@@ -58,58 +61,87 @@ def test_generate_rejects_an_invalid_date(tmp_path: Path) -> None:
     assert result.exit_code != 0
 
 
-def test_run_rejects_an_unknown_experiment(tmp_path: Path) -> None:
-    result = runner.invoke(app, ["run", "no-such-thing", "--stack-env", str(tmp_path / ".env")])
+def _target_file(folder: Path, *, environment: str = "test", env_file: str = "missing.env") -> Path:
+    path = folder / "sandbox.yaml"
+    path.write_text(
+        "name: sandbox\n"
+        "adapter: reference\n"
+        f"environment: {environment}\n"
+        "allow_destructive: true\n"
+        "options:\n"
+        f"  env_file: {env_file}\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_run_rejects_an_unknown_experiment() -> None:
+    result = runner.invoke(app, ["run", "no-such-thing"])
 
     assert result.exit_code == 2
-    assert "unknown experiment 'no-such-thing'" in result.output
-    assert "pos-offline-sync" in result.output
+    assert "no experiment named 'no-such-thing'" in result.output
+    assert "pos-offline-sync" in result.output  # the known ones are listed
+
+
+def test_run_rejects_an_unknown_target() -> None:
+    result = runner.invoke(app, ["run", "late-file", "--target", "bulletproof"])
+
+    assert result.exit_code == 2
+    assert "no target named 'bulletproof'" in result.output
+    assert "reference-hardened-lag1" in result.output
+
+
+def test_run_refuses_a_target_that_is_not_a_test_environment(tmp_path: Path) -> None:
+    target = _target_file(tmp_path, environment="production")
+
+    result = runner.invoke(app, ["run", "late-file", "--target", str(target)])
+
+    assert result.exit_code == 2
+    assert "faultline only runs against environment 'test'" in result.output
 
 
 def test_run_explains_a_missing_stack(tmp_path: Path) -> None:
-    result = runner.invoke(app, ["run", "pos-offline-sync", "--stack-env", str(tmp_path / ".env")])
+    # By path this time: the spec parses, the target too, then the stack is missing.
+    target = _target_file(tmp_path)
+
+    result = runner.invoke(app, ["run", "experiments/late-file.yaml", "--target", str(target)])
 
     assert result.exit_code == 2
     assert "make ref-up" in result.output
 
 
-def test_run_refuses_a_lag_window_on_naive(tmp_path: Path) -> None:
+def test_run_runs_the_experiment_on_every_target_in_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = tmp_path / "stack.env"
+    env.write_text(
+        "SOURCE_DB_USER=u\nSOURCE_DB_PASSWORD=p\nSOURCE_DB_NAME=db\nCLICKHOUSE_USER=u\n"
+        "CLICKHOUSE_PASSWORD=p\nS3_ACCESS_KEY=k\nS3_SECRET_KEY=s\n",
+        encoding="utf-8",
+    )
+    first = _target_file(tmp_path, env_file=env.name)
+    second = tmp_path / "other" / "sandbox.yaml"
+    second.parent.mkdir()
+    second.write_text(
+        first.read_text(encoding="utf-8").replace(env.name, f"../{env.name}"), encoding="utf-8"
+    )
+    seen: list[tuple[str, str, int]] = []
+
+    def fake_run(experiment, target, work_dir, *, log):  # type: ignore[no-untyped-def]
+        seen.append((experiment.name, target.name, experiment.spec.days))
+        return ExperimentResult(experiment.name, target.name, Outcome.PASS, work_dir=work_dir)
+
+    monkeypatch.setattr("faultline.runner.run_experiment", fake_run)
+
     result = runner.invoke(
         app,
-        ["run", "pos-offline-sync", "--lag-days", "3", "--stack-env", str(tmp_path / ".env")],
+        ["run", "late-file", "--target", str(first), "--target", str(second), "--profile", "demo"],
     )
 
-    assert result.exit_code == 2
-    assert "--target hardened only" in result.output
-
-
-def test_run_rejects_an_unknown_target(tmp_path: Path) -> None:
-    result = runner.invoke(
-        app,
-        ["run", "pos-offline-sync", "--target", "bulletproof", "--stack-env", str(tmp_path)],
-    )
-
-    assert result.exit_code != 0
-
-
-def test_run_accepts_a_lag_window_on_hardened(tmp_path: Path) -> None:
-    # Gets as far as looking for the stack, so the options themselves were accepted.
-    result = runner.invoke(
-        app,
-        [
-            "run",
-            "pos-offline-sync",
-            "--target",
-            "hardened",
-            "--lag-days",
-            "1",
-            "--stack-env",
-            str(tmp_path / ".env"),
-        ],
-    )
-
-    assert result.exit_code == 2
-    assert "make ref-up" in result.output
+    assert result.exit_code == 0, result.output
+    assert [(e, t) for e, t, _ in seen] == [("late-file", "sandbox")] * 2
+    assert seen[0][2] == DatasetSpec.from_profile("demo").days  # --profile won over the spec
+    assert result.output.count("Verdict:    PASS") == 2
 
 
 def test_clean_explains_a_missing_stack(tmp_path: Path) -> None:

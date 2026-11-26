@@ -12,8 +12,12 @@ from faultline.adapters.reference import ReferenceStackConfig, config_from_env_f
 from faultline.connectors.clickhouse import ClickHouseClient
 from faultline.connectors.dagster import DagsterClient
 from faultline.connectors.postgres import SourceDatabase
+from faultline.runner import Experiment
+from faultline.safety import Target
+from faultline.spec import load_experiment, load_target
 
-REFERENCE_DIR = Path(__file__).resolve().parents[2] / "reference"
+ROOT = Path(__file__).resolve().parents[2]
+REFERENCE_DIR = ROOT / "reference"
 
 
 def env_file() -> Path:
@@ -24,6 +28,17 @@ def env_file() -> Path:
 def reference_config() -> ReferenceStackConfig:
     """Adapter configuration for the local stack."""
     return config_from_env_file(env_file())
+
+
+def reference_target(edition: str) -> Target:
+    """targets/reference-<edition>.yaml, on the stack the tests use."""
+    spec = load_target(ROOT / "targets" / f"reference-{edition}.yaml")
+    return spec.build(config=reference_config())
+
+
+def experiment(name: str, **dataset: object) -> Experiment:
+    """experiments/<name>.yaml, with its dataset section overridden by `dataset`."""
+    return load_experiment(ROOT / "experiments" / f"{name}.yaml", dataset=dataset)
 
 
 @dataclass

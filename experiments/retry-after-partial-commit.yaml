@@ -1,0 +1,11 @@
+name: retry-after-partial-commit
+description: >
+  The run of day 2 is killed, hard, right after bronze wrote the day's order
+  lines and before Dagster recorded the step as done. Dagster retries the run
+  from the failed step, as its retry policy says.
+dataset:
+  profile: tiny
+faults:
+  - type: retry_after_partial_commit
+    partition: 2
+properties: [no_data_loss, no_silent_corruption]

@@ -1,0 +1,11 @@
+name: column-rename
+description: >
+  One file of the last day's extract (the payments) arrives with a column
+  renamed, amount_vnd to total_amount_vnd. Recovery redelivers it with the
+  agreed schema.
+dataset:
+  profile: tiny
+faults:
+  - type: column_drift
+    partition: last
+properties: [no_data_loss, no_silent_corruption]

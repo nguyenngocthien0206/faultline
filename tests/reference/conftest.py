@@ -28,9 +28,9 @@ import os
 from collections.abc import Iterator
 
 import pytest
-from reference_stack import Stack, reference_config
+from reference_stack import Stack, reference_target
 
-from faultline.adapters.reference import Edition, ReferenceAdapter, target_name
+from faultline.adapters.reference import Edition
 from faultline.connectors.dagster import DagsterError
 from faultline.connectors.workspace import new_workspace_name
 from faultline.datagen import DatasetSpec
@@ -76,12 +76,8 @@ def workspace(stack: Stack) -> Iterator[str]:
 
 
 def _clean_baseline(edition: Edition, tmp_path_factory: pytest.TempPathFactory) -> Baseline:
-    config = reference_config()
     baseline = run_baseline(
-        TINY,
-        lambda root: ReferenceAdapter(config, root, edition=edition),
-        tmp_path_factory.mktemp(f"{edition}_baseline"),
-        target=target_name(edition),
+        TINY, reference_target(edition), tmp_path_factory.mktemp(f"{edition}_baseline")
     )
     assert baseline.established, baseline.problems
     return baseline

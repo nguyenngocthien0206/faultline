@@ -65,16 +65,6 @@ FAILPOINT_TAG = "faultline/failpoint"
 FAILPOINT_REACHED = "faultline failpoint reached: "
 
 
-def target_name(edition: Edition | str, lag_days: int | None = None) -> str:
-    """How a result names the platform it ran on, e.g. reference-hardened(lag=1d).
-
-    faultline does not know the platform's default lag, so the name shows the
-    lag only when faultline set one.
-    """
-    name = f"reference-{Edition(edition)}"
-    return name if lag_days is None else f"{name}(lag={lag_days}d)"
-
-
 # Which landing partition a row came in (naive silver keeps it): true either way,
 # but a history load brings every row in on its first day, so it is left out of
 # comparisons. Hardened keeps it out of silver altogether.
@@ -213,10 +203,6 @@ class ReferenceAdapter(Adapter):
 
     def job_for(self, stage: Stage | None) -> str:
         return JOBS[self.edition, stage]
-
-    @property
-    def target(self) -> str:
-        return target_name(self.edition, self.lag_days)
 
     def run_config(self, stage: Stage | None = None) -> dict[str, object]:
         """Dagster run config: the sandbox to work in and, if set, the lag window.

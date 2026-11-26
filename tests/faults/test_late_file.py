@@ -1,15 +1,17 @@
 from datetime import date
+from pathlib import Path
 
 import pytest
 
 from faultline.adapters.base import Capability, Stage
 from faultline.datagen import DatasetSpec
-from faultline.experiments import BUILTIN, late_file
 from faultline.faults.base import FaultSetupError, InjectionPoint
 from faultline.faults.landing import LateFile
 from faultline.schedule import Deliver, HoldLandingFiles, ReleaseLandingFiles, Run, clean_schedule
+from faultline.spec import SpecError, load_experiment
 
 TINY = DatasetSpec.from_profile("tiny")
+EXPERIMENTS = Path(__file__).resolve().parents[2] / "experiments"
 D1, D2, D3, D4 = (date(2026, 11, d) for d in (1, 2, 3, 4))
 LINES = "pos/order_items"
 
@@ -72,9 +74,9 @@ def test_an_empty_dataset_list_is_refused() -> None:
 
 
 def test_the_built_in_experiment_holds_day_two_until_day_four() -> None:
-    (fault,) = BUILTIN["late-file"](TINY).faults
+    (fault,) = load_experiment(EXPERIMENTS / "late-file.yaml").faults
 
     assert isinstance(fault, LateFile)
     assert (fault.partition, fault.lands_before, fault.datasets) == (D2, D4, (LINES,))
-    with pytest.raises(ValueError, match="at least 4 days"):
-        late_file(DatasetSpec.from_profile("tiny", days=3))
+    with pytest.raises(SpecError, match="day 4 is outside a 3-day dataset"):
+        load_experiment(EXPERIMENTS / "late-file.yaml", dataset={"days": 3})

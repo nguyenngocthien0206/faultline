@@ -3,22 +3,23 @@
 from pathlib import Path
 
 import pytest
-from fake_files import FakeFilePlatform
+from fake_files import files_target
 
 from faultline.adapters.base import RunStatus
 from faultline.datagen import DatasetSpec
-from faultline.experiments import crash_after_landing
 from faultline.outcome import Outcome
 from faultline.runner import run_experiment
+from faultline.spec import load_experiment
 
 TINY = DatasetSpec.from_profile("tiny")
-EXPERIMENT = crash_after_landing(TINY)  # day 2 dies between landing and loading
+EXPERIMENTS = Path(__file__).resolve().parents[2] / "experiments"
+EXPERIMENT = load_experiment(
+    EXPERIMENTS / "crash-after-landing.yaml"
+)  # day 2 dies between landing and loading
 
 
 def _run(mode: str, work_dir: Path):
-    return run_experiment(
-        EXPERIMENT, lambda root: FakeFilePlatform(root, mode), work_dir, target=f"files-{mode}"
-    )
+    return run_experiment(EXPERIMENT, files_target(mode), work_dir)
 
 
 @pytest.mark.parametrize(
