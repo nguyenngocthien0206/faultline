@@ -19,7 +19,7 @@ from datetime import date
 from pathlib import Path
 
 import pytest
-from reference_stack import Stack, experiment, reference_target
+from reference_stack import Stack, experiment, keys_off, reference_target
 from shared_baseline import Baselines
 
 from faultline.adapters.base import RunResult
@@ -57,6 +57,10 @@ class TestNaive:
         result = _run(Edition.NAIVE, tmp_path, baselines)
 
         assert result.outcome is Outcome.SILENT_CORRUPTION, result.render()
+        assert keys_off(result)[-1] > 0  # three rounds of reruns never bring it back
+        assert len(keys_off(result)) == 3
+        assert result.recovery is not None
+        assert result.recovery.summary().endswith("growing")  # every rerun appends again
         run = _crashed_run(result)
         assert run.succeeded
         assert run.metadata["statuses"] == "INTERRUPTED,SUCCEEDED"
@@ -75,6 +79,7 @@ class TestHardened:
         result = _run(Edition.HARDENED, tmp_path, baselines)
 
         assert result.outcome is Outcome.PASS, result.render()
+        assert keys_off(result) == [0]  # healed by the first round of recovery
         run = _crashed_run(result)
         assert run.metadata["statuses"] == "INTERRUPTED,SUCCEEDED"
         for prop in result.properties:

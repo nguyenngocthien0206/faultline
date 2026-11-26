@@ -16,7 +16,7 @@ schedules, so the two experiments run in parallel too.
 from pathlib import Path
 
 import pytest
-from reference_stack import Stack, experiment, reference_target
+from reference_stack import Stack, experiment, keys_off, reference_target
 from shared_baseline import Baselines
 
 from faultline.adapters.base import RunStatus
@@ -52,6 +52,8 @@ class TestNaive:
         result = _run(Edition.NAIVE, tmp_path, baselines)
 
         assert result.outcome is Outcome.SILENT_CORRUPTION, result.render()
+        assert keys_off(result)[-1] > 0  # three rounds of reruns never bring it back
+        assert len(keys_off(result)) == 3
         loss = next(p for p in result.properties if p.name == "no_data_loss")
         assert not loss.at_f.holds
         assert not loss.at_r.holds  # rerunning the days does not bring the rows back
@@ -69,6 +71,7 @@ class TestHardened:
         result = _run(Edition.HARDENED, tmp_path, baselines)
 
         assert result.outcome is Outcome.PASS, result.render()
+        assert keys_off(result) == [0]  # healed by the first round of recovery
         for prop in result.properties:
             assert prop.at_f.holds, prop.at_f.evidence  # right as soon as the till synced
             assert prop.at_r.holds, prop.at_r.evidence  # and the reruns changed nothing
