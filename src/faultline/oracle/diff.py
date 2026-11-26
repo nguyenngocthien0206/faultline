@@ -6,6 +6,11 @@ Each key falls into at most one bucket:
 - extra:      absent from the expected snapshot, present in the actual one
 - duplicated: present in both, with more rows in the actual one (exactly-once broken)
 - changed:    present in both, same or fewer rows, different content (silent corruption)
+
+Rows off counts what the buckets hide: a key duplicated once or five times is
+one duplicated key, but one or four rows too many. Per key that differs: its
+rows when missing or extra, the difference in rows when the counts differ,
+and its rows when only the content changed.
 """
 
 from __future__ import annotations
@@ -44,6 +49,7 @@ class Diff:
     counts: dict[str, int]
     samples: dict[str, tuple[str, ...]] = field(default_factory=dict)
     measures: tuple[MeasureDelta, ...] = ()
+    rows_off: int = 0
 
     @property
     def is_empty(self) -> bool:
@@ -85,7 +91,13 @@ def diff(expected: Path, actual: Path, contract: TableContract) -> Diff:
                    WHEN e.k IS NULL THEN 'extra'
                    WHEN a.n > e.n THEN 'duplicated'
                    WHEN a.n <> e.n OR a.h <> e.h THEN 'changed'
-               END AS bucket
+               END AS bucket,
+               CASE
+                   WHEN a.k IS NULL THEN e.n
+                   WHEN e.k IS NULL THEN a.n
+                   WHEN a.n <> e.n THEN abs(a.n - e.n)
+                   ELSE e.n
+               END AS rows_off
         FROM ({per_key(expected)}) AS e
         FULL OUTER JOIN ({per_key(actual)}) AS a ON e.k = a.k
         """
@@ -98,6 +110,9 @@ def diff(expected: Path, actual: Path, contract: TableContract) -> Diff:
             ).fetchall()
         )
     )
+    rows_off = con.execute(
+        "SELECT coalesce(sum(rows_off), 0)::BIGINT FROM keyed WHERE bucket IS NOT NULL"
+    ).fetchone()[0]
     samples = {
         b: tuple(
             r[0]
@@ -116,4 +131,10 @@ def diff(expected: Path, actual: Path, contract: TableContract) -> Diff:
         act_sum = con.execute(f"{total} {parquet(actual)}").fetchone()[0]
         measures.append(MeasureDelta(m, int(exp_sum), int(act_sum)))
 
-    return Diff(table=contract.name, counts=counts, samples=samples, measures=tuple(measures))
+    return Diff(
+        table=contract.name,
+        counts=counts,
+        samples=samples,
+        measures=tuple(measures),
+        rows_off=int(rows_off),
+    )

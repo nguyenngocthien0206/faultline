@@ -6,9 +6,10 @@ import pytest
 
 from faultline.adapters.base import Capability, RunResult, RunStatus, TableContract
 from faultline.datagen.writer import write_landing_file
-from faultline.properties.base import Checkpoint, PropertyContext
+from faultline.properties.base import Checkpoint, PropertyContext, Recovery, Round
 from faultline.properties.core import (
     BackfillEquivalence,
+    Convergence,
     Idempotency,
     NoDataLoss,
     NoSilentCorruption,
@@ -247,3 +248,64 @@ def test_any_difference_from_the_daily_answer_breaks_equivalence(tmp_path: Path)
     assert not result.holds
     (line,) = result.evidence
     assert line.startswith("backfill 2026-11-01..2026-11-02: gold_sales: 1 duplicated keys")
+
+
+# ------------------------------------------------------------- convergence
+
+OFF = Round(runs=3, keys_off=12, rows_off=12, differences=("silver_orders: 12 missing keys",))
+MATCHED = Round(runs=3, keys_off=0)
+
+
+def _after_recovery(ctx: PropertyContext, recovery: Recovery | None) -> Checkpoint:
+    return Checkpoint("R", ctx.baseline, (), recovery=recovery)
+
+
+def test_convergence_is_judged_at_r_only(ctx: PropertyContext) -> None:
+    at_f = Checkpoint("F", ctx.baseline, ())
+
+    assert Convergence().check(ctx, at_f).holds
+
+
+def test_matching_the_baseline_within_the_rounds_converges(ctx: PropertyContext) -> None:
+    recovery = Recovery(max_rounds=3, rounds=(OFF, MATCHED))
+    result = Convergence().check(ctx, _after_recovery(ctx, recovery))
+
+    assert result.holds
+    assert result.evidence == ()
+    assert recovery.summary() == "converged after 2 rounds (6 runs)"
+
+
+def test_still_off_after_every_round_does_not_converge(ctx: PropertyContext) -> None:
+    worse = Round(3, 1_200, 1_500, ("silver_orders: 1,200 duplicated keys",))
+    recovery = Recovery(max_rounds=3, rounds=(OFF, OFF, worse))
+    result = Convergence().check(ctx, _after_recovery(ctx, recovery))
+
+    assert not result.holds
+    assert result.evidence == (
+        "not converged within 3 rounds (9 runs): "
+        "12, 12, 1,200 keys and 12, 12, 1,500 rows off the baseline",
+        "silver_orders: 1,200 duplicated keys",
+    )
+
+
+def test_a_rerun_that_appends_again_shows_as_rows_growing() -> None:
+    # The same keys duplicated every round: keys_off holds still, rows_off does not.
+    rounds = tuple(Round(1, 163, 163 * n) for n in (1, 2, 3))
+
+    assert Recovery(3, rounds).summary() == (
+        "not converged within 3 rounds (3 runs): "
+        "163, 163, 163 keys and 163, 326, 489 rows off the baseline, growing"
+    )
+    shrinking = tuple(Round(1, k, k) for k in (30, 20, 10))
+    assert Recovery(3, shrinking).summary().endswith("rows off the baseline, shrinking")
+
+
+def test_a_recovery_cut_short_says_so() -> None:
+    assert Recovery(max_rounds=3, rounds=(OFF,)).summary() == (
+        "stopped after 1 round (3 runs): 12 keys and 12 rows off the baseline"
+    )
+
+
+def test_convergence_needs_a_recovery_to_count(ctx: PropertyContext) -> None:
+    with pytest.raises(ValueError, match="no fault"):
+        Convergence().check(ctx, _after_recovery(ctx, None))

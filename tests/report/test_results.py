@@ -4,14 +4,16 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from report_helpers import MATRIX, TINY
+from report_helpers import MATRIX, TINY, converging
 
 from faultline import __version__
+from faultline.outcome import Outcome
 from faultline.report.results import (
     latest_run,
     load_results,
     new_run_id,
     result_file,
+    result_record,
     save_result,
 )
 
@@ -66,3 +68,19 @@ def test_run_ids_sort_in_time_and_the_latest_run_is_found(tmp_path: Path) -> Non
     assert early == "20261126-090500"
     assert latest_run(tmp_path) == tmp_path / late
     assert latest_run(tmp_path / "nothing-here") is None
+
+
+def test_a_result_keeps_the_rounds_recovery_took(tmp_path: Path) -> None:
+    save_result(converging("late-file", "naive", Outcome.SILENT_CORRUPTION, 12, 0), tmp_path)
+    (record,) = load_results(tmp_path)
+
+    assert record["recovery"] == {
+        "max_rounds": 3,
+        "converged": True,
+        "summary": "converged after 2 rounds (2 runs)",
+        "rounds": [
+            {"runs": 1, "keys_off": 12, "rows_off": 12, "differences": []},
+            {"runs": 1, "keys_off": 0, "rows_off": 0, "differences": []},
+        ],
+    }
+    assert result_record(MATRIX[0])["recovery"] is None

@@ -8,4 +8,4 @@ dataset:
 faults:
   - type: column_drift
     partition: last
-properties: [no_data_loss, no_silent_corruption]
+properties: [no_data_loss, no_silent_corruption, convergence]

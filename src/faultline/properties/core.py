@@ -1,4 +1,4 @@
-"""The core properties: nothing lost, nothing silently different, nothing done twice."""
+"""The core properties: nothing lost, nothing silently different, nothing done twice, healed."""
 
 from __future__ import annotations
 
@@ -165,3 +165,32 @@ class BackfillEquivalence(Property):
             if not d.is_empty:
                 evidence.append(f"backfill {self.start}..{self.end}: {d.summary()}")
         return PropertyResult(self.name, checkpoint.name, not evidence, tuple(evidence))
+
+
+class Convergence(Property):
+    """After a fault, rerunning the affected days brings the outputs back to the right answer.
+
+    The operator's move after an incident is to rerun what it touched, and
+    again if the numbers still look wrong. Recovery does that: it reruns every
+    affected partition, compares every table with the baseline, and goes
+    round again until they match, at most the experiment's `recovery_rounds`
+    times. The property holds when they matched, and the number of rounds it
+    took is the measure: one is a platform that heals with the standard move,
+    more is one that needs patience, none is one no amount of rerunning fixes.
+
+    Judged at R only (the runner counts the rounds as it goes); at F it holds,
+    so the outcome is PASS, BROKEN or SILENT_CORRUPTION, never DETECTED.
+    """
+
+    name: ClassVar[str] = "convergence"
+
+    def check(self, ctx: PropertyContext, checkpoint: Checkpoint) -> PropertyResult:
+        if checkpoint.name != "R":
+            return PropertyResult(self.name, checkpoint.name, True)
+        recovery = checkpoint.recovery
+        if recovery is None:
+            raise ValueError("convergence needs a recovery to count: the experiment has no fault")
+        if recovery.converged:
+            return PropertyResult(self.name, checkpoint.name, True)
+        evidence = (recovery.summary(), *recovery.rounds[-1].differences)
+        return PropertyResult(self.name, checkpoint.name, False, evidence)

@@ -10,6 +10,10 @@ that reach the source with a timestamp older than the cursor:
                        (rows later than the window: lost, as in naive)
     alert_then_repair  fail loudly, load them on the next run -> DETECTED
     alert_forever      fail loudly, never load them           -> BROKEN
+    reconcile          like naive, but every `reconcile_every`-th run of the
+                       sandbox is a full refresh that loads everything again:
+                       recovery converges, after as many rounds as it takes
+                       to get there
     lossy              drops one order even on a clean run    -> steady state broken
 
 It declares CONCURRENT_SANDBOXES unless built with `concurrent=False`, so the
@@ -50,12 +54,15 @@ class FakeCursorPlatform(Adapter):
         mode: str,
         *,
         lag: timedelta = LAG,
+        reconcile_every: int = 8,
         concurrent: bool = True,
         on_first_run: Callable[[], object] | None = None,
     ) -> None:
         self.input_root = input_root
         self.mode = mode
         self.lag = lag
+        self.reconcile_every = reconcile_every
+        self.runs = 0
         self.concurrent = concurrent
         self.on_first_run = on_first_run
         self.source: dict[str, dict[str, str]] = {}
@@ -85,6 +92,10 @@ class FakeCursorPlatform(Adapter):
         if self.on_first_run is not None:
             hook, self.on_first_run = self.on_first_run, None
             hook()
+        self.runs += 1
+        if self.mode == "reconcile" and self.runs % self.reconcile_every == 0:
+            self._load(self.source.values())
+            return RunResult(RunStatus.SUCCEEDED)
         if self.mode == "alert_then_repair" and self.repair_pending:
             self._load(self.source.values())
             self.repair_pending = False

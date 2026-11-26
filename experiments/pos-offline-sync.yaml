@@ -8,4 +8,4 @@ faults:
   - type: pos_offline_sync
     offline_from: 2    # the till is offline on days 2 and 3
     sync_on: 4         # and syncs on day 4, old timestamps intact
-properties: [no_data_loss, no_silent_corruption]
+properties: [no_data_loss, no_silent_corruption, convergence]

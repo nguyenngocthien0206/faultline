@@ -79,11 +79,14 @@ def test_naive_loses_rows_silently_and_recovery_cannot_bring_them_back(tmp_path:
     assert not loss.at_r.holds
     assert "silver_orders: complete_keys violated by" in loss.at_f.evidence[0]
     assert all(r.status is RunStatus.SUCCEEDED for runs in result.runs.values() for _, r in runs)
+    # Three rounds of the three affected days: rerunning never brings them back.
     assert [d.isoformat() for d, _ in result.runs["recovery"]] == [
         "2026-11-02",
         "2026-11-03",
         "2026-11-04",
-    ]
+    ] * 3
+    assert result.recovery is not None
+    assert not result.recovery.converged
 
 
 def test_the_report_tells_the_story(tmp_path: Path) -> None:
@@ -91,7 +94,8 @@ def test_the_report_tells_the_story(tmp_path: Path) -> None:
 
     assert "Experiment: pos-offline-sync  (target: fake-naive)" in text
     assert "Fault:      POS of " in text
-    assert "baseline 4/4 green, fault phase 4/4 green, recovery 3/3 green" in text
+    assert "baseline 4/4 green, fault phase 4/4 green, recovery 9/9 green" in text
+    assert "Recovery:   not converged within 3 rounds (9 runs): " in text
     assert "no_data_loss" in text
     assert "Verdict:    SILENT_CORRUPTION" in text
     assert "Evidence at F:" in text
@@ -233,7 +237,7 @@ def test_an_adapter_without_the_capability_gets_one_sandbox_at_a_time(tmp_path: 
 
     assert result.outcome is Outcome.SILENT_CORRUPTION
     assert factory.max_active == 1
-    assert factory.runs == TINY.days * 2 + 3  # baseline, fault phase, three reruns
+    assert factory.runs == TINY.days * 2 + 3 * 3  # baseline, fault phase, 3 rounds of 3
 
 
 def test_one_after_the_other_a_broken_baseline_stops_before_the_fault_phase(
@@ -255,6 +259,7 @@ def test_side_by_side_a_broken_baseline_is_still_an_error(tmp_path: Path) -> Non
     assert result.problems[0] == "steady state not established"
     assert list(result.runs) == ["baseline", "fault phase", "recovery"]  # it ran meanwhile
     assert not result.properties  # nothing is scored against a broken baseline
+    assert len(result.runs["recovery"]) == 3  # one round: nothing worth converging to
 
 
 def test_when_one_sandbox_fails_the_other_still_finishes_and_is_torn_down(

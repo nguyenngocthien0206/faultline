@@ -8,4 +8,4 @@ dataset:
 faults:
   - type: retry_after_partial_commit
     partition: 2
-properties: [no_data_loss, no_silent_corruption]
+properties: [no_data_loss, no_silent_corruption, convergence]

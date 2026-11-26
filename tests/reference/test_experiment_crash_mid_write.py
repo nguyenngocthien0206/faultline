@@ -21,7 +21,7 @@ from datetime import date
 from pathlib import Path
 
 import pytest
-from reference_stack import Stack, experiment, reference_target
+from reference_stack import Stack, experiment, keys_off, reference_target
 from shared_baseline import Baselines
 
 from faultline.adapters.base import RunStatus
@@ -61,6 +61,8 @@ class TestNaive:
         result = _run(Edition.NAIVE, tmp_path, baselines)
 
         assert result.outcome is Outcome.SILENT_CORRUPTION, result.render()
+        assert keys_off(result)[-1] > 0  # three rounds of reruns never bring it back
+        assert len(keys_off(result)) == 3
         assert _statuses(result, "fault phase")[CRASHED] == [RunStatus.INTERRUPTED]
         vanishing = next(p for p in result.properties if p.name == "no_vanishing_rows")
         assert not vanishing.at_f.holds
@@ -79,6 +81,7 @@ class TestHardened:
         result = _run(Edition.HARDENED, tmp_path, baselines)
 
         assert result.outcome is Outcome.PASS, result.render()
+        assert keys_off(result) == [0]  # healed by the first round of recovery
         assert _statuses(result, "fault phase")[CRASHED] == [RunStatus.INTERRUPTED]
         for prop in result.properties:
             assert prop.at_f.holds, prop.at_f.evidence

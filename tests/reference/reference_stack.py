@@ -13,7 +13,7 @@ from faultline.connectors.clickhouse import ClickHouseClient
 from faultline.connectors.dagster import DagsterClient
 from faultline.connectors.postgres import SourceDatabase
 from faultline.connectors.s3 import LandingBucket
-from faultline.runner import Experiment
+from faultline.runner import Experiment, ExperimentResult
 from faultline.safety import Target
 from faultline.spec import load_experiment, load_target
 
@@ -40,6 +40,12 @@ def reference_target(edition: str) -> Target:
 def experiment(name: str, **dataset: object) -> Experiment:
     """experiments/<name>.yaml, with its dataset section overridden by `dataset`."""
     return load_experiment(ROOT / "experiments" / f"{name}.yaml", dataset=dataset)
+
+
+def keys_off(result: ExperimentResult) -> list[int]:
+    """Keys still off the baseline after each round of recovery; ends in 0 if it converged."""
+    assert result.recovery is not None, result.render()
+    return [r.keys_off for r in result.recovery.rounds]
 
 
 @dataclass

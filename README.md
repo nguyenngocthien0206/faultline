@@ -31,21 +31,23 @@ make demo                                                # all ten on both editi
 uv run faultline report --format json                    # the latest run's scorecard, for CI
 ```
 
-`make demo` runs all ten on both editions, one clean run per edition shared by every experiment, the experiments side by side, about 17 minutes on a laptop. It prints the scorecard and checks it against the verdicts the platform should get:
+`make demo` runs all ten on both editions, one clean run per edition shared by every experiment, the experiments side by side, about 22 minutes on a laptop. It prints the scorecard and checks it against the verdicts the platform should get:
 
 ```
 | experiment | reference-naive | reference-hardened |
 |---|---|---|
 | backfill | BROKEN | PASS |
-| column-rename | SILENT_CORRUPTION | DETECTED |
-| crash-after-landing | SILENT_CORRUPTION | PASS |
-| crash-mid-write | SILENT_CORRUPTION | PASS |
-| duplicate-file | SILENT_CORRUPTION | PASS |
+| column-rename | SILENT_CORRUPTION (>3) | DETECTED (1) |
+| crash-after-landing | SILENT_CORRUPTION (1) | PASS (1) |
+| crash-mid-write | SILENT_CORRUPTION (>3) | PASS (1) |
+| duplicate-file | SILENT_CORRUPTION (>3) | PASS (1) |
 | idempotency | SILENT_CORRUPTION | PASS |
-| late-file | SILENT_CORRUPTION | PASS |
-| pos-offline-sync | SILENT_CORRUPTION | PASS |
-| retry-after-partial-commit | SILENT_CORRUPTION | PASS |
-| truncated-file | SILENT_CORRUPTION | DETECTED |
+| late-file | SILENT_CORRUPTION (>3) | PASS (1) |
+| pos-offline-sync | SILENT_CORRUPTION (>3) | PASS (1) |
+| retry-after-partial-commit | SILENT_CORRUPTION (>3) | PASS (1) |
+| truncated-file | SILENT_CORRUPTION (>3) | DETECTED (1) |
+
+(n): rounds of recovery until the outputs matched the baseline; (>n): not within n.
 
 - reference-naive: 1 BROKEN, 9 SILENT_CORRUPTION
 - reference-hardened: 8 PASS, 2 DETECTED
@@ -55,22 +57,26 @@ As expected: 20 of 20 cells checked against scorecard/expected.yaml
 
 Read it as a manager would: the naive pipeline is wrong on every scenario and says so only once, on the one where it cannot recover. Hardened survives eight and refuses the other two until the right file arrives, which is the failure you want: loud and fixable. Every cell that is not a `PASS` comes with one line of evidence (`silver_order_items: 163 duplicated keys, qty +22.0%`), every result is saved as JSON (`faultline report --format json` for CI), and because the table is checked against `scorecard/expected.yaml`, a change that makes the platform worse at surviving a fault fails the build like any other regression.
 
+The number in brackets is how many rounds of recovery it took: faultline reruns the days a fault touched, compares every table with the clean run, and goes round again until they match, three times at most. Hardened always heals in the first round. Naive heals in one round once, and on the other seven no amount of rerunning helps, it makes things worse: every rerun appends the same files again, so on `duplicate-file` the rows off the clean run go 864, 1,429, 1,994 and gold's revenue +68%, +114%, +160%. The runbook's first move is a second incident on this pipeline, and the scorecard shows it.
+
 Every experiment is a YAML file in `experiments/` and every platform a target in `targets/`, so adding a scenario is a reviewed pull request rather than new code. Days in a spec are counted within the dataset (`partition: 2`, `end: last`), so a longer profile keeps their meaning, and anything a spec gets wrong (an unknown fault, a misspelt parameter, day 9 of a four-day dataset) is an error that names the file and the field. A target must declare `environment: test` and `allow_destructive: true`; the runner checks that again before every action, and the reference adapter only ever drops a sandbox it marked as its own.
 
 `pos-offline-sync` takes a store's till offline for two days. When it reconnects, its orders reach the source database with their real, older timestamps, behind the incremental cursor of the ingestion tool. On the reference platform's naive pipeline the result looks like this:
 
 ```
-Runs:       baseline 4/4 green, fault phase 4/4 green, recovery 3/3 green
+Runs:       baseline 4/4 green, fault phase 4/4 green, recovery 9/9 green
   property                F         R         outcome
   no_data_loss            violated  violated  SILENT_CORRUPTION
   no_silent_corruption    violated  violated  SILENT_CORRUPTION
+  convergence             holds     violated  SILENT_CORRUPTION
+Recovery:   not converged within 3 rounds (9 runs): 886, 886, 886 keys and 886, 1,494, 2,102 rows off the baseline, growing
 Verdict:    SILENT_CORRUPTION
 Evidence at F:
   - silver_orders: complete_keys violated by 62 keys, e.g. HCM-001-20261102-00001, ...
   - gold_daily_store_sales: 2 missing keys, ..., net_vnd 37,937,000 -> 32,214,000 (-15.1%)
 ```
 
-Every run was green, so no alert fired and nobody would have been paged, yet two days of one store's sales are gone. Rerunning the days, the usual fix, does not bring them back and double counts the other stores instead (net revenue +35.5% at checkpoint R). That is the gap faultline measures. At checkpoint F, the usual data quality checks (unique keys, no nulls, valid values) all pass: nothing in the tables is malformed, rows are simply absent. The platform failed, not the data. Snapshots of every checkpoint stay in `.faultline/runs/` for inspection.
+Every run was green, so no alert fired and nobody would have been paged, yet two days of one store's sales are gone. Rerunning the days, the usual fix, does not bring them back and double counts the other stores instead (net revenue +35.5% after one round of reruns, +136.6% after three). That is the gap faultline measures. At checkpoint F, the usual data quality checks (unique keys, no nulls, valid values) all pass: nothing in the tables is malformed, rows are simply absent. The platform failed, not the data. Snapshots of every checkpoint stay in `.faultline/runs/` for inspection.
 
 The hardened edition runs the same tools with established patterns: a lag window in the extractor, idempotent bronze loads, one row per key in silver, and gold built from final states. Same fault, same runs, verdict `PASS` at both checkpoints. Its lag window is a promise with a limit, and faultline can measure that too: with a one-day window (`--target reference-hardened-lag1`), shorter than the two-day outage, hardened loses exactly the oldest day (22 orders) and the verdict is `SILENT_CORRUPTION` again. Choosing that window is a business decision (how late may a till sync and still count?) that now comes with a number attached.
 

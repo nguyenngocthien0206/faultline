@@ -41,6 +41,7 @@ from faultline.faults.source import PosOfflineSync
 from faultline.properties.base import Property
 from faultline.properties.core import (
     BackfillEquivalence,
+    Convergence,
     Idempotency,
     NoDataLoss,
     NoSilentCorruption,
@@ -71,7 +72,14 @@ FAULTS: dict[str, type[Fault]] = {
 }
 PROPERTIES: dict[str, type[Property]] = {
     cls.name: cls
-    for cls in (NoDataLoss, NoSilentCorruption, NoVanishingRows, Idempotency, BackfillEquivalence)
+    for cls in (
+        NoDataLoss,
+        NoSilentCorruption,
+        NoVanishingRows,
+        Idempotency,
+        BackfillEquivalence,
+        Convergence,
+    )
 }
 SCHEDULES: dict[str, Callable[[DatasetSpec], Schedule]] = {
     "daily": clean_schedule,  # each day arrives, then runs: the steady state
@@ -176,7 +184,7 @@ class ExperimentSpec(_Strict):
     schedule: Literal["daily", "deliveries_only"] = "daily"
     faults: list[str | dict[str, Any]] = []
     properties: list[str | dict[str, Any]] = Field(min_length=1)
-    recovery_rounds: int = Field(default=1, ge=1)
+    recovery_rounds: int = Field(default=3, ge=1)  # at most; recovery stops once it matches
 
 
 def load_experiment(path: Path, *, dataset: Mapping[str, Any] | None = None) -> Experiment:

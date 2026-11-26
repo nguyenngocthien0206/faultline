@@ -8,4 +8,4 @@ faults:
   - type: late_file
     partition: 2
     lands_before: 4    # right before day 4's run
-properties: [no_data_loss, no_silent_corruption]
+properties: [no_data_loss, no_silent_corruption, convergence]

@@ -7,16 +7,19 @@
     3. fault      a second fresh sandbox runs the faulted schedule on the
                   faulted copy of the input; snapshot at checkpoint F
     4. recovery   heal actions, then rerun the affected partitions (the
-                  operator's standard move); snapshot at checkpoint R
+                  operator's standard move), round after round until the
+                  outputs match the baseline, at most `recovery_rounds`
+                  times; snapshot at checkpoint R
     5. score      every property at F and R, classified into one outcome
 
-The two sandboxes only meet at step 5. When the adapter declares
-CONCURRENT_SANDBOXES, step 2 runs side by side with steps 3 and 4, and an
-experiment takes as long as its longer half. A baseline that turns out broken
-then still yields ERROR, only after the fault phase has run as well: faultline
-never kills a platform's runs midway. Without the capability (one shared test
-environment, say) the steps run one after the other and stop at a broken
-baseline.
+The two sandboxes only meet at step 5, and in step 4, which compares every
+round with the baseline. When the adapter declares CONCURRENT_SANDBOXES,
+step 2 runs side by side with steps 3 and 4 (the first round of recovery
+waits for it if need be), and an experiment takes as long as its longer half.
+A baseline that turns out broken then still yields ERROR, only after the fault
+phase has run as well: faultline never kills a platform's runs midway. Without
+the capability (one shared test environment, say) the steps run one after the
+other and stop at a broken baseline.
 
 A fault that needs a capability the adapter does not declare (landing files,
 say) makes the experiment SKIPPED before anything is generated or run.
@@ -48,7 +51,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date
 from functools import reduce
@@ -66,10 +69,18 @@ from faultline.adapters.base import (
 from faultline.datagen import DatasetSpec, generate
 from faultline.faults.base import Fault
 from faultline.faults.files import rename_column, truncate
+from faultline.oracle.diff import diff
 from faultline.oracle.invariants import complete_keys, unique_keys
 from faultline.oracle.snapshot import snapshot_all
 from faultline.outcome import Outcome, classify, has_signal, worst
-from faultline.properties.base import Checkpoint, Property, PropertyContext, PropertyResult
+from faultline.properties.base import (
+    Checkpoint,
+    Property,
+    PropertyContext,
+    PropertyResult,
+    Recovery,
+    Round,
+)
 from faultline.safety import AdapterFactory, Target
 from faultline.schedule import (
     Action,
@@ -100,7 +111,9 @@ class Experiment:
     spec: DatasetSpec
     faults: tuple[Fault, ...]
     properties: tuple[Property, ...]
-    recovery_rounds: int = 1
+    # At most this many rounds of recovery (every affected partition rerun),
+    # fewer when the outputs match the baseline sooner; always at least one.
+    recovery_rounds: int = 3
     # The fault phase's starting point, before faults rewrite it; the baseline
     # always runs the steady state (clean_schedule), the right answer.
     schedule: Callable[[DatasetSpec], Schedule] = clean_schedule
@@ -124,6 +137,7 @@ class ExperimentResult:
     runs: dict[str, RunLog] = field(default_factory=dict)
     problems: tuple[str, ...] = ()  # why the result is ERROR or SKIPPED, if it is
     work_dir: Path | None = None
+    recovery: Recovery | None = None  # the rounds recovery took, when there was one
 
     def render(self) -> str:
         lines = [f"Experiment: {self.experiment}  (target: {self.target})"]
@@ -140,6 +154,8 @@ class ExperimentResult:
                 f = "holds" if p.at_f.holds else "violated"
                 r = "holds" if p.at_r.holds else "violated"
                 lines.append(f"  {p.name:<24}{f:<10}{r:<10}{p.outcome}")
+        if self.recovery is not None:
+            lines.append(f"Recovery:   {self.recovery.summary()}")
         lines.append(f"Verdict:    {self.outcome}")
         label = "Skipped:    " if self.outcome is Outcome.SKIPPED else "Problem:    "
         lines += [f"{label}{p}" for p in self.problems]
@@ -378,7 +394,9 @@ class _FaultPlan:
 
     input_root: Path
     schedule: Schedule
-    recovery: tuple[Action, ...]
+    heal: tuple[Action, ...]  # the faults' own repairs, once, before the first round
+    round: tuple[Action, ...]  # one round of recovery: every affected partition rerun
+    max_rounds: int
     descriptions: tuple[str, ...]
     probe: Schedule = ()  # the properties' own actions, after the schedule
 
@@ -396,18 +414,33 @@ def _plan_faults(
     schedule = reduce(lambda s, f: f.apply(s), faults, experiment.schedule(experiment.spec))
     affected = sorted({p for f in faults for p in f.affected_partitions()})
     heal = tuple(a for f in faults for a in f.heal())
-    recovery = heal + tuple(Run(p) for _ in range(experiment.recovery_rounds) for p in affected)
+    one_round = tuple(Run(p) for p in affected)
     probe = tuple(a for prop in experiment.properties for a in prop.probe())
-    return _FaultPlan(faulted_input, schedule, recovery, tuple(descriptions), probe)
+    return _FaultPlan(
+        faulted_input,
+        schedule,
+        heal,
+        one_round,
+        experiment.recovery_rounds,
+        tuple(descriptions),
+        probe,
+    )
 
 
 def _fault_phases(
-    plan: _FaultPlan, adapter: Adapter, work_dir: Path, target: Target, log: Log
+    plan: _FaultPlan,
+    adapter: Adapter,
+    work_dir: Path,
+    target: Target,
+    log: Log,
+    answer: Callable[[], Baseline],
 ) -> tuple[Checkpoint, Checkpoint]:
     """Steps 3 and 4 in one sandbox: the faulted schedule, then the recovery.
 
     One store of held files serves both, so a heal can give back the files the
-    fault took away (the full version of a cut file, say).
+    fault took away (the full version of a cut file, say). `answer` gives the
+    baseline every round of recovery is compared with; side by side, it waits
+    for the other half.
     """
     held: Held = {}
     fault_marks: Marks = {}
@@ -439,20 +472,62 @@ def _fault_phases(
             "F", snapshot_all(sandbox, work_dir / "checkpoint_F"), fault_runs, fault_marks
         )
         recovery_marks: Marks = {**fault_marks, "F": at_f.snapshots}
-        recovery_runs = execute(
-            sandbox,
-            plan.recovery,
-            log,
-            "recovery",
-            held,
-            guard=guard,
-            marks=recovery_marks,
-            work_dir=work_dir,
-        )
-        at_r = Checkpoint(
-            "R", snapshot_all(sandbox, work_dir / "checkpoint_R"), recovery_runs, recovery_marks
-        )
+
+        def recover(actions: tuple[Action, ...]) -> RunLog:
+            return execute(
+                sandbox,
+                actions,
+                log,
+                "recovery",
+                held,
+                guard=guard,
+                marks=recovery_marks,
+                work_dir=work_dir,
+            )
+
+        recovery_runs = recover(plan.heal)
+        recovery = None
+        at_r_dir = work_dir / "checkpoint_R"
+        if plan.round:
+            rounds: list[Round] = []
+            while len(rounds) < plan.max_rounds:
+                round_runs = recover(plan.round)
+                recovery_runs += round_runs
+                snapshots = snapshot_all(sandbox, work_dir / f"recovery_round_{len(rounds) + 1}")
+                baseline = answer()
+                rounds.append(_compared(baseline, snapshots, len(round_runs)))
+                log(f"  [recovery] round {len(rounds)}/{plan.max_rounds}: {_off(rounds[-1])}")
+                if rounds[-1].keys_off == 0:
+                    break
+                if not baseline.established:  # nothing to converge to: the verdict is ERROR
+                    break
+            recovery = Recovery(plan.max_rounds, tuple(rounds))
+            log(f"  [recovery] {recovery.summary()}")
+            # R is the last round's state; checkpoint_R keeps it where it always was.
+            shutil.copytree(snapshots[next(iter(snapshots))].parent, at_r_dir, dirs_exist_ok=True)
+            at_r_snapshots = {table: at_r_dir / path.name for table, path in snapshots.items()}
+        else:  # no fault, nothing to rerun
+            at_r_snapshots = snapshot_all(sandbox, at_r_dir)
+        at_r = Checkpoint("R", at_r_snapshots, recovery_runs, recovery_marks, recovery)
     return at_f, at_r
+
+
+def _compared(baseline: Baseline, snapshots: dict[str, Path], runs: int) -> Round:
+    """A round of recovery next to the baseline: how many keys still differ, and where."""
+    diffs = [
+        diff(baseline.snapshots[contract.name], snapshots[contract.name], contract)
+        for contract in baseline.contracts
+    ]
+    off = [d for d in diffs if not d.is_empty]
+    keys = sum(sum(d.counts.values()) for d in off)
+    rows = sum(d.rows_off for d in off)
+    return Round(runs, keys, rows, tuple(d.summary() for d in off))
+
+
+def _off(round_: Round) -> str:
+    if round_.keys_off == 0:
+        return "matches the baseline"
+    return f"{round_.keys_off:,} keys, {round_.rows_off:,} rows off the baseline"
 
 
 def _side_by_side(first: Callable[[], A], second: Callable[[], B]) -> tuple[A, B]:
@@ -563,7 +638,10 @@ def _run(
             log("steady state not established")
             return _not_established(base, {phase: baseline.runs}, baseline)
         plan = _plan_faults(experiment, faults, baseline.truth_root, work_dir, log)
-        at_f, at_r = _fault_phases(plan, target.sandbox(plan.input_root), work_dir, target, log)
+        reused = baseline
+        at_f, at_r = _fault_phases(
+            plan, target.sandbox(plan.input_root), work_dir, target, log, lambda: reused
+        )
     else:
         phase = "baseline"
         truth = generate_truth(experiment.spec, work_dir, log)
@@ -573,16 +651,28 @@ def _run(
         clean, sandbox = target.sandbox(truth), target.sandbox(plan.input_root)
         if clean.capabilities().supports(Capability.CONCURRENT_SANDBOXES):
             log("baseline and fault phase run side by side")
+            answer: Future[Baseline] = Future()
+
+            def clean_half() -> Baseline:
+                try:
+                    done = _clean_run(experiment.spec, truth, clean, work_dir, target, log)
+                except BaseException as exc:  # a recovery waiting for it must not hang
+                    answer.set_exception(exc)
+                    raise
+                answer.set_result(done)
+                return done
+
             baseline, (at_f, at_r) = _side_by_side(
-                lambda: _clean_run(experiment.spec, truth, clean, work_dir, target, log),
-                lambda: _fault_phases(plan, sandbox, work_dir, target, log),
+                clean_half,
+                lambda: _fault_phases(plan, sandbox, work_dir, target, log, answer.result),
             )
         else:
             baseline = _clean_run(experiment.spec, truth, clean, work_dir, target, log)
             if not baseline.established:
                 log("steady state not established")
                 return _not_established(base, {phase: baseline.runs}, baseline, plan.descriptions)
-            at_f, at_r = _fault_phases(plan, sandbox, work_dir, target, log)
+            sequential = baseline
+            at_f, at_r = _fault_phases(plan, sandbox, work_dir, target, log, lambda: sequential)
 
     runs = {phase: baseline.runs, "fault phase": at_f.runs, "recovery": at_r.runs}
     if not baseline.established:  # side by side: found out after the fault phase ran
@@ -606,6 +696,7 @@ def _run(
         faults=plan.descriptions,
         properties=tuple(verdicts),
         runs=runs,
+        recovery=at_r.recovery,
     )
 
 

@@ -19,7 +19,7 @@ Each edition is its own class, the unit pytest-xdist schedules.
 from pathlib import Path
 
 import pytest
-from reference_stack import Stack, experiment, reference_target
+from reference_stack import Stack, experiment, keys_off, reference_target
 from shared_baseline import Baselines
 
 from faultline.adapters.base import RunStatus
@@ -51,6 +51,8 @@ class TestNaive:
         result = _run(Edition.NAIVE, tmp_path, baselines)
 
         assert result.outcome is Outcome.SILENT_CORRUPTION, result.render()
+        assert keys_off(result)[-1] > 0  # three rounds of reruns never bring it back
+        assert len(keys_off(result)) == 3
         loss = next(p for p in result.properties if p.name == "no_data_loss")
         evidence = loss.at_f.evidence
         assert any(e.startswith("silver_order_items: complete_keys violated") for e in evidence)
@@ -67,6 +69,7 @@ class TestHardened:
         result = _run(Edition.HARDENED, tmp_path, baselines)
 
         assert result.outcome is Outcome.DETECTED, result.render()
+        assert keys_off(result) == [0]  # healed by the first round of recovery
         failed = [(d, r) for d, r in result.runs["fault phase"] if r.status is RunStatus.FAILED]
         assert [d for d, _ in failed] == [TINY.end_date]  # the load of the cut day
         assert any("promised" in e and "rows" in e for e in failed[0][1].errors)

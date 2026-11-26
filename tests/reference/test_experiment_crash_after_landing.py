@@ -23,7 +23,7 @@ from datetime import date
 from pathlib import Path
 
 import pytest
-from reference_stack import Stack, experiment, reference_target
+from reference_stack import Stack, experiment, keys_off, reference_target
 from shared_baseline import Baselines
 
 from faultline.adapters.base import RunStatus
@@ -64,6 +64,7 @@ class TestNaive:
         assert "baseline" in result.runs  # its own clean run, not the shared one
 
         assert result.outcome is Outcome.SILENT_CORRUPTION, result.render()
+        assert keys_off(result) == [0]  # rerunning the day is the cure, if someone knows to
         assert _statuses(result, "fault phase")[CRASHED] == [RunStatus.INTERRUPTED]
         loss = next(p for p in result.properties if p.name == "no_data_loss")
         assert not loss.at_f.holds  # day 2 is missing...
@@ -81,6 +82,7 @@ class TestHardened:
         result = _run(Edition.HARDENED, tmp_path, baselines)
 
         assert result.outcome is Outcome.PASS, result.render()
+        assert keys_off(result) == [0]  # healed by the first round of recovery
         assert _statuses(result, "fault phase")[CRASHED] == [RunStatus.INTERRUPTED]
         for prop in result.properties:
             assert prop.at_f.holds, prop.at_f.evidence
