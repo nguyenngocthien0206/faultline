@@ -27,7 +27,33 @@ uv run faultline run retry-after-partial-commit          # a crashed run retried
 uv run faultline run idempotency                         # no fault: an old day is simply run again
 uv run faultline run backfill                            # no fault: the whole history in one backfill
 uv run faultline run late-file --target reference-naive --target reference-hardened
+make demo                                                # all ten on both editions, then the scorecard
+uv run faultline report --format json                    # the latest run's scorecard, for CI
 ```
+
+`make demo` runs all ten on both editions, one clean run per edition shared by every experiment, the experiments side by side, about 17 minutes on a laptop. It prints the scorecard and checks it against the verdicts the platform should get:
+
+```
+| experiment | reference-naive | reference-hardened |
+|---|---|---|
+| backfill | BROKEN | PASS |
+| column-rename | SILENT_CORRUPTION | DETECTED |
+| crash-after-landing | SILENT_CORRUPTION | PASS |
+| crash-mid-write | SILENT_CORRUPTION | PASS |
+| duplicate-file | SILENT_CORRUPTION | PASS |
+| idempotency | SILENT_CORRUPTION | PASS |
+| late-file | SILENT_CORRUPTION | PASS |
+| pos-offline-sync | SILENT_CORRUPTION | PASS |
+| retry-after-partial-commit | SILENT_CORRUPTION | PASS |
+| truncated-file | SILENT_CORRUPTION | DETECTED |
+
+- reference-naive: 1 BROKEN, 9 SILENT_CORRUPTION
+- reference-hardened: 8 PASS, 2 DETECTED
+
+As expected: 20 of 20 cells checked against scorecard/expected.yaml
+```
+
+Read it as a manager would: the naive pipeline is wrong on every scenario and says so only once, on the one where it cannot recover. Hardened survives eight and refuses the other two until the right file arrives, which is the failure you want: loud and fixable. Every cell that is not a `PASS` comes with one line of evidence (`silver_order_items: 163 duplicated keys, qty +22.0%`), every result is saved as JSON (`faultline report --format json` for CI), and because the table is checked against `scorecard/expected.yaml`, a change that makes the platform worse at surviving a fault fails the build like any other regression.
 
 Every experiment is a YAML file in `experiments/` and every platform a target in `targets/`, so adding a scenario is a reviewed pull request rather than new code. Days in a spec are counted within the dataset (`partition: 2`, `end: last`), so a longer profile keeps their meaning, and anything a spec gets wrong (an unknown fault, a misspelt parameter, day 9 of a four-day dataset) is an error that names the file and the field. A target must declare `environment: test` and `allow_destructive: true`; the runner checks that again before every action, and the reference adapter only ever drops a sandbox it marked as its own.
 

@@ -34,6 +34,10 @@ experiments on the same dataset and target, so the clean run is paid for once.
 A baseline from another dataset or another target is refused: comparing a
 hardened platform against naive's clean run would score the difference
 between the two platforms, not the fault.
+
+`run_all` runs a whole matrix, every experiment on every target: one baseline
+per dataset and target, shared by every experiment that uses them, then every
+pair side by side, a few at a time.
 """
 
 from __future__ import annotations
@@ -41,8 +45,9 @@ from __future__ import annotations
 import copy
 import shutil
 import threading
+import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date
@@ -602,3 +607,77 @@ def _run(
         properties=tuple(verdicts),
         runs=runs,
     )
+
+
+# ------------------------------------------------------------------ the matrix
+
+LogFor = Callable[[str], Log]  # a name ("late-file__reference-naive") -> where its log goes
+OnResult = Callable[[ExperimentResult, float], None]  # a finished pair, and its seconds
+
+
+def pair_name(experiment: str, target: str) -> str:
+    return f"{experiment}__{target}"
+
+
+def run_all(
+    experiments: Sequence[Experiment],
+    targets: Sequence[Target],
+    work_dir: Path,
+    *,
+    parallel: int = 8,
+    log_for: LogFor = lambda _: lambda _: None,
+    on_result: OnResult = lambda _result, _seconds: None,
+) -> list[ExperimentResult]:
+    """Every experiment on every target; results in the order of the pairs.
+
+    The clean run is paid once per dataset and target: the baselines run
+    first, side by side, and every experiment with that dataset reuses its
+    target's. Then the pairs run, `parallel` at a time; the platform's own
+    queue decides how many of their runs execute at once. A pair that fails
+    is an ERROR result and the others go on; a baseline that could not run
+    at all makes each of its pairs an ERROR that says so.
+    """
+    if parallel < 1:
+        raise ValueError(f"parallel must be at least 1, got {parallel}")
+    for target in targets:
+        target.check()
+    work_dir = Path(work_dir)
+    keys = list(dict.fromkeys((e.spec, t.name) for e in experiments for t in targets))
+    by_name = {t.name: t for t in targets}
+
+    def baseline(index: int, key: tuple[DatasetSpec, str]) -> Baseline | Exception:
+        spec, name = key
+        try:
+            return run_baseline(
+                spec,
+                by_name[name],
+                work_dir / "baselines" / f"{name}-{index}",
+                log=_synchronized(log_for(f"baseline__{name}-{index}")),
+            )
+        except Exception as exc:  # the pairs report it; a harness failure is never a verdict
+            return exc
+
+    with ThreadPoolExecutor(max_workers=parallel, thread_name_prefix="baseline") as pool:
+        baselines = dict(zip(keys, pool.map(baseline, range(len(keys)), keys), strict=True))
+
+    def pair(experiment: Experiment, target: Target) -> ExperimentResult:
+        name = pair_name(experiment.name, target.name)
+        started = time.monotonic()
+        shared = baselines[experiment.spec, target.name]
+        if isinstance(shared, Exception):
+            result = ExperimentResult(
+                experiment.name,
+                target.name,
+                Outcome.ERROR,
+                problems=(f"baseline: {type(shared).__name__}: {shared}",),
+            )
+        else:
+            result = run_experiment(
+                experiment, target, work_dir / name, baseline=shared, log=log_for(name)
+            )
+        on_result(result, time.monotonic() - started)
+        return result
+
+    pairs = [(e, t) for e in experiments for t in targets]
+    with ThreadPoolExecutor(max_workers=parallel, thread_name_prefix="pair") as pool:
+        return list(pool.map(lambda et: pair(*et), pairs))

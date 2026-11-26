@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ from faultline.adapters.reference import CleanReport, StackBusyError
 from faultline.cli import app
 from faultline.datagen import DatasetSpec
 from faultline.outcome import Outcome
+from faultline.report.results import save_result, save_run
 from faultline.runner import ExperimentResult
 
 runner = CliRunner()
@@ -75,6 +77,143 @@ def _target_file(folder: Path, *, environment: str = "test", env_file: str = "mi
     return path
 
 
+def _folders(tmp_path: Path) -> list[str]:
+    return ["--work-dir", str(tmp_path / "runs"), "--results-dir", str(tmp_path / "results")]
+
+
+def _stack_env(folder: Path) -> Path:
+    env = folder / "stack.env"
+    env.write_text(
+        "SOURCE_DB_USER=u\nSOURCE_DB_PASSWORD=p\nSOURCE_DB_NAME=db\nCLICKHOUSE_USER=u\n"
+        "CLICKHOUSE_PASSWORD=p\nS3_ACCESS_KEY=k\nS3_SECRET_KEY=s\n",
+        encoding="utf-8",
+    )
+    return env
+
+
+@pytest.mark.parametrize("args", [[], ["late-file", "--all"]])
+def test_run_needs_one_experiment_or_all_of_them(args: list[str]) -> None:
+    result = runner.invoke(app, ["run", *args])
+
+    assert result.exit_code == 2
+    assert "give one experiment, or --all" in result.output
+
+
+def test_run_all_runs_the_matrix_saves_every_result_and_prints_the_scorecard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _stack_env(tmp_path)
+    naive = _target_file(tmp_path, env_file=env.name)
+    other = tmp_path / "other.yaml"
+    other.write_text(naive.read_text(encoding="utf-8").replace("sandbox", "other"), "utf-8")
+    calls: dict[str, object] = {}
+
+    def fake_run_all(experiments, targets, work_dir, *, parallel, log_for, on_result):  # type: ignore[no-untyped-def]
+        calls.update(parallel=parallel, work_dir=work_dir)
+        results = []
+        for e in experiments:
+            for t in targets:
+                outcome = Outcome.PASS if t.name == "other" else Outcome.SILENT_CORRUPTION
+                result = ExperimentResult(e.name, t.name, outcome)
+                log_for(f"{e.name}__{t.name}")("a line of log")
+                on_result(result, 75.0)
+                results.append(result)
+        return results
+
+    monkeypatch.setattr("faultline.runner.run_all", fake_run_all)
+
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "--all",
+            "--target",
+            str(naive),
+            "--target",
+            str(other),
+            "--parallel",
+            "3",
+            *_folders(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls["parallel"] == 3
+    (run,) = (tmp_path / "results").iterdir()
+    files = sorted(f.name for f in run.glob("*__*.json"))
+    assert (run / "run.json").is_file()
+    assert len(files) == 2 * len(list(Path("experiments").glob("*.yaml")))
+    assert "late-file__other.json" in files
+    assert (run / "logs" / "late-file__sandbox.log").read_text(
+        encoding="utf-8"
+    ) == "a line of log\n"
+    assert "late-file on sandbox: SILENT_CORRUPTION (1m15s)" in result.output
+    assert "| experiment | sandbox | other |" in result.output
+    assert "| late-file | SILENT_CORRUPTION | PASS |" in result.output
+
+
+def _saved_run(tmp_path: Path) -> Path:
+    run = tmp_path / "results" / "20261126-101500"
+    save_run(run, experiments=["late-file"], targets=["reference-naive", "reference-hardened"])
+    for experiment, target, outcome in [
+        ("late-file", "reference-naive", Outcome.SILENT_CORRUPTION),
+        ("late-file", "reference-hardened", Outcome.PASS),
+    ]:
+        save_result(ExperimentResult(experiment, target, outcome), run)
+    return run
+
+
+def test_report_prints_the_latest_runs_scorecard(tmp_path: Path) -> None:
+    (tmp_path / "results" / "20261120-080000").mkdir(parents=True)  # older, and empty
+    run = _saved_run(tmp_path)
+    (tmp_path / "results" / "20261120-080000").rmdir()
+
+    result = runner.invoke(app, ["report", "--results-dir", str(tmp_path / "results")])
+
+    assert result.exit_code == 0, result.output
+    assert f"# faultline scorecard, run {run.name}" in result.output
+    assert "| late-file | SILENT_CORRUPTION | PASS |" in result.output
+
+
+def test_report_as_json_for_ci(tmp_path: Path) -> None:
+    run = _saved_run(tmp_path)
+
+    result = runner.invoke(
+        app, ["report", run.name, "--format", "json", "--results-dir", str(tmp_path / "results")]
+    )
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    assert data["matrix"]["late-file"]["reference-hardened"] == "PASS"
+
+
+def test_report_checks_the_scorecard_against_expected_verdicts(tmp_path: Path) -> None:
+    _saved_run(tmp_path)
+    good, bad = tmp_path / "good.yaml", tmp_path / "bad.yaml"
+    good.write_text(
+        "reference-naive:\n  late-file: SILENT_CORRUPTION\n"
+        "reference-hardened:\n  late-file: PASS\n",
+        encoding="utf-8",
+    )
+    bad.write_text("reference-hardened:\n  late-file: DETECTED\n", encoding="utf-8")
+    folder = ["--results-dir", str(tmp_path / "results")]
+
+    passed = runner.invoke(app, ["report", "--expect", str(good), *folder])
+    failed = runner.invoke(app, ["report", "--expect", str(bad), *folder])
+
+    assert passed.exit_code == 0, passed.output
+    assert "As expected: 2 of 2 cells" in passed.output
+    assert failed.exit_code == 1
+    assert "late-file on reference-hardened: expected DETECTED, got PASS" in failed.output
+
+
+def test_report_without_results_says_how_to_get_some(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["report", "--results-dir", str(tmp_path / "none")])
+
+    assert result.exit_code == 2
+    assert "run `faultline run` first" in result.output
+
+
 def test_run_rejects_an_unknown_experiment() -> None:
     result = runner.invoke(app, ["run", "no-such-thing"])
 
@@ -135,13 +274,26 @@ def test_run_runs_the_experiment_on_every_target_in_turn(
 
     result = runner.invoke(
         app,
-        ["run", "late-file", "--target", str(first), "--target", str(second), "--profile", "demo"],
+        [
+            "run",
+            "late-file",
+            "--target",
+            str(first),
+            "--target",
+            str(second),
+            "--profile",
+            "demo",
+            *_folders(tmp_path),
+        ],
     )
 
     assert result.exit_code == 0, result.output
     assert [(e, t) for e, t, _ in seen] == [("late-file", "sandbox")] * 2
     assert seen[0][2] == DatasetSpec.from_profile("demo").days  # --profile won over the spec
     assert result.output.count("Verdict:    PASS") == 2
+    (run,) = (tmp_path / "results").iterdir()
+    assert (run / "late-file__sandbox.json").is_file()  # every result is saved
+    assert f"faultline report {run.name}" in result.output
 
 
 def test_clean_explains_a_missing_stack(tmp_path: Path) -> None:

@@ -1,0 +1,32 @@
+# The verdicts the reference platform should get, on the tiny profile.
+#
+# `make demo` checks every run against this file (`faultline report --expect`).
+# A cell that moves is a change in how the platform behaves under a fault:
+# update the file in the same pull request that changes the platform, and say
+# why. A list means the cell may take any of those verdicts.
+
+reference-naive:
+  pos-offline-sync: SILENT_CORRUPTION
+  duplicate-file: SILENT_CORRUPTION
+  late-file: SILENT_CORRUPTION
+  truncated-file: SILENT_CORRUPTION
+  column-rename: SILENT_CORRUPTION
+  crash-after-landing: SILENT_CORRUPTION
+  crash-mid-write: SILENT_CORRUPTION
+  retry-after-partial-commit: SILENT_CORRUPTION
+  idempotency: SILENT_CORRUPTION
+  # Side by side, the backfill's extracts race for dlt's files: BROKEN when a
+  # run loses the race and fails, SILENT_CORRUPTION when none does.
+  backfill: [BROKEN, SILENT_CORRUPTION]
+
+reference-hardened:
+  pos-offline-sync: PASS
+  duplicate-file: PASS
+  late-file: PASS
+  truncated-file: DETECTED
+  column-rename: DETECTED
+  crash-after-landing: PASS
+  crash-mid-write: PASS
+  retry-after-partial-commit: PASS
+  idempotency: PASS
+  backfill: PASS
