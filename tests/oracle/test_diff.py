@@ -41,6 +41,17 @@ def test_each_kind_of_damage_lands_in_its_own_bucket(tmp_path: Path) -> None:
     assert (net.expected, net.actual) == (10_000_000, 10_000_000)
     assert net.delta == 0
     assert not result.is_empty
+    assert result.rows_off == 4  # one row each: lost, copied, changed, new
+
+
+def test_rows_off_counts_every_copy_the_buckets_count_once(tmp_path: Path) -> None:
+    expected = write(tmp_path / "e.parquet", [A, B])
+    twice = diff(expected, write(tmp_path / "a2.parquet", [A, A, B]), SALES)
+    four_times = diff(expected, write(tmp_path / "a4.parquet", [A, A, A, A, B]), SALES)
+
+    assert twice.counts["duplicated"] == four_times.counts["duplicated"] == 1
+    assert (twice.rows_off, four_times.rows_off) == (1, 3)
+    assert diff(expected, write(tmp_path / "same.parquet", [B, A]), SALES).rows_off == 0
 
 
 def test_summary_reads_like_a_scorecard_line(tmp_path: Path) -> None:
