@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help install lint fmt test test-integration check clean ref-up ref-down ref-clean ref-ps ref-logs
+.PHONY: help install lint fmt test test-integration check clean ref-up ref-down ref-clean ref-ps ref-logs demo
 
 COMPOSE := docker compose -f reference/docker-compose.yml
 
@@ -55,6 +55,13 @@ REF_UP_FLAGS ?= --build
 
 ref-up: reference/.env ## Build and start the reference stack, wait until it is healthy
 	$(COMPOSE) up -d $(REF_UP_FLAGS) --wait
+
+# Every experiment on both editions, one clean run per edition shared by all of
+# them, the experiments side by side; then the scorecard, checked against the
+# verdicts the platform should get (exit 1 if a cell moved).
+demo: ref-up ## Run every experiment on naive and hardened, print and check the scorecard
+	uv run faultline run --all --target reference-naive --target reference-hardened
+	uv run faultline report --expect scorecard/expected.yaml
 
 ref-down: reference/.env ## Stop the reference stack and delete its volumes
 	$(COMPOSE) down -v
