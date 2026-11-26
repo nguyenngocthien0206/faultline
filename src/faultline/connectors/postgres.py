@@ -11,7 +11,12 @@ from collections.abc import Iterable, Sequence
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
-from faultline.connectors.workspace import is_workspace_name, validate_workspace_name
+from faultline.connectors.workspace import (
+    SANDBOX_MARK,
+    UnmarkedWorkspaceError,
+    is_workspace_name,
+    validate_workspace_name,
+)
 
 if TYPE_CHECKING:
     import psycopg
@@ -98,10 +103,20 @@ class SourceDatabase:
     # -------------------------------------------------------------- workspaces
 
     def create_workspace(self, name: str) -> None:
+        """Create a workspace schema, marked as faultline's own."""
         sql = _psycopg().sql
+        schema = sql.Identifier(validate_workspace_name(name))
+        self.execute(sql.SQL("CREATE SCHEMA {}").format(schema))
         self.execute(
-            sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(validate_workspace_name(name)))
+            sql.SQL("COMMENT ON SCHEMA {} IS {}").format(schema, sql.Literal(SANDBOX_MARK))
         )
+
+    def is_marked(self, name: str) -> bool:
+        rows = self.fetch_all(
+            "SELECT obj_description(oid, 'pg_namespace') FROM pg_namespace WHERE nspname = %s",
+            (validate_workspace_name(name),),
+        )
+        return bool(rows) and rows[0][0] == SANDBOX_MARK
 
     def list_workspaces(self) -> list[str]:
         """Schemas that are faultline workspaces, sorted."""
@@ -109,7 +124,13 @@ class SourceDatabase:
         return sorted(name for (name,) in rows if is_workspace_name(name))
 
     def drop_workspace(self, name: str) -> None:
-        """Drop a faultline workspace schema and everything in it. Refuses any other name."""
+        """Drop a faultline workspace schema and everything in it.
+
+        Refuses any other name, and a schema with the name but not the mark.
+        """
         validated = validate_workspace_name(name)
+        exists = self.fetch_all("SELECT 1 FROM pg_namespace WHERE nspname = %s", (validated,))
+        if exists and not self.is_marked(validated):
+            raise UnmarkedWorkspaceError(f"refusing to drop schema {validated}: not marked")
         sql = _psycopg().sql
         self.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(validated)))

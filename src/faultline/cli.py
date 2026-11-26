@@ -204,3 +204,5 @@ def clean(
         f"{len(report.landing)} landing prefixes, {len(report.source)} source schemas, "
         f"{len(report.warehouse)} warehouse databases"
     )
+    if report.unmarked:
+        typer.echo(f"Left alone, not marked as faultline sandboxes: {', '.join(report.unmarked)}")

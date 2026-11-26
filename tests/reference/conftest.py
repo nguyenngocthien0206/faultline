@@ -67,12 +67,15 @@ def stack() -> Iterator[Stack]:
 
 @pytest.fixture
 def workspace(stack: Stack) -> Iterator[str]:
-    """A fresh, isolated workspace: Postgres schema now, ClickHouse database on demand."""
+    """A fresh, isolated workspace, marked in all three stores, and gone afterwards."""
     name = new_workspace_name()
     stack.source.create_workspace(name)
+    stack.clickhouse.create_workspace(name)
+    stack.landing.mark_workspace(name)
     yield name
     stack.source.drop_workspace(name)
     stack.clickhouse.drop_workspace(name)
+    stack.landing.delete_workspace(name)
 
 
 def _clean_baseline(edition: Edition, tmp_path_factory: pytest.TempPathFactory) -> Baseline:

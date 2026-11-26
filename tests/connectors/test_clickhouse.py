@@ -5,7 +5,7 @@ import pytest
 from http_stub import StubServer
 
 from faultline.connectors.clickhouse import ClickHouseClient, ClickHouseError
-from faultline.connectors.workspace import UnsafeWorkspaceError
+from faultline.connectors.workspace import UnmarkedWorkspaceError, UnsafeWorkspaceError
 
 
 def client(stub: StubServer) -> ClickHouseClient:
@@ -63,7 +63,18 @@ def test_ping_is_false_when_unreachable() -> None:
     assert not ClickHouseClient("http://127.0.0.1:9", timeout=1).ping()
 
 
-def test_drop_workspace_only_drops_faultline_databases(stub: StubServer) -> None:
+def test_a_workspace_database_is_created_with_faultlines_mark(stub: StubServer) -> None:
+    stub.reply(200, "")
+
+    client(stub).create_workspace("fl_abcd1234")
+
+    assert stub.requests[0].body == (
+        b"CREATE DATABASE IF NOT EXISTS fl_abcd1234 COMMENT 'faultline sandbox'"
+    )
+
+
+def test_drop_workspace_only_drops_marked_faultline_databases(stub: StubServer) -> None:
+    stub.reply(200, '{"comment": "faultline sandbox"}\n')
     stub.reply(200, "")
     ch = client(stub)
 
@@ -71,7 +82,27 @@ def test_drop_workspace_only_drops_faultline_databases(stub: StubServer) -> None
     with pytest.raises(UnsafeWorkspaceError):
         ch.drop_workspace("default")
 
-    assert [r.body for r in stub.requests] == [b"DROP DATABASE IF EXISTS fl_abcd1234"]
+    assert [r.body for r in stub.requests] == [
+        b"SELECT comment FROM system.databases WHERE name = 'fl_abcd1234'",
+        b"DROP DATABASE IF EXISTS fl_abcd1234",
+    ]
+
+
+def test_a_database_with_the_name_but_not_the_mark_is_never_dropped(stub: StubServer) -> None:
+    stub.reply(200, '{"comment": ""}\n')
+
+    with pytest.raises(UnmarkedWorkspaceError, match="fl_abcd1234: not marked"):
+        client(stub).drop_workspace("fl_abcd1234")
+
+    assert len(stub.requests) == 1  # asked, and dropped nothing
+
+
+def test_a_missing_workspace_database_is_nothing_to_drop(stub: StubServer) -> None:
+    stub.reply(200, "")
+
+    client(stub).drop_workspace("fl_abcd1234")
+
+    assert len(stub.requests) == 1
 
 
 def test_export_parquet_streams_the_body_into_the_file(stub: StubServer, tmp_path: Path) -> None:

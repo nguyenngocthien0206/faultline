@@ -12,6 +12,7 @@ from faultline.adapters.reference import ReferenceStackConfig, config_from_env_f
 from faultline.connectors.clickhouse import ClickHouseClient
 from faultline.connectors.dagster import DagsterClient
 from faultline.connectors.postgres import SourceDatabase
+from faultline.connectors.s3 import LandingBucket
 from faultline.runner import Experiment
 from faultline.safety import Target
 from faultline.spec import load_experiment, load_target
@@ -46,6 +47,7 @@ class Stack:
     source: SourceDatabase
     clickhouse: ClickHouseClient
     dagster: DagsterClient
+    landing: LandingBucket
 
     @classmethod
     def from_env(cls) -> "Stack":
@@ -58,4 +60,10 @@ class Stack:
                 password=config.clickhouse_password,
             ),
             dagster=DagsterClient(config.dagster_url, location=config.location),
+            landing=LandingBucket(
+                config.s3_url,
+                access_key=config.s3_access_key,
+                secret_key=config.s3_secret_key,
+                bucket=config.landing_bucket,
+            ),
         )
