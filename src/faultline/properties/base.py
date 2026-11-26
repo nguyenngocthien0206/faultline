@@ -15,11 +15,66 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import date
+from itertools import pairwise
 from pathlib import Path
 from typing import ClassVar
 
 from faultline.adapters.base import Capability, RunResult, TableContract
 from faultline.schedule import Schedule
+
+
+@dataclass(frozen=True)
+class Round:
+    """One round of recovery: every affected partition rerun once, then compared."""
+
+    runs: int
+    keys_off: int  # keys that differ from the baseline afterwards, over every table
+    # Rows behind those keys (oracle.diff): a rerun that appends one more copy
+    # of the same keys leaves keys_off where it was and adds to this.
+    rows_off: int = 0
+    differences: tuple[str, ...] = ()  # one line per table that differs
+
+
+@dataclass(frozen=True)
+class Recovery:
+    """How recovery went: rounds until the outputs matched the baseline, at most `max_rounds`."""
+
+    max_rounds: int
+    rounds: tuple[Round, ...]
+
+    @property
+    def converged(self) -> bool:
+        return bool(self.rounds) and self.rounds[-1].keys_off == 0
+
+    @property
+    def runs(self) -> int:
+        return sum(r.runs for r in self.rounds)
+
+    def summary(self) -> str:
+        n, runs = len(self.rounds), self.runs
+        spent = f"{_count(n, 'round')} ({_count(runs, 'run')})"
+        if self.converged:
+            return f"converged after {spent}"
+        keys = ", ".join(f"{r.keys_off:,}" for r in self.rounds)
+        rows = ", ".join(f"{r.rows_off:,}" for r in self.rounds)
+        off = f"{keys} keys and {rows} rows off the baseline{self._trend()}"
+        if n < self.max_rounds:  # stopped early: the baseline it compares with is not usable
+            return f"stopped after {spent}: {off}"
+        return f"not converged within {spent}: {off}"
+
+    def _trend(self) -> str:
+        rows = [r.rows_off for r in self.rounds]
+        if len(rows) < 2:
+            return ""
+        if all(a < b for a, b in pairwise(rows)):
+            return ", growing"
+        if all(a > b for a, b in pairwise(rows)):
+            return ", shrinking"
+        return ""
+
+
+def _count(n: int, word: str) -> str:
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
 @dataclass(frozen=True)
@@ -32,6 +87,9 @@ class Checkpoint:
     # judges R as it judged F, and F's own snapshots as "F", for properties
     # about what recovery changed.
     marks: dict[str, dict[str, Path]] = field(default_factory=dict)
+    # R only: the rounds recovery took. None at F, and when there was nothing
+    # to recover (an experiment without a fault).
+    recovery: Recovery | None = None
 
 
 @dataclass(frozen=True)
