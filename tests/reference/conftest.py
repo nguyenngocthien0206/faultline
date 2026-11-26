@@ -28,13 +28,14 @@ import os
 from collections.abc import Iterator
 
 import pytest
-from reference_stack import Stack, reference_target
+from reference_stack import Stack
+from shared_baseline import Baselines
 
 from faultline.adapters.reference import Edition
 from faultline.connectors.dagster import DagsterError
 from faultline.connectors.workspace import new_workspace_name
 from faultline.datagen import DatasetSpec
-from faultline.runner import Baseline, run_baseline
+from faultline.runner import Baseline
 
 TINY = DatasetSpec.from_profile("tiny")
 
@@ -78,25 +79,34 @@ def workspace(stack: Stack) -> Iterator[str]:
     stack.landing.delete_workspace(name)
 
 
-def _clean_baseline(edition: Edition, tmp_path_factory: pytest.TempPathFactory) -> Baseline:
-    baseline = run_baseline(
-        TINY, reference_target(edition), tmp_path_factory.mktemp(f"{edition}_baseline")
-    )
+@pytest.fixture(scope="session")
+def baselines(stack: Stack, tmp_path_factory: pytest.TempPathFactory, worker_id: str) -> Baselines:
+    """Each edition's clean run of the tiny dataset, once for the whole session.
+
+    Under xdist every worker's temporary folder sits in one session folder,
+    which is where the shared baselines live (shared_baseline.py). Experiments
+    pass it as `baseline=`, so each fault phase is compared with the same
+    clean run instead of paying four runs for its own.
+    """
+    root = tmp_path_factory.getbasetemp()
+    return Baselines(root if worker_id == "master" else root.parent)
+
+
+def _established(baseline: Baseline) -> Baseline:
     assert baseline.established, baseline.problems
     return baseline
 
 
 @pytest.fixture(scope="session")
-def naive_baseline(stack: Stack, tmp_path_factory: pytest.TempPathFactory) -> Baseline:
-    """One clean run of the tiny dataset on the naive pipeline, for the pipeline checks.
+def naive_baseline(baselines: Baselines) -> Baseline:
+    """The naive pipeline's shared clean run, for the pipeline checks.
 
-    A baseline is four Dagster runs; the checks of one edition all read the same one.
     Its snapshots live on disk; the sandbox itself is already torn down.
     """
-    return _clean_baseline(Edition.NAIVE, tmp_path_factory)
+    return _established(baselines(Edition.NAIVE))
 
 
 @pytest.fixture(scope="session")
-def hardened_baseline(stack: Stack, tmp_path_factory: pytest.TempPathFactory) -> Baseline:
+def hardened_baseline(baselines: Baselines) -> Baseline:
     """The same, on the hardened pipeline (with the platform's default lag window)."""
-    return _clean_baseline(Edition.HARDENED, tmp_path_factory)
+    return _established(baselines(Edition.HARDENED))

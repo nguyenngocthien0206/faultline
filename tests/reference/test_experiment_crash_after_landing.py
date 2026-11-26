@@ -11,7 +11,12 @@ says so: SILENT_CORRUPTION. Rerunning day 2 loads the files still waiting.
 Hardened: day 3's lag window reads day 2's rows again from the source, and the
 day is complete before checkpoint F: PASS.
 
-Each edition is its own class, the unit pytest-xdist schedules.
+Each edition is its own class, the unit pytest-xdist schedules. Every other
+experiment in the suite is compared with its edition's shared clean run
+(conftest.py, `baselines`); this one's naive class runs whole, its own
+baseline side by side with the fault phase, so that path, the one
+`faultline run` takes for a single experiment, is still tested on the real
+stack.
 """
 
 from datetime import date
@@ -19,6 +24,7 @@ from pathlib import Path
 
 import pytest
 from reference_stack import Stack, experiment, reference_target
+from shared_baseline import Baselines
 
 from faultline.adapters.base import RunStatus
 from faultline.adapters.reference import Edition
@@ -32,8 +38,13 @@ TINY = DatasetSpec.from_profile("tiny")
 CRASHED = date(2026, 11, 2)
 
 
-def _run(edition: Edition, work_dir: Path) -> ExperimentResult:
-    result = run_experiment(experiment("crash-after-landing"), reference_target(edition), work_dir)
+def _run(edition: Edition, work_dir: Path, baselines: Baselines | None = None) -> ExperimentResult:
+    result = run_experiment(
+        experiment("crash-after-landing"),
+        reference_target(edition),
+        work_dir,
+        baseline=baselines(edition) if baselines else None,
+    )
     print(result.render())
     return result
 
@@ -49,7 +60,8 @@ class TestNaive:
     def test_never_loads_the_crashed_day_and_nothing_says_so(
         self, stack: Stack, tmp_path: Path
     ) -> None:
-        result = _run(Edition.NAIVE, tmp_path)
+        result = _run(Edition.NAIVE, tmp_path)  # whole, see the module docstring
+        assert "baseline" in result.runs  # its own clean run, not the shared one
 
         assert result.outcome is Outcome.SILENT_CORRUPTION, result.render()
         assert _statuses(result, "fault phase")[CRASHED] == [RunStatus.INTERRUPTED]
@@ -64,9 +76,9 @@ class TestNaive:
 @pytest.mark.hardened
 class TestHardened:
     def test_reads_the_crashed_day_again_on_the_next_run(
-        self, stack: Stack, tmp_path: Path
+        self, stack: Stack, baselines: Baselines, tmp_path: Path
     ) -> None:
-        result = _run(Edition.HARDENED, tmp_path)
+        result = _run(Edition.HARDENED, tmp_path, baselines)
 
         assert result.outcome is Outcome.PASS, result.render()
         assert _statuses(result, "fault phase")[CRASHED] == [RunStatus.INTERRUPTED]

@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 from reference_stack import Stack, experiment, reference_target
+from shared_baseline import Baselines
 
 from faultline.adapters.reference import Edition
 from faultline.datagen import DatasetSpec
@@ -34,15 +35,22 @@ pytestmark = pytest.mark.integration
 TINY = DatasetSpec.from_profile("tiny")
 
 
-def _run(edition: Edition, work_dir: Path) -> ExperimentResult:
-    result = run_experiment(experiment("backfill"), reference_target(edition), work_dir)
+def _run(edition: Edition, work_dir: Path, baselines: Baselines | None = None) -> ExperimentResult:
+    result = run_experiment(
+        experiment("backfill"),
+        reference_target(edition),
+        work_dir,
+        baseline=baselines(edition) if baselines else None,
+    )
     print(result.render())
     return result
 
 
 class TestNaive:
-    def test_a_backfill_never_gives_the_daily_answer(self, stack: Stack, tmp_path: Path) -> None:
-        result = _run(Edition.NAIVE, tmp_path)
+    def test_a_backfill_never_gives_the_daily_answer(
+        self, stack: Stack, baselines: Baselines, tmp_path: Path
+    ) -> None:
+        result = _run(Edition.NAIVE, tmp_path, baselines)
 
         # Which of the two depends on whether a run lost the race for dlt's files.
         assert result.outcome in (Outcome.SILENT_CORRUPTION, Outcome.BROKEN), result.render()
@@ -58,8 +66,10 @@ class TestNaive:
 
 @pytest.mark.hardened
 class TestHardened:
-    def test_a_backfill_gives_the_daily_answer(self, stack: Stack, tmp_path: Path) -> None:
-        result = _run(Edition.HARDENED, tmp_path)
+    def test_a_backfill_gives_the_daily_answer(
+        self, stack: Stack, baselines: Baselines, tmp_path: Path
+    ) -> None:
+        result = _run(Edition.HARDENED, tmp_path, baselines)
 
         assert result.outcome is Outcome.PASS, result.render()
         assert all(r.succeeded for _, r in result.runs["fault phase"])  # the lock, not luck

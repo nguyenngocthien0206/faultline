@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 from reference_stack import Stack, experiment, reference_target
+from shared_baseline import Baselines
 
 from faultline.adapters.base import RunStatus
 from faultline.adapters.reference import Edition
@@ -29,8 +30,13 @@ pytestmark = pytest.mark.integration
 TINY = DatasetSpec.from_profile("tiny")
 
 
-def _run(edition: Edition, work_dir: Path) -> ExperimentResult:
-    result = run_experiment(experiment("pos-offline-sync"), reference_target(edition), work_dir)
+def _run(edition: Edition, work_dir: Path, baselines: Baselines | None = None) -> ExperimentResult:
+    result = run_experiment(
+        experiment("pos-offline-sync"),
+        reference_target(edition),
+        work_dir,
+        baseline=baselines(edition) if baselines else None,
+    )
     print(result.render())
     return result
 
@@ -40,8 +46,10 @@ def _all_green(result: ExperimentResult) -> bool:
 
 
 class TestNaive:
-    def test_loses_the_offline_store_without_a_word(self, stack: Stack, tmp_path: Path) -> None:
-        result = _run(Edition.NAIVE, tmp_path)
+    def test_loses_the_offline_store_without_a_word(
+        self, stack: Stack, baselines: Baselines, tmp_path: Path
+    ) -> None:
+        result = _run(Edition.NAIVE, tmp_path, baselines)
 
         assert result.outcome is Outcome.SILENT_CORRUPTION, result.render()
         loss = next(p for p in result.properties if p.name == "no_data_loss")
@@ -55,8 +63,10 @@ class TestNaive:
 
 @pytest.mark.hardened
 class TestHardened:
-    def test_counts_the_offline_store_once_it_syncs(self, stack: Stack, tmp_path: Path) -> None:
-        result = _run(Edition.HARDENED, tmp_path)
+    def test_counts_the_offline_store_once_it_syncs(
+        self, stack: Stack, baselines: Baselines, tmp_path: Path
+    ) -> None:
+        result = _run(Edition.HARDENED, tmp_path, baselines)
 
         assert result.outcome is Outcome.PASS, result.render()
         for prop in result.properties:
