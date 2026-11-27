@@ -107,11 +107,14 @@ make install            # create .venv and install dependencies
 make check              # lint, format check and the tests that need no Docker
 
 make ref-up             # build and start the reference platform (first build takes a few minutes)
-make test-integration   # run the tests that drive the real platform (about 18 min on 18 parallel workers;
-                        #   EDITION=naive|hardened for one half, WORKERS=0 for one process)
+make test-integration   # run the tests that drive the real platform (about 16 to 25 min on 26 parallel
+                        #   workers; EDITION=naive|hardened for one half, WORKERS=0 for one process)
+make ref-timings LAST=30m   # where those runs spent their time: queue, worker start, imports, steps
 make ref-clean          # delete leftover sandboxes (fl_*) once nothing runs; FORCE=1 to insist
 make ref-down           # stop it and delete its data
 ```
+
+How long the suite takes depends on the machine more than on anything in it: the same tests repeat to the second on a quiet computer and take half as long again on one that has just booted or is busy with other work, in every phase alike. `make ref-timings` shows which phase moved, so compare two suites on the same quiet machine, one after the other.
 
 Pull requests on GitHub run only lint and the Docker-free tests; the integration suite runs on every push to `main`, as two parallel jobs, one per edition. Run `make test-integration` locally before opening a pull request that touches `src/` or `reference/`.
 
