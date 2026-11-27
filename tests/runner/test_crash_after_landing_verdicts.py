@@ -40,3 +40,12 @@ def test_the_crash_is_faultlines_and_does_not_count_as_a_signal(tmp_path: Path) 
     loss = next(p for p in result.properties if p.name == "no_data_loss")
     assert not loss.at_f.holds  # day 2 never loaded...
     assert loss.at_r.holds  # ...until the operator reran it
+
+
+@pytest.mark.parametrize("mode", ["append", "keyed"])
+def test_a_crash_before_anything_is_loaded_keeps_the_day_whole(mode: str, tmp_path: Path) -> None:
+    # Nothing of the day reached a consumer table: readers see it not started.
+    result = run_experiment(EXPERIMENT, files_target(mode), tmp_path)
+
+    atomicity = next(p for p in result.properties if p.name == "atomicity")
+    assert atomicity.outcome is Outcome.PASS, atomicity.at_f.evidence

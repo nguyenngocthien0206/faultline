@@ -90,6 +90,9 @@ class Checkpoint:
     # R only: the rounds recovery took. None at F, and when there was nothing
     # to recover (an experiment without a fault).
     recovery: Recovery | None = None
+    # The fault phase's runs, at F and at R alike, so a property about a moment
+    # in the fault phase (a crash) can find it again at R.
+    fault_runs: tuple[tuple[date, RunResult], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -97,6 +100,9 @@ class PropertyContext:
     contracts: tuple[TableContract, ...]
     baseline: dict[str, Path]  # clean run, same input: the differential answer key
     truth_root: Path  # the generated data before any fault touched it
+    # The clean run after each day: what the tables should look like once
+    # that day is done (the last day's is `baseline`).
+    baseline_days: dict[date, dict[str, Path]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

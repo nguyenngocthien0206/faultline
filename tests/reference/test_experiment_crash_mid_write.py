@@ -8,11 +8,14 @@ touches an older day: refunds of day 1 orders.
 Naive (delete_insert): the day 1 rows of the stores the refunds touched are
 deleted, the insert never runs. Readers lose rows they could see a moment ago,
 and days 4 and on never touch those keys again: SILENT_CORRUPTION, with
-no_vanishing_rows violated at F. Rerunning day 3 puts them back.
+no_vanishing_rows violated at F and gold half written right after the crash
+(atomicity). Rerunning day 3 puts the rows back.
 
 Hardened (insert_overwrite): the new rows are built aside and never swapped in,
 the old ones stay where they were, and day 4 rebuilds the days it touches from
-final state: PASS.
+final state: no row is lost. But silver (views over bronze) and the payments
+report already show day 3, and the sales report does not: until the next run
+the two gold tables disagree, and nothing says so (atomicity): SILENT_CORRUPTION.
 
 Each edition is its own class, the unit pytest-xdist schedules.
 """
@@ -71,18 +74,30 @@ class TestNaive:
             for e in vanishing.at_f.evidence
         ), vanishing.at_f.evidence
         assert vanishing.at_r.holds  # the rerun only adds back
+        atomicity = next(p for p in result.properties if p.name == "atomicity")
+        assert any(
+            e.startswith("crash on 2026-11-03: half written, gold_daily_store_sales: ")
+            for e in atomicity.at_f.evidence
+        ), atomicity.at_f.evidence
 
 
 @pytest.mark.hardened
 class TestHardened:
-    def test_the_old_rows_stay_until_the_new_ones_are_swapped_in(
+    def test_no_row_is_lost_but_the_gold_tables_disagree_until_the_next_run(
         self, stack: Stack, baselines: Baselines, tmp_path: Path
     ) -> None:
         result = _run(Edition.HARDENED, tmp_path, baselines)
 
-        assert result.outcome is Outcome.PASS, result.render()
+        assert result.outcome is Outcome.SILENT_CORRUPTION, result.render()
         assert keys_off(result) == [0]  # healed by the first round of recovery
         assert _statuses(result, "fault phase")[CRASHED] == [RunStatus.INTERRUPTED]
-        for prop in result.properties:
-            assert prop.at_f.holds, prop.at_f.evidence
-            assert prop.at_r.holds, prop.at_r.evidence
+        atomicity = next(p for p in result.properties if p.name == "atomicity")
+        assert atomicity.at_f.evidence == (
+            "crash on 2026-11-03: tables disagree: silver_orders, silver_order_items, "
+            "silver_payments, gold_daily_payments show the day, "
+            "gold_daily_store_sales does not",
+        )
+        for prop in result.properties:  # only the moment of the crash was wrong
+            if prop.name != "atomicity":
+                assert prop.at_f.holds, prop.at_f.evidence
+                assert prop.at_r.holds, prop.at_r.evidence

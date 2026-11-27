@@ -11,4 +11,4 @@ faults:
   # new ones no reader ever saw.
   - type: crash_mid_write
     partition: 3
-properties: [no_data_loss, no_silent_corruption, no_vanishing_rows, convergence]
+properties: [no_data_loss, no_silent_corruption, no_vanishing_rows, atomicity, convergence]

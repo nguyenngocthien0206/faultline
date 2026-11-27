@@ -346,3 +346,13 @@ def test_the_runner_checks_the_target_again_before_every_action(tmp_path: Path) 
 
     assert result.outcome is Outcome.ERROR  # stopped at the next action, mid-schedule
     assert "allow_destructive" in result.problems[0]
+
+
+def test_the_baseline_keeps_the_tables_after_every_day(tmp_path: Path) -> None:
+    baseline = run_baseline(TINY, cursor_target("naive"), tmp_path)
+
+    days = sorted(baseline.days)
+    assert days == [TINY.start_date + timedelta(days=i) for i in range(TINY.days)]
+    assert baseline.days[days[-1]] == baseline.snapshots  # the last day is the baseline itself
+    assert (tmp_path / "baseline_days" / "mark_2026-11-01" / "silver_orders.parquet").is_file()
+    assert not (tmp_path / "baseline_days" / "mark_2026-11-04").exists()  # not taken twice

@@ -69,6 +69,8 @@ class TestNaive:
         loss = next(p for p in result.properties if p.name == "no_data_loss")
         assert not loss.at_f.holds  # day 2 is missing...
         assert loss.at_r.holds  # ...until the operator reruns it
+        atomicity = next(p for p in result.properties if p.name == "atomicity")
+        assert atomicity.outcome is Outcome.PASS  # nothing of the day had reached readers
         assert any(
             e.startswith("silver_orders: complete_keys violated") for e in loss.at_f.evidence
         )

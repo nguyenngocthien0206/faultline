@@ -348,6 +348,7 @@ class Baseline:
     runs: RunLog
     problems: tuple[str, ...] = ()
     target: str = "platform"  # the target's name
+    days: dict[date, dict[str, Path]] = field(default_factory=dict)  # snapshots after each day
 
     @property
     def established(self) -> bool:
@@ -368,14 +369,37 @@ def _clean_run(
 ) -> Baseline:
     log("baseline: clean run")
     target.check()
+    marks: Marks = {}
     with adapter as clean:
-        runs = execute(clean, clean_schedule(spec), log, "baseline", guard=target.check)
+        runs = execute(
+            clean,
+            _snapshot_every_day(clean_schedule(spec)),
+            log,
+            "baseline",
+            guard=target.check,
+            marks=marks,
+            work_dir=work_dir / "baseline_days",
+        )
         snapshots = snapshot_all(clean, work_dir / "baseline")
         contracts = clean.capabilities().tables
         invariants = steady_state_problems(clean, snapshots, truth)
     failed = [f"baseline run {d} failed: {r.errors}" for d, r in runs if not r.succeeded]
     problems = (*failed, *invariants)
-    return Baseline(spec, truth, snapshots, contracts, runs, tuple(problems), target.name)
+    days = {date.fromisoformat(name): snaps for name, snaps in marks.items()}
+    if runs:
+        days[runs[-1][0]] = snapshots  # the last day's is the baseline itself
+    return Baseline(spec, truth, snapshots, contracts, runs, tuple(problems), target.name, days)
+
+
+def _snapshot_every_day(schedule: Schedule) -> Schedule:
+    """A snapshot after every run but the last (the baseline's own snapshot covers that one)."""
+    last = max(i for i, a in enumerate(schedule) if isinstance(a, Run))
+    out: list[Action] = []
+    for i, action in enumerate(schedule):
+        out.append(action)
+        if isinstance(action, Run) and i != last:
+            out.append(Snapshot(action.partition.isoformat()))
+    return tuple(out)
 
 
 def run_baseline(
@@ -469,7 +493,11 @@ def _fault_phases(
                 work_dir=work_dir,
             )
         at_f = Checkpoint(
-            "F", snapshot_all(sandbox, work_dir / "checkpoint_F"), fault_runs, fault_marks
+            "F",
+            snapshot_all(sandbox, work_dir / "checkpoint_F"),
+            fault_runs,
+            fault_marks,
+            fault_runs=fault_runs,
         )
         recovery_marks: Marks = {**fault_marks, "F": at_f.snapshots}
 
@@ -508,7 +536,9 @@ def _fault_phases(
             at_r_snapshots = {table: at_r_dir / path.name for table, path in snapshots.items()}
         else:  # no fault, nothing to rerun
             at_r_snapshots = snapshot_all(sandbox, at_r_dir)
-        at_r = Checkpoint("R", at_r_snapshots, recovery_runs, recovery_marks, recovery)
+        at_r = Checkpoint(
+            "R", at_r_snapshots, recovery_runs, recovery_marks, recovery, fault_runs=fault_runs
+        )
     return at_f, at_r
 
 
@@ -680,7 +710,10 @@ def _run(
         return _not_established(base, runs, baseline, plan.descriptions)
 
     ctx = PropertyContext(
-        contracts=baseline.contracts, baseline=baseline.snapshots, truth_root=baseline.truth_root
+        contracts=baseline.contracts,
+        baseline=baseline.snapshots,
+        truth_root=baseline.truth_root,
+        baseline_days=baseline.days,
     )
     signal_f, signal_r = has_signal(at_f.runs), has_signal(at_r.runs)
     verdicts = []

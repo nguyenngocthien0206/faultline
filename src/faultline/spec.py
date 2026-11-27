@@ -40,6 +40,7 @@ from faultline.faults.landing import ColumnDrift, DuplicateFile, LateFile, Trunc
 from faultline.faults.source import PosOfflineSync
 from faultline.properties.base import Property
 from faultline.properties.core import (
+    Atomicity,
     BackfillEquivalence,
     Convergence,
     Idempotency,
@@ -79,6 +80,7 @@ PROPERTIES: dict[str, type[Property]] = {
         Idempotency,
         BackfillEquivalence,
         Convergence,
+        Atomicity,
     )
 }
 SCHEDULES: dict[str, Callable[[DatasetSpec], Schedule]] = {

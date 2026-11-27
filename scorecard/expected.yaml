@@ -26,7 +26,10 @@ reference-hardened:
   truncated-file: DETECTED
   column-rename: DETECTED
   crash-after-landing: PASS
-  crash-mid-write: PASS
+  # No row is lost, but right after the crash silver and the payments report
+  # show day 3 while the sales report does not (atomicity): gold tables are
+  # swapped in one at a time, and nothing publishes them together.
+  crash-mid-write: SILENT_CORRUPTION
   retry-after-partial-commit: PASS
   idempotency: PASS
   backfill: PASS

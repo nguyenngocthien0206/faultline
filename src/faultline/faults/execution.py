@@ -6,7 +6,8 @@ a lost node). The cursor lives with the landing files, the data was meant to go
 to the warehouse: the crash leaves the first ahead of the second. A platform
 that only loads the partition it runs, from a cursor that has already moved
 on, never loads that day. The crash itself is faultline's (INTERRUPTED), so it
-does not count as the platform noticing anything.
+does not count as the platform noticing anything. Snapshots on either side of
+the crash let `atomicity` check what readers saw in the meantime.
 
 CrashMidWrite: a day's run dies, hard, in the middle of refreshing a gold
 table: after its old rows for the day's keys are gone and before the new ones
@@ -50,12 +51,16 @@ class CrashAfterLanding(Fault):
     requires: ClassVar[frozenset[Capability]] = frozenset({Capability.FAILPOINTS})
 
     def apply(self, schedule: Schedule) -> Schedule:
-        """The day's run dies at the failpoint after landing; every other run is untouched."""
+        """The day's run dies after landing, a snapshot on either side; the rest is untouched."""
         if Run(self.partition) not in schedule:
             raise FaultSetupError(f"{self.partition} is never run in this schedule")
         at = schedule.index(Run(self.partition))
-        crash = Run(self.partition, failpoint=AFTER_LANDING)
-        return (*schedule[:at], crash, *schedule[at + 1 :])
+        crash = (
+            Snapshot(BEFORE_CRASH),
+            Run(self.partition, failpoint=AFTER_LANDING),
+            Snapshot(AFTER_CRASH),
+        )
+        return (*schedule[:at], *crash, *schedule[at + 1 :])
 
     def affected_partitions(self) -> set[date]:
         return {self.partition}  # the operator reruns the day that crashed
