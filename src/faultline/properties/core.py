@@ -1,11 +1,11 @@
-"""The core properties: nothing lost, nothing silently different, nothing done twice, healed."""
+"""The core properties: nothing lost or silently changed, nothing done twice, healed, whole."""
 
 from __future__ import annotations
 
 from datetime import date
 from typing import ClassVar
 
-from faultline.adapters.base import Capability
+from faultline.adapters.base import Capability, RunStatus
 from faultline.oracle.diff import diff
 from faultline.oracle.invariants import complete_keys
 from faultline.properties.base import Checkpoint, Property, PropertyContext, PropertyResult
@@ -194,3 +194,68 @@ class Convergence(Property):
             return PropertyResult(self.name, checkpoint.name, True)
         evidence = (recovery.summary(), *recovery.rounds[-1].differences)
         return PropertyResult(self.name, checkpoint.name, False, evidence)
+
+
+class Atomicity(Property):
+    """Right after a crash, readers see the day either not started or done, never in between.
+
+    A run that dies leaves the tables as they were at that moment until the
+    next run, and readers keep reading them. Each consumer table is then:
+
+        before   as it was right before the crashed run
+        after    as the clean run left it after that day (the baseline's day)
+        neither  half written
+
+    A table the day leaves alone is both, and sides with any. The promise holds
+    when every table is before, or every table is after. A table half written
+    breaks it; so do tables split between the two, each whole on its own but
+    contradicting the others: silver with the day, a gold report without it.
+    A warehouse without transactions across tables (ClickHouse, most lakes)
+    has to publish them together on purpose to keep it.
+
+    The crash is the run faultline interrupted in the fault phase, between the
+    snapshots `before` and `after`; R judges the same moment again (it carries
+    the fault phase's runs and snapshots), so the outcome follows F.
+    """
+
+    name: ClassVar[str] = "atomicity"
+
+    def __init__(self, before: str = "before_crash", after: str = "after_crash") -> None:
+        self.before = before
+        self.after = after
+
+    def check(self, ctx: PropertyContext, checkpoint: Checkpoint) -> PropertyResult:
+        crashed = sorted({d for d, r in checkpoint.fault_runs if r.status is RunStatus.INTERRUPTED})
+        if len(crashed) != 1:
+            found = ", ".join(map(str, crashed)) or "none"
+            raise ValueError(f"atomicity needs exactly one interrupted run, found {found}")
+        (day,) = crashed
+        missing = {self.before, self.after} - set(checkpoint.marks)
+        if missing:
+            raise ValueError(f"no snapshot named {', '.join(sorted(missing))} at {checkpoint.name}")
+        if day not in ctx.baseline_days:
+            raise ValueError(f"the baseline has no snapshot after {day}")
+        before, seen = checkpoint.marks[self.before], checkpoint.marks[self.after]
+        done = ctx.baseline_days[day]
+        as_before, as_after, half = [], [], []
+        for contract in ctx.contracts:
+            t = contract.name
+            untouched = diff(before[t], seen[t], contract)
+            finished = diff(done[t], seen[t], contract).is_empty
+            if untouched.is_empty and finished:
+                continue  # the day leaves it alone: it sides with either
+            if untouched.is_empty:
+                as_before.append(t)
+            elif finished:
+                as_after.append(t)
+            else:
+                half.append(untouched)
+        evidence = [f"crash on {day}: half written, {d.summary()}" for d in half]
+        if as_before and as_after:
+            shows = "shows" if len(as_after) == 1 else "show"
+            lacks = "does" if len(as_before) == 1 else "do"
+            evidence.append(
+                f"crash on {day}: tables disagree: {', '.join(as_after)} {shows} the day, "
+                f"{', '.join(as_before)} {lacks} not"
+            )
+        return PropertyResult(self.name, checkpoint.name, not evidence, tuple(evidence))

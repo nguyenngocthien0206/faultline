@@ -8,6 +8,7 @@ from faultline.adapters.base import Capability, RunResult, RunStatus, TableContr
 from faultline.datagen.writer import write_landing_file
 from faultline.properties.base import Checkpoint, PropertyContext, Recovery, Round
 from faultline.properties.core import (
+    Atomicity,
     BackfillEquivalence,
     Convergence,
     Idempotency,
@@ -309,3 +310,111 @@ def test_a_recovery_cut_short_says_so() -> None:
 def test_convergence_needs_a_recovery_to_count(ctx: PropertyContext) -> None:
     with pytest.raises(ValueError, match="no fault"):
         Convergence().check(ctx, _after_recovery(ctx, None))
+
+
+# --------------------------------------------------------------- atomicity
+
+DAY = date(2026, 11, 2)
+CRASHED = (
+    (date(2026, 11, 1), RunResult(RunStatus.SUCCEEDED)),
+    (DAY, RunResult(RunStatus.INTERRUPTED)),
+)
+OLD_ORDERS = [("O-1", 100)]
+NEW_ORDERS = [("O-1", 100), ("O-2", 200)]
+OLD_SALES = [("2026-11-01", 100)]
+NEW_SALES = [("2026-11-01", 100), ("2026-11-02", 200)]
+
+
+def _crash(
+    tmp_path: Path,
+    seen_orders: list[tuple[str, int]],
+    seen_sales: list[tuple[str, int]],
+    *,
+    at: str = "F",
+    runs: tuple[tuple[date, RunResult], ...] = CRASHED,
+) -> tuple[PropertyContext, Checkpoint]:
+    """Day 2 crashed; readers saw `seen_*` until the next run."""
+    folder = tmp_path / f"crash-{len(list(tmp_path.iterdir()))}"
+    folder.mkdir()
+
+    def state(name: str, orders: list[tuple[str, int]], sales: list[tuple[str, int]]):
+        return {
+            "silver_orders": _orders(folder / f"{name}_orders.parquet", orders),
+            "gold_sales": _sales(folder / f"{name}_sales.parquet", sales),
+        }
+
+    done = state("done", NEW_ORDERS, NEW_SALES)
+    ctx = PropertyContext(
+        contracts=(ORDERS, SALES), baseline=done, truth_root=tmp_path, baseline_days={DAY: done}
+    )
+    marks = {
+        "before_crash": state("before", OLD_ORDERS, OLD_SALES),
+        "after_crash": state("after", seen_orders, seen_sales),
+    }
+    return ctx, Checkpoint(at, {}, (), marks, fault_runs=runs)
+
+
+def test_a_crash_that_left_everything_as_it_was_is_atomic(tmp_path: Path) -> None:
+    assert Atomicity().check(*_crash(tmp_path, OLD_ORDERS, OLD_SALES)).holds
+
+
+def test_a_crash_after_everything_was_written_is_atomic(tmp_path: Path) -> None:
+    assert Atomicity().check(*_crash(tmp_path, NEW_ORDERS, NEW_SALES)).holds
+
+
+def test_tables_split_between_before_and_after_disagree(tmp_path: Path) -> None:
+    result = Atomicity().check(*_crash(tmp_path, NEW_ORDERS, OLD_SALES))
+
+    assert not result.holds
+    assert result.evidence == (
+        "crash on 2026-11-02: tables disagree: silver_orders shows the day, gold_sales does not",
+    )
+
+
+def test_a_table_half_written_breaks_it(tmp_path: Path) -> None:
+    # Day 1 taken out to be rewritten, only day 2 put back in: neither old nor new.
+    result = Atomicity().check(*_crash(tmp_path, NEW_ORDERS, [("2026-11-02", 200)]))
+
+    assert not result.holds
+    (evidence,) = result.evidence
+    assert evidence.startswith("crash on 2026-11-02: half written, gold_sales: 1 missing keys")
+
+
+def test_a_table_the_day_leaves_alone_sides_with_either(tmp_path: Path) -> None:
+    ctx, checkpoint = _crash(tmp_path, NEW_ORDERS, OLD_SALES)
+    # A day that changes no sales: gold is the same before and after, so it agrees.
+    unchanged = {
+        **ctx.baseline_days[DAY],
+        "gold_sales": checkpoint.marks["before_crash"]["gold_sales"],
+    }
+    ctx = PropertyContext(ctx.contracts, ctx.baseline, ctx.truth_root, {DAY: unchanged})
+
+    assert Atomicity().check(ctx, checkpoint).holds
+
+
+def test_r_judges_the_same_moment_as_f(tmp_path: Path) -> None:
+    at_r = Atomicity().check(*_crash(tmp_path, NEW_ORDERS, OLD_SALES, at="R"))
+
+    assert not at_r.holds
+    assert at_r.checkpoint == "R"
+
+
+@pytest.mark.parametrize(
+    "runs",
+    [
+        ((DAY, RunResult(RunStatus.SUCCEEDED)),),
+        (*CRASHED, (date(2026, 11, 3), RunResult(RunStatus.INTERRUPTED))),
+    ],
+)
+def test_atomicity_needs_exactly_one_interrupted_run(
+    runs: tuple[tuple[date, RunResult], ...], tmp_path: Path
+) -> None:
+    with pytest.raises(ValueError, match="exactly one interrupted run"):
+        Atomicity().check(*_crash(tmp_path, OLD_ORDERS, OLD_SALES, runs=runs))
+
+
+def test_atomicity_needs_the_snapshots_around_the_crash(tmp_path: Path) -> None:
+    ctx, _ = _crash(tmp_path, OLD_ORDERS, OLD_SALES)
+
+    with pytest.raises(ValueError, match="no snapshot named after_crash, before_crash"):
+        Atomicity().check(ctx, Checkpoint("F", {}, (), fault_runs=CRASHED))
