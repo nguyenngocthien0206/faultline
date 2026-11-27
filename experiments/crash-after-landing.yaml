@@ -7,4 +7,4 @@ dataset:
 faults:
   - type: crash_after_landing
     partition: 2
-properties: [no_data_loss, no_silent_corruption, convergence]
+properties: [no_data_loss, no_silent_corruption, atomicity, convergence]
