@@ -309,8 +309,8 @@ Measured on the reference stack: two clean baselines in two separate workspaces 
 | Bucket | Meaning | Feeds property |
 |---|---|---|
 | missing | key in the expected snapshot only | no data loss |
-| extra | key in the actual snapshot only | exactly-once |
-| duplicated | more rows for the key in the actual snapshot | exactly-once |
+| extra | key in the actual snapshot only | no silent corruption |
+| duplicated | more rows for the key in the actual snapshot | no silent corruption |
 | changed | same or fewer rows, different content | no silent corruption |
 
 Next to the buckets the diff counts the **rows off**: for every key that differs, its rows when it is missing or extra, the difference in rows when the counts differ, its rows when only the content changed. A key is in one bucket however badly it is off; the rows say how badly. Recovery reports both after every round (section 5).
@@ -380,7 +380,6 @@ Per property, given results at checkpoints F and R:
 |---|---|---|---|
 | `idempotency` | F, R (after its probe) | outputs change when an already processed day is rerun (built) | snapshot, rerun an old day, snapshot |
 | `atomicity` | F, R (the moment right after the interrupted run) | right after a crash a table is half written, or the tables disagree: some show the crashed day, others do not (built) | none (needs a crash fault with `Snapshot` actions around it) |
-| `exactly_once` | F, R | duplicated keys, or aggregates inflated after a retry | none |
 | `no_data_loss` | F, R | keys missing compared with the generator truth or baseline | none |
 | `backfill_equivalence` | F, R (after its probe) | loading a range of days in one backfill gives a different result from running them day by day (built) | one orchestrator backfill of the range |
 | `convergence` | R | outputs do not match the baseline within `recovery_rounds` rounds of recovery; the rounds taken are reported (built) | none (recovery itself, section 5) |
@@ -388,6 +387,8 @@ Per property, given results at checkpoints F and R:
 | `no_vanishing_rows` | F, R | a key readers could see is gone: at F between the snapshots around a crash, at R between the end of the fault phase and the end of recovery (built) | none (needs `Snapshot` actions in the fault's schedule) |
 
 Every property gets its own unit tests on hand-built traces, plus at least one integration test proving it catches the naive reference platform.
+
+The first plan also listed `exactly_once` (duplicated keys, or aggregates inflated after a retry). It was dropped, not deferred: `no_silent_corruption` already reports every duplicated and extra key with the measures they inflate, and the experiments that would exercise it (duplicate-file, retry-after-partial-commit, idempotency) all say so in their evidence (`silver_order_items: 163 duplicated keys, qty +22.0%`). A second property over the same buckets would add a line to the scorecard and nothing to what a team learns from it. For data without a natural key, where a copy cannot be told from a second real row, the answer is a different oracle (counts per source event), not this property.
 
 ## 8. Reference platform
 
