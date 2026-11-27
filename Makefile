@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help install lint fmt test test-integration check clean ref-up ref-down ref-clean ref-ps ref-logs demo
+.PHONY: help install lint fmt test test-integration check clean ref-up ref-down ref-clean ref-ps ref-logs ref-timings demo
 
 COMPOSE := docker compose -f reference/docker-compose.yml
 
@@ -77,6 +77,11 @@ ref-ps: reference/.env ## Show the reference stack services
 
 ref-logs: reference/.env ## Follow the reference stack logs
 	$(COMPOSE) logs -f --tail 100
+
+# Where the stack's runs spent their time (queue, launch, imports, steps), read
+# from Dagster's GraphQL API: LAST=30m, or SINCE=2026-11-27T08:23 [UNTIL=...].
+ref-timings: ## Show where Dagster runs spent their time (LAST=30m or SINCE=... UNTIL=...)
+	uv run python reference/scripts/run_timings.py $(if $(LAST),--last $(LAST)) $(if $(SINCE),--since $(SINCE)) $(if $(UNTIL),--until $(UNTIL))
 
 clean: ## Remove caches, build output and faultline workspaces
 	rm -rf .pytest_cache .ruff_cache dist build .faultline
